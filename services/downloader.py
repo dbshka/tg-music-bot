@@ -205,6 +205,8 @@ def _sync_download(
             search_opts["extract_flat"] = True
             search_opts["noplaylist"] = True
 
+            search_opts["ignoreerrors"] = True
+
             inv_idx1 = len(invocations) + 1
             t_s0 = time.perf_counter()
             with yt_dlp.YoutubeDL(search_opts) as ydl_search:
@@ -228,86 +230,128 @@ def _sync_download(
             if not entries:
                 raise ValueError("Трек не найден по данному запросу.")
 
-            # 2. Интеллектуальный выбор кандидата (отсекаем превью <= 35s, тизеры, шортсы)
+            # 2. Интеллектуальный скоринг и ранжирование кандидатов
             t_c0 = time.perf_counter()
-            if expected_duration:
-                valid_candidates = []
-                for e in entries:
-                    dur = e.get("duration") or 0
-                    fmt_str = str(e.get("formats", "")).lower()
-                    is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
-                    if is_prev and abs(dur - expected_duration) > 30:
-                        continue
-                    valid_candidates.append(e)
-                chosen_list = valid_candidates if valid_candidates else entries
-                selected_entry = min(chosen_list, key=lambda e: abs((e.get("duration") or 0) - expected_duration))
-            else:
-                full_tracks = []
-                for e in entries:
-                    dur = e.get("duration") or 0
-                    fmt_str = str(e.get("formats", "")).lower()
-                    is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
-                    if not is_prev and dur >= 45:
-                        full_tracks.append(e)
-                selected_entry = full_tracks[0] if full_tracks else entries[0]
+            def _candidate_penalty(e):
+                dur = e.get("duration") or 0
+                fmt_str = (str(e.get("formats", "")) + str(e.get("format_id", ""))).lower()
+                is_prev = "preview" in fmt_str or (expected_duration and expected_duration > 60 and 0 < dur <= 35)
+                penalty = 1000.0 if is_prev else 0.0
+
+                if expected_duration:
+                    diff = abs(dur - expected_duration)
+                    if diff <= 15:
+                        penalty += diff
+                    elif diff <= 45:
+                        penalty += 20.0 + diff
+                    else:
+                        penalty += 100.0 + diff
+                else:
+                    if dur >= 45:
+                        penalty += 0.0
+                    elif dur > 0:
+                        penalty += 50.0 + (45 - dur)
+                    else:
+                        penalty += 80.0
+
+                if source == "youtube":
+                    uploader = str(e.get("uploader") or "")
+                    channel = str(e.get("channel") or "")
+                    is_topic = uploader.endswith("- Topic") or channel.endswith("- Topic") or " - Topic" in uploader or " - Topic" in channel
+                    # На серверных/облачных IP YouTube Topic релизы часто блокируются бот-проверкой
+                    if is_topic and not cookies_info.get("active"):
+                        penalty += 60.0
+
+                return penalty
+
+            ranked_candidates = sorted(entries, key=_candidate_penalty)
             t_c1 = time.perf_counter()
             perf_timings["candidate_selection"] += (t_c1 - t_c0)
 
-            # 3. Скачиваем только выбранного кандидата
-            target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
-            if target_url and not target_url.startswith("http") and "soundcloud" not in source:
-                target_url = f"https://www.youtube.com/watch?v={target_url}"
-
+            # 3. Цикл скачивания лучших кандидатов (до 4 попыток)
             dl_opts = dict(options)
             dl_opts["extract_flat"] = False
 
-            hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
-            def p_hook(d):
-                if d.get("status") == "downloading" and not hook_times["dl_start"]:
-                    hook_times["dl_start"] = time.perf_counter()
-                elif d.get("status") == "finished":
-                    hook_times["dl_end"] = time.perf_counter()
+            last_cand_error = None
+            for cand_idx, selected_entry in enumerate(ranked_candidates[:4]):
+                target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
+                if target_url and not target_url.startswith("http") and "soundcloud" not in source:
+                    target_url = f"https://www.youtube.com/watch?v={target_url}"
+                if not target_url:
+                    continue
 
-            def pp_hook(d):
-                if d.get("status") == "started" and not hook_times["pp_start"]:
-                    hook_times["pp_start"] = time.perf_counter()
-                elif d.get("status") == "finished":
-                    hook_times["pp_end"] = time.perf_counter()
+                cand_title = selected_entry.get("title") or target_url
+                cand_dur = selected_entry.get("duration") or 0
+                print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1}/{min(4, len(ranked_candidates))}: '{cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
 
-            dl_opts["progress_hooks"] = [p_hook]
-            dl_opts["postprocessor_hooks"] = [pp_hook]
+                hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
+                def p_hook(d):
+                    if d.get("status") == "downloading" and not hook_times["dl_start"]:
+                        hook_times["dl_start"] = time.perf_counter()
+                    elif d.get("status") == "finished":
+                        hook_times["dl_end"] = time.perf_counter()
 
-            inv_idx2 = len(invocations) + 1
-            t_d0 = time.perf_counter()
-            with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
-                res_info = ydl_dl.extract_info(target_url, download=True)
-            t_d1 = time.perf_counter()
-            dur_dl_all = t_d1 - t_d0
+                def pp_hook(d):
+                    if d.get("status") == "started" and not hook_times["pp_start"]:
+                        hook_times["pp_start"] = time.perf_counter()
+                    elif d.get("status") == "finished":
+                        hook_times["pp_end"] = time.perf_counter()
 
-            if hook_times["dl_start"] and hook_times["dl_end"]:
-                dur_net = hook_times["dl_end"] - hook_times["dl_start"]
-            else:
-                dur_net = dur_dl_all * 0.65
+                dl_opts["progress_hooks"] = [p_hook]
+                dl_opts["postprocessor_hooks"] = [pp_hook]
 
-            if hook_times["pp_start"] and hook_times["pp_end"]:
-                dur_ff = hook_times["pp_end"] - hook_times["pp_start"]
-            else:
-                dur_ff = max(0.1, dur_dl_all - dur_net)
+                inv_idx2 = len(invocations) + 1
+                t_d0 = time.perf_counter()
+                try:
+                    with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
+                        res_info = ydl_dl.extract_info(target_url, download=True)
+                    t_d1 = time.perf_counter()
+                    dur_dl_all = t_d1 - t_d0
 
-            perf_timings["download"] += dur_net
-            perf_timings["ffmpeg"] += dur_ff
+                    # Проверяем появление готового MP3 файла
+                    mp3_files = list(output_dir.glob("*.mp3"))
+                    if not mp3_files:
+                        raise FileNotFoundError("Аудиофайл MP3 не был создан после обработки кандидата.")
 
-            invocations.append({
-                "invocation": inv_idx2,
-                "purpose": "stream_download_and_convert",
-                "source": source,
-                "start": t_d0 - t_start_all,
-                "end": t_d1 - t_start_all,
-                "duration": dur_dl_all,
-                "result": "OK"
-            })
-            print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} purpose='stream_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
-            return res_info
+                    if hook_times["dl_start"] and hook_times["dl_end"]:
+                        dur_net = hook_times["dl_end"] - hook_times["dl_start"]
+                    else:
+                        dur_net = dur_dl_all * 0.65
+
+                    if hook_times["pp_start"] and hook_times["pp_end"]:
+                        dur_ff = hook_times["pp_end"] - hook_times["pp_start"]
+                    else:
+                        dur_ff = max(0.1, dur_dl_all - dur_net)
+
+                    perf_timings["download"] += dur_net
+                    perf_timings["ffmpeg"] += dur_ff
+
+                    invocations.append({
+                        "invocation": inv_idx2,
+                        "purpose": f"stream_download_cand_{cand_idx+1}",
+                        "source": source,
+                        "start": t_d0 - t_start_all,
+                        "end": t_d1 - t_start_all,
+                        "duration": dur_dl_all,
+                        "result": "OK"
+                    })
+                    print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
+                    return res_info
+                except Exception as cand_err:
+                    last_cand_error = cand_err
+                    print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}). Пробуем следующего...", flush=True)
+                    # Очищаем неполные или временные файлы перед следующей попыткой
+                    for temp_f in output_dir.iterdir():
+                        if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                            try:
+                                temp_f.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    continue
+
+            if last_cand_error:
+                raise last_cand_error
+            raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
         else:
             inv_idx = len(invocations) + 1
             t_d0 = time.perf_counter()
@@ -486,13 +530,13 @@ async def download_track(
             if path_parts:
                 fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ").replace("—", " ")
 
-        # 1. Fallback в YouTube Search (поиск аудиорелиза из 3 кандидатов)
-        if fallback_query and not query_or_url.startswith("ytsearch") and not query_or_url.startswith("scsearch"):
+        # 1. Fallback в YouTube Search (поиск аудиорелиза из 5 кандидатов)
+        if fallback_query and not query_or_url.startswith("ytsearch"):
             try:
-                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch3:{fallback_query}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch5:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
-                    f"ytsearch3:{fallback_query}",
+                    f"ytsearch5:{fallback_query}",
                     output_dir,
                     custom_title,
                     custom_artist,
@@ -518,13 +562,13 @@ async def download_track(
             except Exception as yt_err:
                 print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
 
-        # 2. Fallback в SoundCloud (выбирает полный трек среди 3 кандидатов)
+        # 2. Fallback в SoundCloud (выбирает полный трек среди 5 кандидатов)
         if fallback_query and not query_or_url.startswith("scsearch"):
             try:
-                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch3:{fallback_query}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
-                    f"scsearch3:{fallback_query}",
+                    f"scsearch5:{fallback_query}",
                     output_dir,
                     custom_title,
                     custom_artist,
