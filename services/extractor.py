@@ -319,12 +319,11 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
             pass
 
     # Если есть title и artist, пробуем получить точную длительность из Deezer
+    duration = None
     if title and artist:
         _, _, _, d_dur = await _search_deezer(session, f"{artist} {title}")
         if d_dur:
             duration = d_dur
-    else:
-        duration = None
 
     # Попытка 3: Если есть заголовок, но нет артиста — ищем в Deezer, затем в iTunes
     if title and not artist:
@@ -422,7 +421,7 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
                     search_query = f"{artist} - {title}" if artist else title
                     return ExtractedTrack(
                         platform="Apple Music",
-                        target=f"ytsearch1:{search_query}",
+                        target=f"ytsearch3:{search_query}",
                         is_search=True,
                         title=title,
                         artist=artist,
