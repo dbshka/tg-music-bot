@@ -1,7 +1,11 @@
 import asyncio
 import html
 import logging
+import os
 import time
+import traceback
+import uuid
+from pathlib import Path
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile
@@ -68,23 +72,37 @@ async def cmd_help(message: Message):
 
 @router.message(F.text)
 async def handle_music_request(message: Message):
+    if not message.text:
+        return
+    user_text = message.text.strip()
+    if not user_text:
+        return
+    # Пропускаем команды бота
+    if user_text.startswith("/"):
+        return
+
+    req_id = uuid.uuid4().hex[:6]
+    t_req_start = time.perf_counter()
+    user_id = message.from_user.id if message.from_user else "unknown"
+    print(f"[MUSIC][request_id={req_id}] handler START user={user_id} text='{user_text[:80]}'", flush=True)
+
     if message.from_user:
         log_user_activity(message.from_user.id, message.from_user.username, message.from_user.full_name)
 
-    t_req_start = time.perf_counter()
-    print(f"[PERF] request received for: {user_text[:80]}", flush=True)
-
     url = find_first_url(user_text)
     cache_key = url if url else user_text
+    print(f"[MUSIC][request_id={req_id}] query='{cache_key}' is_url={bool(url)}", flush=True)
 
     # ⚡ Шаг 0: Мгновенная отдача из Telegram-кэша (0.2–0.4 сек, без повторной загрузки и кодирования)
     t_c0 = time.perf_counter()
+    print(f"[MUSIC][request_id={req_id}] cache lookup START key='{cache_key}'", flush=True)
     cached = get_cached_track(cache_key)
     t_cache = time.perf_counter() - t_c0
-    print(f"[PERF] cache={t_cache*1000:.1f}ms", flush=True)
 
     if cached:
+        print(f"[MUSIC][request_id={req_id}] cache lookup HIT in {t_cache*1000:.1f}ms", flush=True)
         try:
+            print(f"[MUSIC][request_id={req_id}] send_audio START (cached)", flush=True)
             await message.answer_audio(
                 audio=cached["file_id"],
                 title=cached.get("title") or "Unknown Track",
@@ -92,12 +110,17 @@ async def handle_music_request(message: Message):
                 duration=cached.get("duration") or 0,
                 reply_markup=get_audio_edit_keyboard()
             )
+            print(f"[MUSIC][request_id={req_id}] send_audio SUCCESS (cached)", flush=True)
             if message.from_user:
                 increment_user_download(message.from_user.id)
-            print(f"[CACHE] ⚡ Мгновенная отдача из кэша для: {cache_key} (всего {time.perf_counter() - t_req_start:.2f}s)", flush=True)
+            t_total_cache = time.perf_counter() - t_req_start
+            print(f"[MUSIC][request_id={req_id}] handler END total={t_total_cache:.2f}s (cached)", flush=True)
             return
         except Exception as cache_err:
+            print(f"[MUSIC][request_id={req_id}] cache send failed, falling back to live download: {cache_err}", flush=True)
             logger.warning("Кэшированный file_id устарел или недоступен, выполняем загрузку: %s", cache_err)
+    else:
+        print(f"[MUSIC][request_id={req_id}] cache lookup MISS in {t_cache*1000:.1f}ms", flush=True)
 
     # 1. Если передана ссылка
     if url:
@@ -105,10 +128,11 @@ async def handle_music_request(message: Message):
         downloaded_audio = None
         try:
             t_m0 = time.perf_counter()
+            print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
             track_info = await resolve_track_url(url)
             t_metadata = time.perf_counter() - t_m0
-            print(f"[PERF] metadata={t_metadata*1000:.1f}ms", flush=True)
-            
+            print(f"[MUSIC][request_id={req_id}] resolve_track_url SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}'", flush=True)
+
             await status_msg.edit_text(
                 f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>\n"
                 f"Платформа: <b>{track_info.platform}</b>\n"
@@ -116,6 +140,7 @@ async def handle_music_request(message: Message):
                 parse_mode="HTML"
             )
 
+            print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}'", flush=True)
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
                     downloaded_audio = await download_track(
@@ -123,8 +148,16 @@ async def handle_music_request(message: Message):
                         custom_title=track_info.title,
                         custom_artist=track_info.artist,
                         thumbnail_url=track_info.thumbnail_url,
-                        expected_duration=track_info.duration
+                        expected_duration=track_info.duration,
+                        request_id=req_id
                     )
+            print(f"[MUSIC][request_id={req_id}] download_track SUCCESS title='{downloaded_audio.title}' duration={downloaded_audio.duration}s size={downloaded_audio.filesize} bytes", flush=True)
+
+            file_p = Path(downloaded_audio.file_path)
+            p_exists = file_p.exists()
+            p_size = file_p.stat().st_size if p_exists else 0
+            p_readable = os.access(file_p, os.R_OK) if p_exists else False
+            print(f"[MUSIC][request_id={req_id}] file path='{file_p}', exists={p_exists}, size={p_size}, readable={p_readable}", flush=True)
 
             if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
                 size_mb = downloaded_audio.filesize / (1024 * 1024)
@@ -141,6 +174,7 @@ async def handle_music_request(message: Message):
             thumb_file = FSInputFile(downloaded_audio.thumbnail_path) if downloaded_audio.thumbnail_path else None
 
             t_u0 = time.perf_counter()
+            print(f"[MUSIC][request_id={req_id}] send_audio START", flush=True)
             sent_msg = await message.answer_audio(
                 audio=audio_file,
                 title=downloaded_audio.title,
@@ -150,7 +184,7 @@ async def handle_music_request(message: Message):
                 reply_markup=get_audio_edit_keyboard()
             )
             t_telegram = time.perf_counter() - t_u0
-            print(f"[PERF] telegram={t_telegram:.2f}s", flush=True)
+            print(f"[MUSIC][request_id={req_id}] send_audio SUCCESS in {t_telegram:.2f}s", flush=True)
 
             # Сохраняем в кэш для мгновенной отдачи будущим запросам
             if sent_msg.audio and sent_msg.audio.file_id:
@@ -168,6 +202,7 @@ async def handle_music_request(message: Message):
                     artist=downloaded_audio.artist,
                     duration=downloaded_audio.duration
                 )
+                print(f"[MUSIC][request_id={req_id}] cache save SUCCESS", flush=True)
 
             if message.from_user:
                 increment_user_download(message.from_user.id)
@@ -175,23 +210,28 @@ async def handle_music_request(message: Message):
             t_total = time.perf_counter() - t_req_start
             perf = downloaded_audio.perf_timings or {}
             print(
-                f"[PERF] ===== PRODUCTION TIMING SUMMARY =====\n"
-                f"[PERF] metadata={t_metadata*1000:.1f}ms\n"
-                f"[PERF] cache={t_cache*1000:.1f}ms\n"
-                f"[PERF] search={perf.get('search', 0.0):.2f}s\n"
-                f"[PERF] candidate selection={perf.get('candidate_selection', 0.0):.3f}s\n"
-                f"[PERF] download={perf.get('download', 0.0):.2f}s\n"
-                f"[PERF] ffmpeg={perf.get('ffmpeg', 0.0):.2f}s\n"
-                f"[PERF] tags={perf.get('tags', 0.0):.2f}s\n"
-                f"[PERF] telegram={t_telegram:.2f}s\n"
-                f"[PERF] total={t_total:.2f}s\n"
-                f"[PERF] ======================================",
+                f"[PERF][request_id={req_id}] ===== PRODUCTION TIMING SUMMARY =====\n"
+                f"[PERF][request_id={req_id}] metadata={t_metadata*1000:.1f}ms\n"
+                f"[PERF][request_id={req_id}] cache={t_cache*1000:.1f}ms\n"
+                f"[PERF][request_id={req_id}] search={perf.get('search', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] candidate selection={perf.get('candidate_selection', 0.0):.3f}s\n"
+                f"[PERF][request_id={req_id}] download={perf.get('download', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] ffmpeg={perf.get('ffmpeg', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] tags={perf.get('tags', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] telegram={t_telegram:.2f}s\n"
+                f"[PERF][request_id={req_id}] total={t_total:.2f}s\n"
+                f"[PERF][request_id={req_id}] ======================================",
                 flush=True
             )
+            print(f"[MUSIC][request_id={req_id}] handler END total={t_total:.2f}s", flush=True)
 
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
         except Exception as e:
+            print(f"[MUSIC][request_id={req_id}] ERROR at link processing: {e}\n{traceback.format_exc()}", flush=True)
             logger.exception("Ошибка при обработке ссылки %s", url)
             err_str = str(e)
             if "Sign in to confirm you’re not a bot" in err_str or "Sign in to confirm" in err_str:
@@ -202,7 +242,10 @@ async def handle_music_request(message: Message):
                 )
             else:
                 user_friendly = f"❌ <b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
-            await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            try:
+                await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            except Exception:
+                pass
         finally:
             if downloaded_audio:
                 downloaded_audio.cleanup()
@@ -215,13 +258,21 @@ async def handle_music_request(message: Message):
         )
         downloaded_audio = None
         try:
+            print(f"[MUSIC][request_id={req_id}] search query='{user_text}'", flush=True)
+            print(f"[MUSIC][request_id={req_id}] download_track START query='ytsearch3:{user_text}'", flush=True)
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
-                    # YouTube Music search в 10 раз быстрее (2-3 сек вместо 15-30 сек на SoundCloud)
-                    # Фильтрация кандидатов автоматически отсекает 30-секундные шортсы и превью
                     downloaded_audio = await download_track(
-                        query_or_url=f"ytsearch3:{user_text}"
+                        query_or_url=f"ytsearch3:{user_text}",
+                        request_id=req_id
                     )
+            print(f"[MUSIC][request_id={req_id}] download_track SUCCESS title='{downloaded_audio.title}' duration={downloaded_audio.duration}s size={downloaded_audio.filesize} bytes", flush=True)
+
+            file_p = Path(downloaded_audio.file_path)
+            p_exists = file_p.exists()
+            p_size = file_p.stat().st_size if p_exists else 0
+            p_readable = os.access(file_p, os.R_OK) if p_exists else False
+            print(f"[MUSIC][request_id={req_id}] file path='{file_p}', exists={p_exists}, size={p_size}, readable={p_readable}", flush=True)
 
             if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
                 size_mb = downloaded_audio.filesize / (1024 * 1024)
@@ -237,6 +288,7 @@ async def handle_music_request(message: Message):
             thumb_file = FSInputFile(downloaded_audio.thumbnail_path) if downloaded_audio.thumbnail_path else None
 
             t_u0 = time.perf_counter()
+            print(f"[MUSIC][request_id={req_id}] send_audio START", flush=True)
             sent_msg = await message.answer_audio(
                 audio=audio_file,
                 title=downloaded_audio.title,
@@ -246,7 +298,7 @@ async def handle_music_request(message: Message):
                 reply_markup=get_audio_edit_keyboard()
             )
             t_telegram = time.perf_counter() - t_u0
-            print(f"[PERF] telegram={t_telegram:.2f}s", flush=True)
+            print(f"[MUSIC][request_id={req_id}] send_audio SUCCESS in {t_telegram:.2f}s", flush=True)
 
             if sent_msg.audio and sent_msg.audio.file_id:
                 save_cached_track(
@@ -263,6 +315,7 @@ async def handle_music_request(message: Message):
                     artist=downloaded_audio.artist,
                     duration=downloaded_audio.duration
                 )
+                print(f"[MUSIC][request_id={req_id}] cache save SUCCESS", flush=True)
 
             if message.from_user:
                 increment_user_download(message.from_user.id)
@@ -270,27 +323,35 @@ async def handle_music_request(message: Message):
             t_total = time.perf_counter() - t_req_start
             perf = downloaded_audio.perf_timings or {}
             print(
-                f"[PERF] ===== PRODUCTION TIMING SUMMARY =====\n"
-                f"[PERF] metadata=0.0ms\n"
-                f"[PERF] cache={t_cache*1000:.1f}ms\n"
-                f"[PERF] search={perf.get('search', 0.0):.2f}s\n"
-                f"[PERF] candidate selection={perf.get('candidate_selection', 0.0):.3f}s\n"
-                f"[PERF] download={perf.get('download', 0.0):.2f}s\n"
-                f"[PERF] ffmpeg={perf.get('ffmpeg', 0.0):.2f}s\n"
-                f"[PERF] tags={perf.get('tags', 0.0):.2f}s\n"
-                f"[PERF] telegram={t_telegram:.2f}s\n"
-                f"[PERF] total={t_total:.2f}s\n"
-                f"[PERF] ======================================",
+                f"[PERF][request_id={req_id}] ===== PRODUCTION TIMING SUMMARY =====\n"
+                f"[PERF][request_id={req_id}] metadata=0.0ms\n"
+                f"[PERF][request_id={req_id}] cache={t_cache*1000:.1f}ms\n"
+                f"[PERF][request_id={req_id}] search={perf.get('search', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] candidate selection={perf.get('candidate_selection', 0.0):.3f}s\n"
+                f"[PERF][request_id={req_id}] download={perf.get('download', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] ffmpeg={perf.get('ffmpeg', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] tags={perf.get('tags', 0.0):.2f}s\n"
+                f"[PERF][request_id={req_id}] telegram={t_telegram:.2f}s\n"
+                f"[PERF][request_id={req_id}] total={t_total:.2f}s\n"
+                f"[PERF][request_id={req_id}] ======================================",
                 flush=True
             )
+            print(f"[MUSIC][request_id={req_id}] handler END total={t_total:.2f}s", flush=True)
 
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
         except Exception as e:
+            print(f"[MUSIC][request_id={req_id}] ERROR at text search: {e}\n{traceback.format_exc()}", flush=True)
             logger.exception("Ошибка при поиске трека %s", user_text)
             err_str = str(e)
             user_friendly = f"❌ <b>Трек не найден или произошла ошибка:</b>\n<i>{html.escape(err_str[:250])}</i>"
-            await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            try:
+                await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            except Exception:
+                pass
         finally:
             if downloaded_audio:
                 downloaded_audio.cleanup()

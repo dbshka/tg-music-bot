@@ -38,8 +38,11 @@ class DownloadedAudio:
     def cleanup(self):
         """Удаляет временную папку загрузки и все файлы внутри."""
         try:
-            if self.folder_path.exists():
-                shutil.rmtree(self.folder_path, ignore_errors=True)
+            if self.folder_path and self.folder_path.exists():
+                resolved_folder = self.folder_path.resolve()
+                resolved_downloads = DOWNLOADS_DIR.resolve()
+                if resolved_folder != resolved_downloads and resolved_downloads in resolved_folder.parents:
+                    shutil.rmtree(resolved_folder, ignore_errors=True)
         except Exception:
             pass
 
@@ -123,9 +126,11 @@ def _sync_download(
     custom_artist: Optional[str] = None,
     bitrate: str = DEFAULT_AUDIO_BITRATE,
     skip_thumbnail: bool = False,
-    expected_duration: Optional[int] = None
+    expected_duration: Optional[int] = None,
+    request_id: Optional[str] = None
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
+    req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
     outtmpl = str(output_dir / "%(title).100B.%(ext)s")
 
     cookies_info = get_cookies_info()
@@ -171,14 +176,14 @@ def _sync_download(
                 "player_client": ["android", "ios", "mweb", "web"],
             }
         }
-        print(f"[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["android", "ios", "mweb", "web"],
             }
         }
-        print("[DOWNLOADER] Режим без cookies (клиенты android, ios, mweb)", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты android, ios, mweb)", flush=True)
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
@@ -218,7 +223,7 @@ def _sync_download(
                 "duration": dur_s,
                 "result": f"OK ({len(entries)} candidates)"
             })
-            print(f"[YTDLP] invocation=#{inv_idx1} purpose='candidate_search' source='{source}' start={t_s0 - t_start_all:.2f}s end={t_s1 - t_start_all:.2f}s duration={dur_s:.2f}s result='OK ({len(entries)} candidates)'", flush=True)
+            print(f"{req_tag}[YTDLP] invocation=#{inv_idx1} purpose='candidate_search' source='{source}' start={t_s0 - t_start_all:.2f}s end={t_s1 - t_start_all:.2f}s duration={dur_s:.2f}s result='OK ({len(entries)} candidates)'", flush=True)
 
             if not entries:
                 raise ValueError("Трек не найден по данному запросу.")
@@ -301,7 +306,7 @@ def _sync_download(
                 "duration": dur_dl_all,
                 "result": "OK"
             })
-            print(f"[YTDLP] invocation=#{inv_idx2} purpose='stream_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
+            print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} purpose='stream_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
             return res_info
         else:
             inv_idx = len(invocations) + 1
@@ -350,7 +355,7 @@ def _sync_download(
                 "duration": dur_dl_all,
                 "result": "OK"
             })
-            print(f"[YTDLP] invocation=#{inv_idx} purpose='direct_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
+            print(f"{req_tag}[YTDLP] invocation=#{inv_idx} purpose='direct_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
             return res_info
 
     try:
@@ -415,11 +420,13 @@ async def download_track(
     custom_artist: Optional[str] = None,
     thumbnail_url: Optional[str] = None,
     bitrate: str = DEFAULT_AUDIO_BITRATE,
-    expected_duration: Optional[int] = None
+    expected_duration: Optional[int] = None,
+    request_id: Optional[str] = None
 ) -> DownloadedAudio:
     """
     Асинхронная функция загрузки трека в MP3.
     """
+    req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
     session_id = uuid.uuid4().hex
     output_dir = DOWNLOADS_DIR / session_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +448,8 @@ async def download_track(
             custom_artist,
             bitrate,
             bool(thumbnail_url),
-            expected_duration
+            expected_duration,
+            request_id
         )
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
@@ -458,11 +466,11 @@ async def download_track(
                 pass
 
         elapsed = time.time() - t_start
-        print(f"[DOWNLOADER] [OK] Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
+        print(f"{req_tag}[DOWNLOADER] [OK] Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
         return audio
     except Exception as primary_error:
         elapsed = time.time() - t_start
-        print(f"[DOWNLOADER] Первичная загрузка {query_or_url} ({elapsed:.2f}s) вернула ошибку: {primary_error}", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Первичная загрузка {query_or_url} ({elapsed:.2f}s) вернула ошибку: {primary_error}", flush=True)
 
         fallback_query = None
         if custom_artist and custom_title:
@@ -481,7 +489,7 @@ async def download_track(
         # 1. Fallback в YouTube Search (поиск аудиорелиза из 3 кандидатов)
         if fallback_query and not query_or_url.startswith("ytsearch") and not query_or_url.startswith("scsearch"):
             try:
-                print(f"[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch3:{fallback_query}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch3:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
                     f"ytsearch3:{fallback_query}",
@@ -490,7 +498,8 @@ async def download_track(
                     custom_artist,
                     bitrate,
                     bool(thumbnail_url),
-                    expected_duration
+                    expected_duration,
+                    request_id
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
                     raise ValueError(f"Fallback YouTube вернул превью ({audio.duration}s)")
@@ -504,15 +513,15 @@ async def download_track(
                     except Exception:
                         pass
                 elapsed_fb = time.time() - t_start
-                print(f"[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
             except Exception as yt_err:
-                print(f"[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
 
         # 2. Fallback в SoundCloud (выбирает полный трек среди 3 кандидатов)
         if fallback_query and not query_or_url.startswith("scsearch"):
             try:
-                print(f"[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch3:{fallback_query}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch3:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
                     f"scsearch3:{fallback_query}",
@@ -521,7 +530,8 @@ async def download_track(
                     custom_artist,
                     bitrate,
                     bool(thumbnail_url),
-                    expected_duration
+                    expected_duration,
+                    request_id
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
                     raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
@@ -535,10 +545,10 @@ async def download_track(
                     except Exception:
                         pass
                 elapsed_fb = time.time() - t_start
-                print(f"[DOWNLOADER] [OK] Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
             except Exception as sc_err:
-                print(f"[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
 
         shutil.rmtree(output_dir, ignore_errors=True)
         raise primary_error
