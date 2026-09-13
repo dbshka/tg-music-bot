@@ -1,5 +1,7 @@
 import sqlite3
 import datetime
+import re
+import urllib.parse
 from typing import Optional, List, Dict, Any
 from config import DB_PATH
 
@@ -33,10 +35,52 @@ def init_db():
 
 
 def normalize_cache_key(query: str) -> str:
-    """Нормализует поисковый запрос или URL для кэширования."""
+    """
+    Нормализует поисковый запрос или URL для точного кэширования:
+    - Извлекает уникальные идентификаторы треков (YouTube v=..., Spotify track ID, Apple Music ID)
+    - Очищает лишние GET-параметры отслеживания
+    - Нормализует дефисы и пробелы в текстовых запросах
+    """
     q = query.strip().lower()
     if q.startswith("http://") or q.startswith("https://"):
-        q = q.split("?")[0].rstrip("/")
+        try:
+            parsed = urllib.parse.urlparse(q)
+            # YouTube ID
+            if "youtube.com" in parsed.netloc:
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "v" in qs:
+                    return f"youtube:{qs['v'][0]}"
+                if parsed.path.startswith("/shorts/"):
+                    parts = [p for p in parsed.path.split('/') if p]
+                    if len(parts) >= 2:
+                        return f"youtube:{parts[1]}"
+            elif "youtu.be" in parsed.netloc:
+                vid = parsed.path.strip("/")
+                if vid:
+                    return f"youtube:{vid}"
+            # Spotify track ID
+            elif "spotify.com" in parsed.netloc:
+                sp_match = re.search(r'track/([a-zA-Z0-9]+)', parsed.path)
+                if sp_match:
+                    return f"spotify:{sp_match.group(1)}"
+            # Apple Music track ID
+            elif "apple.com" in parsed.netloc:
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "i" in qs:
+                    return f"applemusic:{qs['i'][0]}"
+                am_match = re.search(r'(?:/id|/song/)(\d+)', parsed.path)
+                if am_match:
+                    return f"applemusic:{am_match.group(1)}"
+
+            # Общий случай для URL: отсекаем query параметры и конечный слеш
+            clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+            return clean_url
+        except Exception:
+            return q.split("?")[0].rstrip("/")
+
+    # Для текстовых запросов: заменяем длинные тире на дефис и схлопываем пробелы
+    q = q.replace("—", "-").replace("–", "-").replace("−", "-").replace("_", " ")
+    q = " ".join(q.split())
     return q
 
 

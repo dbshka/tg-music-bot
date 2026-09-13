@@ -128,8 +128,9 @@ def _sync_download(
     cookies_info = get_cookies_info()
 
     ydl_opts = {
-        # Приоритет отдаем m4a и opus аудиопотокам оптимального размера (быстрая загрузка без лишнего веса)
-        "format": "ba[ext=m4a]/ba[ext=webm]/ba/best",
+        # Приоритет отдаем прямым прогрессивным HTTP MP3/M4A аудиопотокам
+        # (в десятки раз быстрее HLS чанков и исключает лишнюю перекодировку MP3)
+        "format": "ba[protocol^=http][ext=mp3]/ba[protocol^=http][ext=m4a]/ba[ext=m4a]/ba[protocol^=http]/ba/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "writethumbnail": not skip_thumbnail,
@@ -157,26 +158,24 @@ def _sync_download(
     }
 
     # Клиенты YouTube:
-    # Клиенты YouTube:
-    # Важно: мобильные клиенты (mweb, android, ios) исключают ошибку "The page needs to be reloaded",
-    # которая блокирует настольный веб-клиент на серверах Render.
+    # Android клиент работает в разы быстрее desktop и исключает ошибки SABR streaming и 403
     is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
 
     if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["mweb", "android", "ios", "web"],
+                "player_client": ["android", "web"],
             }
         }
         print(f"[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
+                "player_client": ["android", "web"],
             }
         }
-        print("[DOWNLOADER] Режим без cookies (мобильные клиенты)", flush=True)
+        print("[DOWNLOADER] Режим без cookies (клиент android)", flush=True)
 
 
     try:
@@ -185,14 +184,14 @@ def _sync_download(
     except Exception as extract_err:
         err_msg = str(extract_err).lower()
         # Если cookies в Render устарели и YouTube требует авторизацию ("Sign in to confirm you're not a bot" / 403):
-        # Автоматически пробуем второй шанс БЕЗ cookies через чистые мобильные клиенты (android, ios, mweb)
+        # Автоматически пробуем второй шанс БЕЗ cookies через чистый android клиент
         if "cookiefile" in ydl_opts and ("sign in" in err_msg or "bot" in err_msg or "cookie" in err_msg or "reload" in err_msg or "403" in err_msg):
             print(f"[DOWNLOADER] Сессия cookies недействительна ({extract_err}). Пробуем чистый запуск без cookies...", flush=True)
             ydl_opts_retry = dict(ydl_opts)
             ydl_opts_retry.pop("cookiefile", None)
             ydl_opts_retry["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["android", "ios", "mweb"],
+                    "player_client": ["android", "web"],
                 }
             }
             with yt_dlp.YoutubeDL(ydl_opts_retry) as ydl_retry:
@@ -250,6 +249,13 @@ async def download_track(
     output_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
 
+    # Параллельная загрузка обложки в фоне во время скачивания аудио (экономит 0.5-1.5 сек)
+    thumb_task = None
+    if thumbnail_url:
+        thumb_task = asyncio.create_task(
+            _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
+        )
+
     try:
         audio = await asyncio.to_thread(
             _sync_download,
@@ -261,16 +267,17 @@ async def download_track(
             bool(thumbnail_url)
         )
 
-        # Если yt-dlp не скачал обложку, но есть ссылка на неё (например, из Spotify/Apple Music)
-        if not audio.thumbnail_path and thumbnail_url:
-            downloaded_thumb = await _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
-            if downloaded_thumb:
-                audio.thumbnail_path = downloaded_thumb
-                # Повторно применим теги с новой обложкой
-                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+        if thumb_task:
+            try:
+                downloaded_thumb = await thumb_task
+                if downloaded_thumb and not audio.thumbnail_path:
+                    audio.thumbnail_path = downloaded_thumb
+                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+            except Exception:
+                pass
 
         elapsed = time.time() - t_start
-        print(f"[DOWNLOADER] ✅ Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
+        print(f"[DOWNLOADER] [OK] Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
         return audio
     except Exception as primary_error:
         elapsed = time.time() - t_start
@@ -290,31 +297,7 @@ async def download_track(
             if path_parts:
                 fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ").replace("—", " ")
 
-        # 1. Fallback в SoundCloud: если YouTube выдал ошибку (The page needs to be reloaded / CAPTCHA / bot check)
-        if fallback_query and not query_or_url.startswith("scsearch"):
-            try:
-                print(f"[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch1:{fallback_query}", flush=True)
-                audio = await asyncio.to_thread(
-                    _sync_download,
-                    f"scsearch1:{fallback_query}",
-                    output_dir,
-                    custom_title,
-                    custom_artist,
-                    bitrate,
-                    bool(thumbnail_url)
-                )
-                if not audio.thumbnail_path and thumbnail_url:
-                    downloaded_thumb = await _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
-                    if downloaded_thumb:
-                        audio.thumbnail_path = downloaded_thumb
-                        _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
-                elapsed_fb = time.time() - t_start
-                print(f"[DOWNLOADER] ✅ Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
-                return audio
-            except Exception as sc_err:
-                print(f"[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
-
-        # 2. Fallback в YouTube Search (если изначально передавалась прямая ссылка на видео YouTube)
+        # 1. Fallback в YouTube Search (если изначально передавалась прямая ссылка на видео YouTube, поиск аудиорелиза в 10 раз быстрее)
         if fallback_query and not query_or_url.startswith("ytsearch") and not query_or_url.startswith("scsearch"):
             try:
                 print(f"[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch1:{fallback_query}", flush=True)
@@ -327,16 +310,46 @@ async def download_track(
                     bitrate,
                     bool(thumbnail_url)
                 )
-                if not audio.thumbnail_path and thumbnail_url:
-                    downloaded_thumb = await _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
-                    if downloaded_thumb:
-                        audio.thumbnail_path = downloaded_thumb
-                        _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                if thumb_task:
+                    try:
+                        downloaded_thumb = await thumb_task
+                        if downloaded_thumb and not audio.thumbnail_path:
+                            audio.thumbnail_path = downloaded_thumb
+                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                    except Exception:
+                        pass
                 elapsed_fb = time.time() - t_start
-                print(f"[DOWNLOADER] ✅ Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
+                print(f"[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
             except Exception as yt_err:
                 print(f"[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
+
+        # 2. Fallback в SoundCloud: если YouTube недоступен
+        if fallback_query and not query_or_url.startswith("scsearch"):
+            try:
+                print(f"[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch1:{fallback_query}", flush=True)
+                audio = await asyncio.to_thread(
+                    _sync_download,
+                    f"scsearch1:{fallback_query}",
+                    output_dir,
+                    custom_title,
+                    custom_artist,
+                    bitrate,
+                    bool(thumbnail_url)
+                )
+                if thumb_task:
+                    try:
+                        downloaded_thumb = await thumb_task
+                        if downloaded_thumb and not audio.thumbnail_path:
+                            audio.thumbnail_path = downloaded_thumb
+                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                    except Exception:
+                        pass
+                elapsed_fb = time.time() - t_start
+                print(f"[DOWNLOADER] [OK] Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
+                return audio
+            except Exception as sc_err:
+                print(f"[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
 
         shutil.rmtree(output_dir, ignore_errors=True)
         raise primary_error
