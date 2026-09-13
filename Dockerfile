@@ -1,11 +1,14 @@
 FROM python:3.11-slim
 
-# Установка системных утилит, FFmpeg и Node.js (JS-рантайм для yt-dlp для решения челленджей YouTube)
+# Установка системных утилит, FFmpeg и Node.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# Добавление Deno (нативный JS-рантайм yt-dlp по умолчанию для решения челленджей YouTube)
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 # Создание пользователя с UID 1000 (стандарт безопасности Hugging Face Spaces)
 RUN useradd -m -u 1000 user

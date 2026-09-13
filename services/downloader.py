@@ -145,18 +145,24 @@ def _sync_download(
         ],
     }
 
+    # Клиенты YouTube: Android и iOS клиенты не имеют ошибки "The page needs to be reloaded"
+    ydl_opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android", "ios", "mweb", "web"],
+        }
+    }
+
+    # Подключение Node.js JS-рантайма при наличии в системе
+    node_bin = shutil.which("node")
+    if node_bin:
+        ydl_opts["js_runtimes"] = {"node": node_bin}
+
     # Если cookies активны (Render Secret File или ENV), используем авторизованную сессию
     if cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
         print(f"[DOWNLOADER] Используем cookiefile: {cookies_info['path']} ({cookies_info['size']} байт)", flush=True)
     else:
         print("[DOWNLOADER] ВНИМАНИЕ: cookies не активны! YouTube может заблокировать запрос.", flush=True)
-        # Резервная попытка обхода бот-детекта через мобильные клиенты
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
-            }
-        }
 
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -230,8 +236,8 @@ async def download_track(
 
         return audio
     except Exception as primary_error:
-        # Умный fallback: если прямой ресурс заблокирован провайдером (например SoundCloud / Bandcamp в РФ),
-        # пытаемся найти этот трек через поисковик YouTube
+        print(f"[DOWNLOADER] Первичная загрузка {query_or_url} вернула ошибку: {primary_error}", flush=True)
+
         fallback_query = None
         if custom_artist and custom_title:
             fallback_query = f"{custom_artist} - {custom_title}"
@@ -242,8 +248,31 @@ async def download_track(
             if path_parts:
                 fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ")
 
-        if fallback_query and not query_or_url.startswith("ytsearch"):
+        # 1. Fallback в SoundCloud: если YouTube выдал ошибку (The page needs to be reloaded / CAPTCHA / bot check)
+        if fallback_query and not query_or_url.startswith("scsearch"):
             try:
+                print(f"[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch1:{fallback_query}", flush=True)
+                audio = await asyncio.to_thread(
+                    _sync_download,
+                    f"scsearch1:{fallback_query}",
+                    output_dir,
+                    custom_title,
+                    custom_artist,
+                    bitrate
+                )
+                if not audio.thumbnail_path and thumbnail_url:
+                    downloaded_thumb = await _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
+                    if downloaded_thumb:
+                        audio.thumbnail_path = downloaded_thumb
+                        _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                return audio
+            except Exception as sc_err:
+                print(f"[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
+
+        # 2. Fallback в YouTube Search (если изначально передавалась прямая ссылка на видео YouTube)
+        if fallback_query and not query_or_url.startswith("ytsearch") and not query_or_url.startswith("scsearch"):
+            try:
+                print(f"[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch1:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
                     f"ytsearch1:{fallback_query}",
@@ -258,9 +287,8 @@ async def download_track(
                         audio.thumbnail_path = downloaded_thumb
                         _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
                 return audio
-            except Exception:
-                shutil.rmtree(output_dir, ignore_errors=True)
-                raise primary_error
+            except Exception as yt_err:
+                print(f"[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
 
         shutil.rmtree(output_dir, ignore_errors=True)
         raise primary_error
