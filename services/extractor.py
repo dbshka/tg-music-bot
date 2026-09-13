@@ -16,6 +16,7 @@ class ExtractedTrack:
     title: Optional[str] = None
     artist: Optional[str] = None
     thumbnail_url: Optional[str] = None
+    duration: Optional[int] = None
 
     @property
     def display_name(self) -> str:
@@ -81,30 +82,67 @@ def find_first_url(text: str) -> Optional[str]:
 
 async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
     """
-    Извлекает точные метаданные из страницы Яндекс Музыки (OpenGraph теги).
+    Извлекает точные метаданные трека Яндекс Музыки через официальный API или OpenGraph.
     Предотвращает падение yt-dlp из-за DRM/блокировки веб-интерфейса Яндекса.
     """
+    # 1. Извлекаем ID трека из URL (поддержка /album/.../track/123 или /track/123)
+    track_id = None
+    match = re.search(r'track/(\d+)', url)
+    if match:
+        track_id = match.group(1)
+
+    if track_id:
+        try:
+            api_url = f"https://api.music.yandex.net/tracks/{track_id}"
+            headers = {"User-Agent": "Yandex-Music-API"}
+            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    results = data.get("result", [])
+                    if results and isinstance(results, list):
+                        item = results[0]
+                        title = item.get("title")
+                        artists = ", ".join([a.get("name") for a in item.get("artists", []) if a.get("name")])
+                        duration = int(item.get("durationMs", 0) / 1000) or None
+                        cover = item.get("coverUri")
+                        if not cover and item.get("artists"):
+                            cover = item.get("artists")[0].get("cover", {}).get("uri")
+                        thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+
+                        if title:
+                            search_query = f"{artists} - {title}" if artists else title
+                            return ExtractedTrack(
+                                platform="Яндекс Музыка",
+                                target=f"ytsearch3:{search_query}",
+                                is_search=True,
+                                title=title,
+                                artist=artists,
+                                thumbnail_url=thumb_url,
+                                duration=duration
+                            )
+        except Exception:
+            pass
+
+    # Резервный парсинг HTML (OpenGraph / Title)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "ru,en;q=0.9"
     }
     clean_url = url.split("?")[0]
     try:
-        async with session.get(clean_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(clean_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 html = await resp.text()
                 title = None
                 artist = None
                 thumbnail_url = None
 
-                # Название песни
                 t_match = re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
                 if not t_match:
                     t_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', html)
                 if t_match:
                     title = t_match.group(1).strip()
 
-                # Исполнитель из og:description (например "Gazan · трек · 2026")
                 d_match = re.search(r'property=["\']og:description["\']\s+content=["\']([^"\']+)["\']', html)
                 if not d_match:
                     d_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', html)
@@ -114,7 +152,6 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
                     if parts:
                         artist = parts[0].strip()
 
-                # Обложка трека в максимальном разрешении (m1000x1000)
                 i_match = re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
                 if not i_match:
                     i_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html)
@@ -127,7 +164,7 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
                     search_query = f"{artist} - {title}" if artist else title
                     return ExtractedTrack(
                         platform="Яндекс Музыка",
-                        target=f"ytsearch1:{search_query}",
+                        target=f"ytsearch3:{search_query}",
                         is_search=True,
                         title=title,
                         artist=artist,
@@ -138,7 +175,7 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
     return None
 
 
-async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
     """Поиск по Deezer API (не путает треки и исполнителей, в отличие от одиночного запроса к iTunes)."""
     try:
         encoded = urllib.parse.quote(query)
@@ -152,13 +189,14 @@ async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Op
                     artist = item.get("artist", {}).get("name")
                     title = item.get("title")
                     cover = item.get("album", {}).get("cover_xl") or item.get("album", {}).get("cover_big")
-                    return artist, title, cover
+                    duration = int(item.get("duration") or 0) or None
+                    return artist, title, cover, duration
     except Exception:
         pass
-    return None, None, None
+    return None, None, None, None
 
 
-async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
     """Резервный поиск по iTunes API с валидацией совпадения названия трека."""
     try:
         encoded = urllib.parse.quote(query)
@@ -177,10 +215,11 @@ async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tu
                     if match:
                         artist = item.get("artistName")
                         artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-                        return artist, track_name, artwork
+                        duration = int(item.get("trackTimeMillis", 0) / 1000) or None
+                        return artist, track_name, artwork, duration
     except Exception:
         pass
-    return None, None, None
+    return None, None, None, None
 
 
 async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -279,29 +318,40 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
         except Exception:
             pass
 
+    # Если есть title и artist, пробуем получить точную длительность из Deezer
+    if title and artist:
+        _, _, _, d_dur = await _search_deezer(session, f"{artist} {title}")
+        if d_dur:
+            duration = d_dur
+    else:
+        duration = None
+
     # Попытка 3: Если есть заголовок, но нет артиста — ищем в Deezer, затем в iTunes
     if title and not artist:
-        d_artist, d_title, d_cover = await _search_deezer(session, title)
+        d_artist, d_title, d_cover, d_dur = await _search_deezer(session, title)
         if d_artist:
             artist = d_artist
             title = d_title or title
             thumbnail_url = thumbnail_url or d_cover
+            duration = d_dur
         else:
-            it_artist, it_title, it_cover = await _search_itunes_track(session, title)
+            it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, title)
             if it_artist:
                 artist = it_artist
                 title = it_title or title
                 thumbnail_url = thumbnail_url or it_cover
+                duration = it_dur
 
     if title:
         search_query = f"{artist} - {title}" if artist else title
         return ExtractedTrack(
             platform="Spotify",
-            target=f"ytsearch1:{search_query}",
+            target=f"ytsearch3:{search_query}",
             is_search=True,
             title=title,
             artist=artist,
-            thumbnail_url=thumbnail_url
+            thumbnail_url=thumbnail_url,
+            duration=duration
         )
 
     return None
@@ -338,13 +388,15 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
                             artwork = artwork.replace("100x100bb", "600x600bb")
 
                         search_query = f"{artist} - {title}" if artist and title else (title or artist)
+                        duration = int(item.get("trackTimeMillis", 0) / 1000) or None
                         return ExtractedTrack(
                             platform="Apple Music",
-                            target=f"ytsearch1:{search_query}",
+                            target=f"ytsearch3:{search_query}",
                             is_search=True,
                             title=title,
                             artist=artist,
-                            thumbnail_url=artwork
+                            thumbnail_url=artwork,
+                            duration=duration
                         )
         except Exception:
             pass

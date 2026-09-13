@@ -115,7 +115,8 @@ async def handle_music_request(message: Message):
                         query_or_url=track_info.target,
                         custom_title=track_info.title,
                         custom_artist=track_info.artist,
-                        thumbnail_url=track_info.thumbnail_url
+                        thumbnail_url=track_info.thumbnail_url,
+                        expected_duration=track_info.duration
                     )
 
             if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
@@ -193,9 +194,9 @@ async def handle_music_request(message: Message):
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
                     # YouTube Music search в 10 раз быстрее (2-3 сек вместо 15-30 сек на SoundCloud)
-                    # При возникновении проблем автоматически сработает fallback на SoundCloud
+                    # Фильтрация кандидатов автоматически отсекает 30-секундные шортсы и превью
                     downloaded_audio = await download_track(
-                        query_or_url=f"ytsearch1:{user_text}"
+                        query_or_url=f"ytsearch3:{user_text}"
                     )
 
             if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:

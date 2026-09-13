@@ -120,7 +120,8 @@ def _sync_download(
     custom_title: Optional[str] = None,
     custom_artist: Optional[str] = None,
     bitrate: str = DEFAULT_AUDIO_BITRATE,
-    skip_thumbnail: bool = False
+    skip_thumbnail: bool = False,
+    expected_duration: Optional[int] = None
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     outtmpl = str(output_dir / "%(title).100B.%(ext)s")
@@ -177,14 +178,50 @@ def _sync_download(
         }
         print("[DOWNLOADER] Режим без cookies (клиент android)", flush=True)
 
+    is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
+
+    def _execute_extraction(options):
+        with yt_dlp.YoutubeDL(options) as ydl:
+            if is_search:
+                # 1. Извлекаем кандидатов поиска без скачивания
+                search_info = ydl.extract_info(query_or_url, download=False)
+                entries = [e for e in search_info.get("entries", []) if e]
+                if not entries:
+                    raise ValueError("Трек не найден по данному запросу.")
+
+                # 2. Интеллектуальный выбор кандидата (отсекаем превью <= 35s, тизеры, шортсы)
+                if expected_duration:
+                    valid_candidates = []
+                    for e in entries:
+                        dur = e.get("duration") or 0
+                        fmt_str = str(e.get("formats", "")).lower()
+                        is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
+                        if is_prev and abs(dur - expected_duration) > 30:
+                            continue
+                        valid_candidates.append(e)
+                    chosen_list = valid_candidates if valid_candidates else entries
+                    selected_entry = min(chosen_list, key=lambda e: abs((e.get("duration") or 0) - expected_duration))
+                else:
+                    # Без известной длительности: отсекаем превью и шортсы (<45s), если есть полноценные треки (>60s)
+                    full_tracks = []
+                    for e in entries:
+                        dur = e.get("duration") or 0
+                        fmt_str = str(e.get("formats", "")).lower()
+                        is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
+                        if not is_prev and dur >= 45:
+                            full_tracks.append(e)
+                    selected_entry = full_tracks[0] if full_tracks else entries[0]
+
+                # 3. Скачиваем только выбранного кандидата
+                target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
+                return ydl.extract_info(target_url, download=True)
+            else:
+                return ydl.extract_info(query_or_url, download=True)
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query_or_url, download=True)
+        info = _execute_extraction(ydl_opts)
     except Exception as extract_err:
         err_msg = str(extract_err).lower()
-        # Если cookies в Render устарели и YouTube требует авторизацию ("Sign in to confirm you're not a bot" / 403):
-        # Автоматически пробуем второй шанс БЕЗ cookies через чистый android клиент
         if "cookiefile" in ydl_opts and ("sign in" in err_msg or "bot" in err_msg or "cookie" in err_msg or "reload" in err_msg or "403" in err_msg):
             print(f"[DOWNLOADER] Сессия cookies недействительна ({extract_err}). Пробуем чистый запуск без cookies...", flush=True)
             ydl_opts_retry = dict(ydl_opts)
@@ -194,8 +231,7 @@ def _sync_download(
                     "player_client": ["android", "web"],
                 }
             }
-            with yt_dlp.YoutubeDL(ydl_opts_retry) as ydl_retry:
-                info = ydl_retry.extract_info(query_or_url, download=True)
+            info = _execute_extraction(ydl_opts_retry)
         else:
             raise extract_err
 
@@ -239,7 +275,8 @@ async def download_track(
     custom_title: Optional[str] = None,
     custom_artist: Optional[str] = None,
     thumbnail_url: Optional[str] = None,
-    bitrate: str = DEFAULT_AUDIO_BITRATE
+    bitrate: str = DEFAULT_AUDIO_BITRATE,
+    expected_duration: Optional[int] = None
 ) -> DownloadedAudio:
     """
     Асинхронная функция загрузки трека в MP3.
@@ -264,8 +301,13 @@ async def download_track(
             custom_title,
             custom_artist,
             bitrate,
-            bool(thumbnail_url)
+            bool(thumbnail_url),
+            expected_duration
         )
+
+        # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
+        if expected_duration and expected_duration > 60 and audio.duration <= 35:
+            raise ValueError(f"Скачано превью ({audio.duration}s) вместо полного трека ({expected_duration}s)")
 
         if thumb_task:
             try:
@@ -288,28 +330,32 @@ async def download_track(
             fallback_query = f"{custom_artist} - {custom_title}"
         elif custom_title:
             fallback_query = custom_title
-        elif query_or_url.startswith("scsearch1:"):
-            fallback_query = query_or_url[len("scsearch1:"):]
-        elif query_or_url.startswith("ytsearch1:"):
-            fallback_query = query_or_url[len("ytsearch1:"):]
+        elif query_or_url.startswith("scsearch"):
+            fallback_query = query_or_url.split(":", 1)[1]
+        elif query_or_url.startswith("ytsearch"):
+            fallback_query = query_or_url.split(":", 1)[1]
         else:
             path_parts = [p for p in urllib.parse.urlparse(query_or_url).path.split('/') if p and p not in ('sets', 'track', 'song', 'watch')]
             if path_parts:
                 fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ").replace("—", " ")
 
-        # 1. Fallback в YouTube Search (если изначально передавалась прямая ссылка на видео YouTube, поиск аудиорелиза в 10 раз быстрее)
+        # 1. Fallback в YouTube Search (поиск аудиорелиза из 3 кандидатов)
         if fallback_query and not query_or_url.startswith("ytsearch") and not query_or_url.startswith("scsearch"):
             try:
-                print(f"[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch1:{fallback_query}", flush=True)
+                print(f"[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch3:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
-                    f"ytsearch1:{fallback_query}",
+                    f"ytsearch3:{fallback_query}",
                     output_dir,
                     custom_title,
                     custom_artist,
                     bitrate,
-                    bool(thumbnail_url)
+                    bool(thumbnail_url),
+                    expected_duration
                 )
+                if expected_duration and expected_duration > 60 and audio.duration <= 35:
+                    raise ValueError(f"Fallback YouTube вернул превью ({audio.duration}s)")
+
                 if thumb_task:
                     try:
                         downloaded_thumb = await thumb_task
@@ -324,19 +370,23 @@ async def download_track(
             except Exception as yt_err:
                 print(f"[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
 
-        # 2. Fallback в SoundCloud: если YouTube недоступен
+        # 2. Fallback в SoundCloud (выбирает полный трек среди 3 кандидатов)
         if fallback_query and not query_or_url.startswith("scsearch"):
             try:
-                print(f"[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch1:{fallback_query}", flush=True)
+                print(f"[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch3:{fallback_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
-                    f"scsearch1:{fallback_query}",
+                    f"scsearch3:{fallback_query}",
                     output_dir,
                     custom_title,
                     custom_artist,
                     bitrate,
-                    bool(thumbnail_url)
+                    bool(thumbnail_url),
+                    expected_duration
                 )
+                if expected_duration and expected_duration > 60 and audio.duration <= 35:
+                    raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
+
                 if thumb_task:
                     try:
                         downloaded_thumb = await thumb_task
