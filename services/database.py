@@ -19,7 +19,60 @@ def init_db():
                 tags_edited_count INTEGER DEFAULT 0
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tracks_cache (
+                query_key TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                title TEXT,
+                artist TEXT,
+                duration INTEGER,
+                created_at TIMESTAMP
+            )
+        """)
         conn.commit()
+
+
+def normalize_cache_key(query: str) -> str:
+    """Нормализует поисковый запрос или URL для кэширования."""
+    q = query.strip().lower()
+    if q.startswith("http://") or q.startswith("https://"):
+        q = q.split("?")[0].rstrip("/")
+    return q
+
+
+def get_cached_track(query: str) -> Optional[Dict[str, Any]]:
+    """Проверяет наличие уже загруженного аудиофайла в Telegram-кэше."""
+    key = normalize_cache_key(query)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT file_id, title, artist, duration FROM tracks_cache WHERE query_key = ?",
+                (key,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+    except Exception:
+        pass
+    return None
+
+
+def save_cached_track(query: str, file_id: str, title: str, artist: str, duration: int):
+    """Сохраняет Telegram file_id скачанного трека для мгновенной отдачи при повторных запросах."""
+    key = normalize_cache_key(query)
+    now = datetime.datetime.now()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO tracks_cache (query_key, file_id, title, artist, duration, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (key, file_id, title, artist, duration, now))
+            conn.commit()
+    except Exception:
+        pass
 
 
 def log_user_activity(user_id: int, username: Optional[str] = None, full_name: Optional[str] = None):

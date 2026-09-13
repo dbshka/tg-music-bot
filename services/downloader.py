@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
@@ -143,27 +144,26 @@ def _sync_download(
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": bitrate,
-            },
-            {
-                "key": "FFmpegMetadata",
-                "add_metadata": True,
             }
         ],
-        # Ускорение кодирования MP3 в 3-4 раза за счет многопоточности и быстрого LAME алгоритма
+        # Максимальное ускорение кодирования MP3 на Render (compression_level 9 в 7-10 раз быстрее уровня 0)
         "postprocessor_args": {
             "FFmpegExtractAudio": [
                 "-threads", "0",
-                "-compression_level", "0"
+                "-compression_level", "9",
+                "-vn"
             ]
         },
     }
 
-    # Если есть активные cookies: используем веб-клиент напрямую без задержек на перебор
+    # Клиенты YouTube:
+    # Важно: мобильные клиенты (mweb, android, ios) исключают ошибку "The page needs to be reloaded",
+    # которая блокирует настольный веб-клиент на серверах Render.
     if cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["web"],
+                "player_client": ["mweb", "android", "ios", "web"],
             }
         }
         print(f"[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
@@ -174,7 +174,7 @@ def _sync_download(
                 "player_client": ["android", "ios", "mweb", "web"],
             }
         }
-        print("[DOWNLOADER] ВНИМАНИЕ: cookies не активны!", flush=True)
+        print("[DOWNLOADER] Режим без cookies (мобильные клиенты)", flush=True)
 
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -227,6 +227,7 @@ async def download_track(
     session_id = uuid.uuid4().hex
     output_dir = DOWNLOADS_DIR / session_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    t_start = time.time()
 
     try:
         audio = await asyncio.to_thread(
@@ -247,9 +248,12 @@ async def download_track(
                 # Повторно применим теги с новой обложкой
                 _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
 
+        elapsed = time.time() - t_start
+        print(f"[DOWNLOADER] ✅ Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
         return audio
     except Exception as primary_error:
-        print(f"[DOWNLOADER] Первичная загрузка {query_or_url} вернула ошибку: {primary_error}", flush=True)
+        elapsed = time.time() - t_start
+        print(f"[DOWNLOADER] Первичная загрузка {query_or_url} ({elapsed:.2f}s) вернула ошибку: {primary_error}", flush=True)
 
         fallback_query = None
         if custom_artist and custom_title:
@@ -279,6 +283,8 @@ async def download_track(
                     if downloaded_thumb:
                         audio.thumbnail_path = downloaded_thumb
                         _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                elapsed_fb = time.time() - t_start
+                print(f"[DOWNLOADER] ✅ Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
             except Exception as sc_err:
                 print(f"[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
@@ -301,6 +307,8 @@ async def download_track(
                     if downloaded_thumb:
                         audio.thumbnail_path = downloaded_thumb
                         _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                elapsed_fb = time.time() - t_start
+                print(f"[DOWNLOADER] ✅ Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
             except Exception as yt_err:
                 print(f"[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
