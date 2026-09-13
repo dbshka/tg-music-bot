@@ -145,17 +145,12 @@ def _sync_download(
         ],
     }
 
-    # Клиенты YouTube: Android и iOS клиенты не имеют ошибки "The page needs to be reloaded"
+    # Клиенты YouTube: Android и iOS клиенты для надежной отдачи аудиопотоков
     ydl_opts["extractor_args"] = {
         "youtube": {
             "player_client": ["android", "ios", "mweb", "web"],
         }
     }
-
-    # Подключение Node.js JS-рантайма при наличии в системе
-    node_bin = shutil.which("node")
-    if node_bin:
-        ydl_opts["js_runtimes"] = {"node": node_bin}
 
     # Если cookies активны (Render Secret File или ENV), используем авторизованную сессию
     if cookies_info["active"]:
