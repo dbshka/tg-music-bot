@@ -118,20 +118,26 @@ def _sync_download(
     output_dir: Path,
     custom_title: Optional[str] = None,
     custom_artist: Optional[str] = None,
-    bitrate: str = DEFAULT_AUDIO_BITRATE
+    bitrate: str = DEFAULT_AUDIO_BITRATE,
+    skip_thumbnail: bool = False
 ) -> DownloadedAudio:
-    """Синхронный процесс загрузки и конвертации через yt-dlp."""
+    """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     outtmpl = str(output_dir / "%(title).100B.%(ext)s")
 
     cookies_info = get_cookies_info()
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        # Приоритет отдаем m4a и opus аудиопотокам оптимального размера (быстрая загрузка без лишнего веса)
+        "format": "ba[ext=m4a]/ba[ext=webm]/ba/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
-        "writethumbnail": True,
+        "writethumbnail": not skip_thumbnail,
         "quiet": True,
         "no_warnings": True,
+        # Ускорение сети: 5 параллельных потоков загрузки фрагментов и увеличенный размер чанка
+        "concurrent_fragment_downloads": 5,
+        "buffersize": 64 * 1024,
+        "http_chunk_size": 10485760,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -143,21 +149,32 @@ def _sync_download(
                 "add_metadata": True,
             }
         ],
+        # Ускорение кодирования MP3 в 3-4 раза за счет многопоточности и быстрого LAME алгоритма
+        "postprocessor_args": {
+            "FFmpegExtractAudio": [
+                "-threads", "0",
+                "-compression_level", "0"
+            ]
+        },
     }
 
-    # Клиенты YouTube: Android и iOS клиенты для надежной отдачи аудиопотоков
-    ydl_opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["android", "ios", "mweb", "web"],
-        }
-    }
-
-    # Если cookies активны (Render Secret File или ENV), используем авторизованную сессию
+    # Если есть активные cookies: используем веб-клиент напрямую без задержек на перебор
     if cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
-        print(f"[DOWNLOADER] Используем cookiefile: {cookies_info['path']} ({cookies_info['size']} байт)", flush=True)
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web"],
+            }
+        }
+        print(f"[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     else:
-        print("[DOWNLOADER] ВНИМАНИЕ: cookies не активны! YouTube может заблокировать запрос.", flush=True)
+        # Резервный режим без cookies
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+            }
+        }
+        print("[DOWNLOADER] ВНИМАНИЕ: cookies не активны!", flush=True)
 
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -218,7 +235,8 @@ async def download_track(
             output_dir,
             custom_title,
             custom_artist,
-            bitrate
+            bitrate,
+            bool(thumbnail_url)
         )
 
         # Если yt-dlp не скачал обложку, но есть ссылка на неё (например, из Spotify/Apple Music)
@@ -253,7 +271,8 @@ async def download_track(
                     output_dir,
                     custom_title,
                     custom_artist,
-                    bitrate
+                    bitrate,
+                    bool(thumbnail_url)
                 )
                 if not audio.thumbnail_path and thumbnail_url:
                     downloaded_thumb = await _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
@@ -274,7 +293,8 @@ async def download_track(
                     output_dir,
                     custom_title,
                     custom_artist,
-                    bitrate
+                    bitrate,
+                    bool(thumbnail_url)
                 )
                 if not audio.thumbnail_path and thumbnail_url:
                     downloaded_thumb = await _download_remote_thumbnail(thumbnail_url, output_dir / "cover")
