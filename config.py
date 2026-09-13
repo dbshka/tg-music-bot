@@ -35,9 +35,15 @@ DB_PATH = BASE_DIR / "bot_database.db"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 
 # 1. Проверяем расположение Secret Files на Render (/etc/secrets/cookies.txt)
+# Важно: раздел /etc/secrets смонтирован в Render как read-only, а yt-dlp обновляет
+# сессионные куки в файле. Поэтому копируем его в рабочую папку бота (доступную для записи).
 render_secret_cookies = Path("/etc/secrets/cookies.txt")
 if render_secret_cookies.exists() and render_secret_cookies.stat().st_size > 50:
-    COOKIES_FILE = render_secret_cookies
+    try:
+        content = render_secret_cookies.read_text(encoding="utf-8", errors="ignore")
+        COOKIES_FILE.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
 
 # 2. Если файл еще не найден, проверяем переменные окружения
 if not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < 50:
