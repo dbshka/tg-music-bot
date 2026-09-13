@@ -148,7 +148,9 @@ def _sync_download(
     # Если cookies активны (Render Secret File или ENV), используем авторизованную сессию
     if cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
+        print(f"[DOWNLOADER] Используем cookiefile: {cookies_info['path']} ({cookies_info['size']} байт)", flush=True)
     else:
+        print("[DOWNLOADER] ВНИМАНИЕ: cookies не активны! YouTube может заблокировать запрос.", flush=True)
         # Резервная попытка обхода бот-детекта через мобильные клиенты
         ydl_opts["extractor_args"] = {
             "youtube": {

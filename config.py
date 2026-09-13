@@ -32,33 +32,63 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "6874119454"))
 DB_PATH = BASE_DIR / "bot_database.db"
 
 # Настройки cookies для YouTube (обход блокировок хостинга)
-COOKIES_FILE = BASE_DIR / "cookies.txt"
+import base64
+import tempfile
 
-# 1. Проверяем расположение Secret Files на Render (/etc/secrets/cookies.txt)
-# Важно: раздел /etc/secrets смонтирован в Render как read-only, а yt-dlp обновляет
-# сессионные куки в файле. Поэтому копируем его в рабочую папку бота (доступную для записи).
-render_secret_cookies = Path("/etc/secrets/cookies.txt")
-if render_secret_cookies.exists() and render_secret_cookies.stat().st_size > 50:
-    try:
-        content = render_secret_cookies.read_text(encoding="utf-8", errors="ignore")
-        COOKIES_FILE.write_text(content, encoding="utf-8")
-    except Exception:
-        pass
+COOKIES_FILE = Path(tempfile.gettempdir()) / "yt_cookies.txt"
 
-# 2. Если файл еще не найден, проверяем переменные окружения
-if not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < 50:
-    import base64
+def _setup_cookies() -> Path:
+    """
+    Ищет cookies во всех возможных источниках:
+    1. Каталог Secret Files на Render (/etc/secrets)
+    2. Файл cookies.txt в корне проекта
+    3. Переменные окружения YOUTUBE_COOKIES_BASE64 и YOUTUBE_COOKIES
+    Копирует найденные куки в гарантированно доступный для записи каталог (/tmp),
+    чтобы избежать ошибок Read-only file system на Render.
+    """
+    dest = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+    
+    # 1. Поиск в Secret Files Render (/etc/secrets)
+    secrets_dir = Path("/etc/secrets")
+    if secrets_dir.exists():
+        print(f"[COOKIES] Обнаружена системная папка Secret Files: {secrets_dir}", flush=True)
+        try:
+            for item in secrets_dir.iterdir():
+                print(f"[COOKIES] Найден секретный файл: {item.name} ({item.stat().st_size} байт)", flush=True)
+                if item.is_file() and item.stat().st_size > 30:
+                    text = item.read_text(encoding="utf-8", errors="ignore")
+                    dest.write_text(text, encoding="utf-8")
+                    print(f"[COOKIES] Успешно скопирован {item} -> {dest} ({dest.stat().st_size} байт)", flush=True)
+                    return dest
+        except Exception as e:
+            print(f"[COOKIES] Ошибка при чтении /etc/secrets: {e}", flush=True)
+
+    # 2. Поиск локального cookies.txt в папке проекта
+    for name in ["cookies.txt", "cookies"]:
+        local_candidate = BASE_DIR / name
+        if local_candidate.exists() and local_candidate.stat().st_size > 30:
+            try:
+                text = local_candidate.read_text(encoding="utf-8", errors="ignore")
+                dest.write_text(text, encoding="utf-8")
+                print(f"[COOKIES] Скопирован локальный файл {local_candidate} -> {dest} ({dest.stat().st_size} байт)", flush=True)
+                return dest
+            except Exception as e:
+                print(f"[COOKIES] Ошибка при копировании {local_candidate}: {e}", flush=True)
+
+    # 3. Переменная YOUTUBE_COOKIES_BASE64
     raw_b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
     if raw_b64:
         try:
             decoded = base64.b64decode(raw_b64.strip()).decode("utf-8")
-            COOKIES_FILE = BASE_DIR / "cookies.txt"
-            COOKIES_FILE.write_text(decoded.strip(), encoding="utf-8")
-        except Exception:
-            pass
+            dest.write_text(decoded.strip(), encoding="utf-8")
+            print(f"[COOKIES] Успешно загружены cookies из YOUTUBE_COOKIES_BASE64 ({dest.stat().st_size} байт)", flush=True)
+            return dest
+        except Exception as e:
+            print(f"[COOKIES] Ошибка декодирования YOUTUBE_COOKIES_BASE64: {e}", flush=True)
 
+    # 4. Переменная YOUTUBE_COOKIES
     raw_env = os.getenv("YOUTUBE_COOKIES")
-    if raw_env and (not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < 50):
+    if raw_env:
         try:
             cleaned = raw_env.replace("\\n", "\n").replace("\\t", "\t").strip()
             if cleaned.startswith("IyBOZXRzY2FwZQ") or (len(cleaned) > 100 and " " not in cleaned and "\n" not in cleaned):
@@ -66,31 +96,43 @@ if not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < 50:
                     cleaned = base64.b64decode(cleaned).decode("utf-8")
                 except Exception:
                     pass
-            COOKIES_FILE = BASE_DIR / "cookies.txt"
-            COOKIES_FILE.write_text(cleaned, encoding="utf-8")
-        except Exception:
-            pass
+            dest.write_text(cleaned, encoding="utf-8")
+            print(f"[COOKIES] Успешно загружены cookies из YOUTUBE_COOKIES ({dest.stat().st_size} байт)", flush=True)
+            return dest
+        except Exception as e:
+            print(f"[COOKIES] Ошибка записи YOUTUBE_COOKIES: {e}", flush=True)
+
+    print("[COOKIES] Файл cookies не найден ни в одном из источников.", flush=True)
+    return dest
+
+COOKIES_FILE = _setup_cookies()
 
 
 def get_cookies_info() -> dict:
-    """Возвращает информацию о текущем состоянии cookies для логирования."""
-    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 50:
+    """Возвращает актуальную информацию о cookies."""
+    target = COOKIES_FILE
+    # Если в первый раз не нашлось, повторно проверим
+    if not target.exists() or target.stat().st_size < 30:
+        target = _setup_cookies()
+
+    if target.exists() and target.stat().st_size > 30:
         try:
-            content = COOKIES_FILE.read_text(encoding="utf-8", errors="ignore")
+            content = target.read_text(encoding="utf-8", errors="ignore")
             lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
             return {
                 "active": True,
-                "path": str(COOKIES_FILE),
-                "size": COOKIES_FILE.stat().st_size,
+                "path": str(target),
+                "size": target.stat().st_size,
                 "cookie_count": len(lines)
             }
         except Exception:
             pass
     return {
         "active": False,
-        "path": str(COOKIES_FILE),
+        "path": str(target),
         "size": 0,
         "cookie_count": 0
     }
+
 
 
