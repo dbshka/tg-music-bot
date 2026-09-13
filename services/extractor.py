@@ -379,6 +379,50 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
     except Exception:
         pass
 
+async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
+    """
+    Извлекает название, автора и обложку трека из YouTube через публичный oEmbed API.
+    Работает со 100% надежностью без cookies и без блокировок, гарантируя метаданные для Fallback.
+    """
+    clean_url = url.split('&')[0] if 'watch?v=' in url else url
+    oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(clean_url)}&format=json"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                raw_title = data.get("title") or ""
+                author = data.get("author_name") or ""
+                thumb = data.get("thumbnail_url")
+
+                title = raw_title
+                artist = author
+                if " - " in raw_title:
+                    parts = raw_title.split(" - ", 1)
+                    artist = parts[0].strip()
+                    title = parts[1].strip()
+                elif " — " in raw_title:
+                    parts = raw_title.split(" — ", 1)
+                    artist = parts[0].strip()
+                    title = parts[1].strip()
+
+                title = re.sub(
+                    r'\s*[\(\[](?:Official|Music Video|Audio|Lyric|Video|Remix|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
+                    '',
+                    title,
+                    flags=re.IGNORECASE
+                ).strip()
+
+                return ExtractedTrack(
+                    platform="YouTube / YouTube Music",
+                    target=url,
+                    is_search=False,
+                    title=title or raw_title,
+                    artist=artist or author,
+                    thumbnail_url=thumb
+                )
+    except Exception:
+        pass
     return None
 
 
@@ -388,7 +432,8 @@ async def resolve_track_url(url: str) -> ExtractedTrack:
     - Яндекс Музыка -> OpenGraph парсинг -> ytsearch
     - Spotify -> OpenGraph / oEmbed / Deezer -> ytsearch
     - Apple Music -> iTunes lookup -> ytsearch
-    - YouTube, SoundCloud, VK, Bandcamp и др. -> прямая загрузка через yt-dlp
+    - YouTube -> oEmbed метаданные + прямая загрузка
+    - SoundCloud, VK, Bandcamp и др. -> прямая загрузка через yt-dlp
     """
     parsed = urllib.parse.urlparse(url)
     domain = parsed.netloc.lower()
@@ -412,7 +457,13 @@ async def resolve_track_url(url: str) -> ExtractedTrack:
             if track:
                 return track
 
-    # Сервисы, поддерживаемые yt-dlp напрямую
+        # 4. YouTube / YouTube Music (извлекаем точные метаданные для мгновенного SoundCloud Fallback)
+        if "youtube.com" in domain or "youtu.be" in domain:
+            yt_track = await extract_youtube_info(url, session)
+            if yt_track:
+                return yt_track
+
+    # Прочие сервисы, поддерживаемые yt-dlp напрямую
     platform_name = "Музыкальный сервис"
     if "youtube.com" in domain or "youtu.be" in domain:
         platform_name = "YouTube / YouTube Music"

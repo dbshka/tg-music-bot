@@ -169,11 +169,11 @@ async def handle_music_request(message: Message):
         except Exception as e:
             logger.exception("Ошибка при обработке ссылки %s", url)
             err_str = str(e)
-            if "Sign in to confirm" in err_str or "bot" in err_str.lower():
+            if "Sign in to confirm you’re not a bot" in err_str or "Sign in to confirm" in err_str:
                 user_friendly = (
-                    "❌ <b>YouTube заблокировал облачный сервер хостинга.</b>\n\n"
-                    "Для работы на бесплатном сервере Render необходимо прикрепить файл <code>cookies.txt</code> "
-                    "в панели Render (раздел <b>Environment ➔ Secret Files</b>)."
+                    "❌ <b>YouTube временно ограничил прямое скачивание по этой ссылке.</b>\n\n"
+                    "💡 <b>Решение:</b> просто отправьте название этой песни текстом — "
+                    "бот мгновенно найдет и пришлет её!"
                 )
             else:
                 user_friendly = f"❌ <b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
@@ -192,8 +192,9 @@ async def handle_music_request(message: Message):
         try:
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
+                    # SoundCloud в приоритете для быстрого и надежного поиска без блокировок
                     downloaded_audio = await download_track(
-                        query_or_url=f"ytsearch1:{user_text}"
+                        query_or_url=f"scsearch1:{user_text}"
                     )
 
             if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
@@ -245,14 +246,7 @@ async def handle_music_request(message: Message):
         except Exception as e:
             logger.exception("Ошибка при поиске трека %s", user_text)
             err_str = str(e)
-            if "Sign in to confirm" in err_str or "bot" in err_str.lower():
-                user_friendly = (
-                    "❌ <b>YouTube заблокировал облачный сервер хостинга.</b>\n\n"
-                    "Для работы на бесплатном сервере Render необходимо прикрепить файл <code>cookies.txt</code> "
-                    "в панели Render (раздел <b>Environment ➔ Secret Files</b>)."
-                )
-            else:
-                user_friendly = f"❌ <b>Трек не найден или произошла ошибка:</b>\n<i>{html.escape(err_str[:250])}</i>"
+            user_friendly = f"❌ <b>Трек не найден или произошла ошибка:</b>\n<i>{html.escape(err_str[:250])}</i>"
             await status_msg.edit_text(user_friendly, parse_mode="HTML")
         finally:
             if downloaded_audio:

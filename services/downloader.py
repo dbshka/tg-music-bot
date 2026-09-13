@@ -157,9 +157,12 @@ def _sync_download(
     }
 
     # Клиенты YouTube:
+    # Клиенты YouTube:
     # Важно: мобильные клиенты (mweb, android, ios) исключают ошибку "The page needs to be reloaded",
     # которая блокирует настольный веб-клиент на серверах Render.
-    if cookies_info["active"]:
+    is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
+
+    if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
@@ -167,8 +170,7 @@ def _sync_download(
             }
         }
         print(f"[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
-    else:
-        # Резервный режим без cookies
+    elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["android", "ios", "mweb", "web"],
@@ -177,12 +179,31 @@ def _sync_download(
         print("[DOWNLOADER] Режим без cookies (мобильные клиенты)", flush=True)
 
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query_or_url, download=True)
-        if "entries" in info:
-            if not info["entries"]:
-                raise ValueError("Трек не найден по данному запросу.")
-            info = info["entries"][0]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query_or_url, download=True)
+    except Exception as extract_err:
+        err_msg = str(extract_err).lower()
+        # Если cookies в Render устарели и YouTube требует авторизацию ("Sign in to confirm you're not a bot" / 403):
+        # Автоматически пробуем второй шанс БЕЗ cookies через чистые мобильные клиенты (android, ios, mweb)
+        if "cookiefile" in ydl_opts and ("sign in" in err_msg or "bot" in err_msg or "cookie" in err_msg or "reload" in err_msg or "403" in err_msg):
+            print(f"[DOWNLOADER] Сессия cookies недействительна ({extract_err}). Пробуем чистый запуск без cookies...", flush=True)
+            ydl_opts_retry = dict(ydl_opts)
+            ydl_opts_retry.pop("cookiefile", None)
+            ydl_opts_retry["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["android", "ios", "mweb"],
+                }
+            }
+            with yt_dlp.YoutubeDL(ydl_opts_retry) as ydl_retry:
+                info = ydl_retry.extract_info(query_or_url, download=True)
+        else:
+            raise extract_err
+
+    if "entries" in info:
+        if not info["entries"]:
+            raise ValueError("Трек не найден по данному запросу.")
+        info = info["entries"][0]
 
     mp3_files = list(output_dir.glob("*.mp3"))
     if not mp3_files:
@@ -260,10 +281,14 @@ async def download_track(
             fallback_query = f"{custom_artist} - {custom_title}"
         elif custom_title:
             fallback_query = custom_title
+        elif query_or_url.startswith("scsearch1:"):
+            fallback_query = query_or_url[len("scsearch1:"):]
+        elif query_or_url.startswith("ytsearch1:"):
+            fallback_query = query_or_url[len("ytsearch1:"):]
         else:
-            path_parts = [p for p in urllib.parse.urlparse(query_or_url).path.split('/') if p and p not in ('sets', 'track', 'song')]
+            path_parts = [p for p in urllib.parse.urlparse(query_or_url).path.split('/') if p and p not in ('sets', 'track', 'song', 'watch')]
             if path_parts:
-                fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ")
+                fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ").replace("—", " ")
 
         # 1. Fallback в SoundCloud: если YouTube выдал ошибку (The page needs to be reloaded / CAPTCHA / bot check)
         if fallback_query and not query_or_url.startswith("scsearch"):
