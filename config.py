@@ -31,13 +31,60 @@ if CUSTOM_API_SERVER:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6874119454"))
 DB_PATH = BASE_DIR / "bot_database.db"
 
-# Автоматическое создание cookies.txt из переменной окружения YOUTUBE_COOKIES
-# (удобно для Hugging Face Spaces Secrets без коммита файла в репозиторий)
+# Настройки cookies для YouTube (обход блокировок хостинга)
 COOKIES_FILE = BASE_DIR / "cookies.txt"
-YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
-if YOUTUBE_COOKIES:
-    try:
-        COOKIES_FILE.write_text(YOUTUBE_COOKIES.strip(), encoding="utf-8")
-    except Exception:
-        pass
+
+# 1. Проверяем расположение Secret Files на Render (/etc/secrets/cookies.txt)
+render_secret_cookies = Path("/etc/secrets/cookies.txt")
+if render_secret_cookies.exists() and render_secret_cookies.stat().st_size > 50:
+    COOKIES_FILE = render_secret_cookies
+
+# 2. Если файл еще не найден, проверяем переменные окружения
+if not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < 50:
+    import base64
+    raw_b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
+    if raw_b64:
+        try:
+            decoded = base64.b64decode(raw_b64.strip()).decode("utf-8")
+            COOKIES_FILE = BASE_DIR / "cookies.txt"
+            COOKIES_FILE.write_text(decoded.strip(), encoding="utf-8")
+        except Exception:
+            pass
+
+    raw_env = os.getenv("YOUTUBE_COOKIES")
+    if raw_env and (not COOKIES_FILE.exists() or COOKIES_FILE.stat().st_size < 50):
+        try:
+            cleaned = raw_env.replace("\\n", "\n").replace("\\t", "\t").strip()
+            if cleaned.startswith("IyBOZXRzY2FwZQ") or (len(cleaned) > 100 and " " not in cleaned and "\n" not in cleaned):
+                try:
+                    cleaned = base64.b64decode(cleaned).decode("utf-8")
+                except Exception:
+                    pass
+            COOKIES_FILE = BASE_DIR / "cookies.txt"
+            COOKIES_FILE.write_text(cleaned, encoding="utf-8")
+        except Exception:
+            pass
+
+
+def get_cookies_info() -> dict:
+    """Возвращает информацию о текущем состоянии cookies для логирования."""
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 50:
+        try:
+            content = COOKIES_FILE.read_text(encoding="utf-8", errors="ignore")
+            lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
+            return {
+                "active": True,
+                "path": str(COOKIES_FILE),
+                "size": COOKIES_FILE.stat().st_size,
+                "cookie_count": len(lines)
+            }
+        except Exception:
+            pass
+    return {
+        "active": False,
+        "path": str(COOKIES_FILE),
+        "size": 0,
+        "cookie_count": 0
+    }
+
 

@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
-# Установка системных утилит и FFmpeg
+# Установка системных утилит, FFmpeg и Node.js (JS-рантайм для yt-dlp для решения челленджей YouTube)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Создание пользователя с UID 1000 (стандарт безопасности Hugging Face Spaces)

@@ -19,7 +19,7 @@ from PIL import Image
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC, ID3NoHeaderError
 
-from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR
+from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
 
 
 @dataclass
@@ -123,7 +123,7 @@ def _sync_download(
     """Синхронный процесс загрузки и конвертации через yt-dlp."""
     outtmpl = str(output_dir / "%(title).100B.%(ext)s")
 
-    cookies_file = BASE_DIR / "cookies.txt"
+    cookies_info = get_cookies_info()
 
     ydl_opts = {
         "format": "bestaudio/best",
@@ -132,14 +132,6 @@ def _sync_download(
         "writethumbnail": True,
         "quiet": True,
         "no_warnings": True,
-        # Эмуляция мобильных клиентов Android и iOS для обхода бот-детекта YouTube
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb"],
-                "player_skip": ["webpage", "configs"],
-            }
-        },
-
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -153,9 +145,16 @@ def _sync_download(
         ],
     }
 
-    # Если в папку проекта подложен файл cookies.txt, используем авторизованную сессию
-    if cookies_file.exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
+    # Если cookies активны (Render Secret File или ENV), используем авторизованную сессию
+    if cookies_info["active"]:
+        ydl_opts["cookiefile"] = cookies_info["path"]
+    else:
+        # Резервная попытка обхода бот-детекта через мобильные клиенты
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+            }
+        }
 
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:

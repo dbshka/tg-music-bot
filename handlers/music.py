@@ -114,12 +114,16 @@ async def handle_music_request(message: Message):
 
         except Exception as e:
             logger.exception("Ошибка при обработке ссылки %s", url)
-            error_text = html.escape(str(e))
-            await status_msg.edit_text(
-                f"❌ <b>Не удалось скачать трек.</b>\n"
-                f"<i>Причина: {error_text}</i>",
-                parse_mode="HTML"
-            )
+            err_str = str(e)
+            if "Sign in to confirm" in err_str or "bot" in err_str.lower():
+                user_friendly = (
+                    "❌ <b>YouTube заблокировал облачный сервер хостинга.</b>\n\n"
+                    "Для работы на бесплатном сервере Render необходимо прикрепить файл <code>cookies.txt</code> "
+                    "в панели Render (раздел <b>Environment ➔ Secret Files</b>)."
+                )
+            else:
+                user_friendly = f"❌ <b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
+            await status_msg.edit_text(user_friendly, parse_mode="HTML")
         finally:
             if downloaded_audio:
                 downloaded_audio.cleanup()
@@ -166,12 +170,16 @@ async def handle_music_request(message: Message):
 
         except Exception as e:
             logger.exception("Ошибка при поиске трека %s", user_text)
-            error_text = html.escape(str(e))
-            await status_msg.edit_text(
-                f"❌ <b>Трек не найден или произошла ошибка:</b>\n"
-                f"<i>{error_text}</i>",
-                parse_mode="HTML"
-            )
+            err_str = str(e)
+            if "Sign in to confirm" in err_str or "bot" in err_str.lower():
+                user_friendly = (
+                    "❌ <b>YouTube заблокировал облачный сервер хостинга.</b>\n\n"
+                    "Для работы на бесплатном сервере Render необходимо прикрепить файл <code>cookies.txt</code> "
+                    "в панели Render (раздел <b>Environment ➔ Secret Files</b>)."
+                )
+            else:
+                user_friendly = f"❌ <b>Трек не найден или произошла ошибка:</b>\n<i>{html.escape(err_str[:250])}</i>"
+            await status_msg.edit_text(user_friendly, parse_mode="HTML")
         finally:
             if downloaded_audio:
                 downloaded_audio.cleanup()

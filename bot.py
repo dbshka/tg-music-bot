@@ -13,7 +13,7 @@ from aiogram.types import BotCommand
 
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN, PROXY, CUSTOM_API_SERVER, DOWNLOADS_DIR
+from config import BOT_TOKEN, PROXY, CUSTOM_API_SERVER, DOWNLOADS_DIR, get_cookies_info
 from services.database import init_db
 from handlers.admin import router as admin_router
 from handlers.music import router as music_router
@@ -104,6 +104,21 @@ async def main():
     dp.include_router(music_router)
 
     logger.info("Бот запускается...")
+
+    # Проверка статуса cookies для YouTube
+    cookie_info = get_cookies_info()
+    if cookie_info["active"]:
+        logger.info(
+            "🍪 Cookies активны: %s (%d байт, %d записей)",
+            cookie_info["path"],
+            cookie_info["size"],
+            cookie_info["cookie_count"]
+        )
+    else:
+        logger.warning(
+            "⚠️ Cookies НЕ обнаружены! На сервере Render YouTube может требовать авторизацию (Sign in to confirm you're not a bot). "
+            "Рекомендуется добавить Secret File 'cookies.txt' в панели Render (Environment -> Secret Files)."
+        )
 
     # Очистка папки downloads от старых временных файлов
     try:
