@@ -139,14 +139,27 @@ async def main():
         bot_user = await bot.get_me()
         logger.info("✅ Бот успешно подключен к Telegram как @%s!", bot_user.username)
 
-        # Регистрация меню команд Telegram
+        # Регистрация меню команд Telegram и карточки «Что умеет этот бот» (до нажатия Старт)
         try:
             await bot.set_my_commands([
-                BotCommand(command="start", description="🚀 Начать / Инструкция"),
-                BotCommand(command="help", description="📖 Поддерживаемые ссылки"),
+                BotCommand(command="start", description="🚀 Начать / Меню"),
+                BotCommand(command="help", description="📖 Инструкция по боту"),
             ])
+            # Окно «Что умеет этот бот?», отображаемое по центру чата до нажатия «Старт»
+            bot_description = (
+                "👋 Я помогу скачать музыку в MP3 и настроить её под себя!\n\n"
+                "🎵 Скачивание треков:\n"
+                "Отправь ссылку (YouTube, Spotify, Яндекс Музыка, Apple Music, SoundCloud, VK) или название песни.\n\n"
+                "✏️ Редактор тегов:\n"
+                "Меняй название, исполнителя, альбом и обложку трека в пару кликов прямо в Telegram.\n\n"
+                "📂 Поддерживается загрузка своих MP3-файлов для изменения тегов и обложки!"
+            )
+            await bot.set_my_description(description=bot_description)
+            await bot.set_my_short_description(
+                short_description="Скачивай треки из YouTube, Spotify, Я.Музыки, Apple Music и редактируй теги MP3 прямо в чате!"
+            )
         except Exception as e:
-            logger.debug("Не удалось обновить меню команд: %s", e)
+            logger.debug("Не удалось обновить меню команд и описание: %s", e)
 
         await dp.start_polling(bot)
 
