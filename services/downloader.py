@@ -135,10 +135,11 @@ def _sync_download(
         # Эмуляция мобильных клиентов Android и iOS для обхода бот-детекта YouTube
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web"],
+                "player_client": ["android", "ios", "mweb"],
                 "player_skip": ["webpage", "configs"],
             }
         },
+
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

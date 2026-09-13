@@ -35,8 +35,9 @@ DB_PATH = BASE_DIR / "bot_database.db"
 # (удобно для Hugging Face Spaces Secrets без коммита файла в репозиторий)
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
-if YOUTUBE_COOKIES and not COOKIES_FILE.exists():
+if YOUTUBE_COOKIES:
     try:
         COOKIES_FILE.write_text(YOUTUBE_COOKIES.strip(), encoding="utf-8")
     except Exception:
         pass
+
