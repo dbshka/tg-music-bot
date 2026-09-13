@@ -32,6 +32,8 @@ class DownloadedAudio:
     thumbnail_path: Optional[Path]
     filesize: int
     folder_path: Path
+    perf_timings: Optional[dict] = None
+    invocations: Optional[list] = None
 
     def cleanup(self):
         """Удаляет временную папку загрузки и все файлы внутри."""
@@ -166,57 +168,190 @@ def _sync_download(
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["android", "ios", "mweb", "web"],
             }
         }
         print(f"[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["android", "ios", "mweb", "web"],
             }
         }
-        print("[DOWNLOADER] Режим без cookies (клиент android)", flush=True)
+        print("[DOWNLOADER] Режим без cookies (клиенты android, ios, mweb)", flush=True)
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
+    invocations = []
+    perf_timings = {
+        "search": 0.0,
+        "candidate_selection": 0.0,
+        "download": 0.0,
+        "ffmpeg": 0.0,
+        "tags": 0.0
+    }
+    t_start_all = time.perf_counter()
+
     def _execute_extraction(options):
-        with yt_dlp.YoutubeDL(options) as ydl:
-            if is_search:
-                # 1. Извлекаем кандидатов поиска без скачивания
-                search_info = ydl.extract_info(query_or_url, download=False)
-                entries = [e for e in search_info.get("entries", []) if e]
-                if not entries:
-                    raise ValueError("Трек не найден по данному запросу.")
+        source = "soundcloud" if (query_or_url.startswith("scsearch") or "soundcloud.com" in query_or_url) else "youtube"
+        if is_search:
+            # 1. Извлекаем кандидатов поиска БЕЗ полного скачивания веб-страниц (extract_flat=True)
+            search_opts = dict(options)
+            search_opts["extract_flat"] = True
+            search_opts["noplaylist"] = True
 
-                # 2. Интеллектуальный выбор кандидата (отсекаем превью <= 35s, тизеры, шортсы)
-                if expected_duration:
-                    valid_candidates = []
-                    for e in entries:
-                        dur = e.get("duration") or 0
-                        fmt_str = str(e.get("formats", "")).lower()
-                        is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
-                        if is_prev and abs(dur - expected_duration) > 30:
-                            continue
-                        valid_candidates.append(e)
-                    chosen_list = valid_candidates if valid_candidates else entries
-                    selected_entry = min(chosen_list, key=lambda e: abs((e.get("duration") or 0) - expected_duration))
-                else:
-                    # Без известной длительности: отсекаем превью и шортсы (<45s), если есть полноценные треки (>60s)
-                    full_tracks = []
-                    for e in entries:
-                        dur = e.get("duration") or 0
-                        fmt_str = str(e.get("formats", "")).lower()
-                        is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
-                        if not is_prev and dur >= 45:
-                            full_tracks.append(e)
-                    selected_entry = full_tracks[0] if full_tracks else entries[0]
+            inv_idx1 = len(invocations) + 1
+            t_s0 = time.perf_counter()
+            with yt_dlp.YoutubeDL(search_opts) as ydl_search:
+                search_info = ydl_search.extract_info(query_or_url, download=False)
+            t_s1 = time.perf_counter()
+            dur_s = t_s1 - t_s0
+            perf_timings["search"] += dur_s
 
-                # 3. Скачиваем только выбранного кандидата
-                target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
-                return ydl.extract_info(target_url, download=True)
+            entries = [e for e in search_info.get("entries", []) if e]
+            invocations.append({
+                "invocation": inv_idx1,
+                "purpose": "candidate_search",
+                "source": source,
+                "start": t_s0 - t_start_all,
+                "end": t_s1 - t_start_all,
+                "duration": dur_s,
+                "result": f"OK ({len(entries)} candidates)"
+            })
+            print(f"[YTDLP] invocation=#{inv_idx1} purpose='candidate_search' source='{source}' start={t_s0 - t_start_all:.2f}s end={t_s1 - t_start_all:.2f}s duration={dur_s:.2f}s result='OK ({len(entries)} candidates)'", flush=True)
+
+            if not entries:
+                raise ValueError("Трек не найден по данному запросу.")
+
+            # 2. Интеллектуальный выбор кандидата (отсекаем превью <= 35s, тизеры, шортсы)
+            t_c0 = time.perf_counter()
+            if expected_duration:
+                valid_candidates = []
+                for e in entries:
+                    dur = e.get("duration") or 0
+                    fmt_str = str(e.get("formats", "")).lower()
+                    is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
+                    if is_prev and abs(dur - expected_duration) > 30:
+                        continue
+                    valid_candidates.append(e)
+                chosen_list = valid_candidates if valid_candidates else entries
+                selected_entry = min(chosen_list, key=lambda e: abs((e.get("duration") or 0) - expected_duration))
             else:
-                return ydl.extract_info(query_or_url, download=True)
+                full_tracks = []
+                for e in entries:
+                    dur = e.get("duration") or 0
+                    fmt_str = str(e.get("formats", "")).lower()
+                    is_prev = "preview" in fmt_str or "preview" in str(e.get("format_id", "")).lower()
+                    if not is_prev and dur >= 45:
+                        full_tracks.append(e)
+                selected_entry = full_tracks[0] if full_tracks else entries[0]
+            t_c1 = time.perf_counter()
+            perf_timings["candidate_selection"] += (t_c1 - t_c0)
+
+            # 3. Скачиваем только выбранного кандидата
+            target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
+            if target_url and not target_url.startswith("http") and "soundcloud" not in source:
+                target_url = f"https://www.youtube.com/watch?v={target_url}"
+
+            dl_opts = dict(options)
+            dl_opts["extract_flat"] = False
+
+            hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
+            def p_hook(d):
+                if d.get("status") == "downloading" and not hook_times["dl_start"]:
+                    hook_times["dl_start"] = time.perf_counter()
+                elif d.get("status") == "finished":
+                    hook_times["dl_end"] = time.perf_counter()
+
+            def pp_hook(d):
+                if d.get("status") == "started" and not hook_times["pp_start"]:
+                    hook_times["pp_start"] = time.perf_counter()
+                elif d.get("status") == "finished":
+                    hook_times["pp_end"] = time.perf_counter()
+
+            dl_opts["progress_hooks"] = [p_hook]
+            dl_opts["postprocessor_hooks"] = [pp_hook]
+
+            inv_idx2 = len(invocations) + 1
+            t_d0 = time.perf_counter()
+            with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
+                res_info = ydl_dl.extract_info(target_url, download=True)
+            t_d1 = time.perf_counter()
+            dur_dl_all = t_d1 - t_d0
+
+            if hook_times["dl_start"] and hook_times["dl_end"]:
+                dur_net = hook_times["dl_end"] - hook_times["dl_start"]
+            else:
+                dur_net = dur_dl_all * 0.65
+
+            if hook_times["pp_start"] and hook_times["pp_end"]:
+                dur_ff = hook_times["pp_end"] - hook_times["pp_start"]
+            else:
+                dur_ff = max(0.1, dur_dl_all - dur_net)
+
+            perf_timings["download"] += dur_net
+            perf_timings["ffmpeg"] += dur_ff
+
+            invocations.append({
+                "invocation": inv_idx2,
+                "purpose": "stream_download_and_convert",
+                "source": source,
+                "start": t_d0 - t_start_all,
+                "end": t_d1 - t_start_all,
+                "duration": dur_dl_all,
+                "result": "OK"
+            })
+            print(f"[YTDLP] invocation=#{inv_idx2} purpose='stream_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
+            return res_info
+        else:
+            inv_idx = len(invocations) + 1
+            t_d0 = time.perf_counter()
+            dl_opts = dict(options)
+            hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
+            def p_hook(d):
+                if d.get("status") == "downloading" and not hook_times["dl_start"]:
+                    hook_times["dl_start"] = time.perf_counter()
+                elif d.get("status") == "finished":
+                    hook_times["dl_end"] = time.perf_counter()
+
+            def pp_hook(d):
+                if d.get("status") == "started" and not hook_times["pp_start"]:
+                    hook_times["pp_start"] = time.perf_counter()
+                elif d.get("status") == "finished":
+                    hook_times["pp_end"] = time.perf_counter()
+
+            dl_opts["progress_hooks"] = [p_hook]
+            dl_opts["postprocessor_hooks"] = [pp_hook]
+
+            with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
+                res_info = ydl_dl.extract_info(query_or_url, download=True)
+            t_d1 = time.perf_counter()
+            dur_dl_all = t_d1 - t_d0
+
+            if hook_times["dl_start"] and hook_times["dl_end"]:
+                dur_net = hook_times["dl_end"] - hook_times["dl_start"]
+            else:
+                dur_net = dur_dl_all * 0.65
+
+            if hook_times["pp_start"] and hook_times["pp_end"]:
+                dur_ff = hook_times["pp_end"] - hook_times["pp_start"]
+            else:
+                dur_ff = max(0.1, dur_dl_all - dur_net)
+
+            perf_timings["download"] += dur_net
+            perf_timings["ffmpeg"] += dur_ff
+
+            invocations.append({
+                "invocation": inv_idx,
+                "purpose": "direct_download",
+                "source": source,
+                "start": t_d0 - t_start_all,
+                "end": t_d1 - t_start_all,
+                "duration": dur_dl_all,
+                "result": "OK"
+            })
+            print(f"[YTDLP] invocation=#{inv_idx} purpose='direct_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
+            return res_info
 
     try:
         info = _execute_extraction(ydl_opts)
@@ -228,7 +363,7 @@ def _sync_download(
             ydl_opts_retry.pop("cookiefile", None)
             ydl_opts_retry["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["android", "web"],
+                    "player_client": ["android", "ios", "mweb", "web"],
                 }
             }
             info = _execute_extraction(ydl_opts_retry)
@@ -257,7 +392,9 @@ def _sync_download(
     extracted_artist = custom_artist or info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist"
     duration = int(info.get("duration") or 0)
 
+    t_tag0 = time.perf_counter()
     _apply_custom_metadata(mp3_path, extracted_title, extracted_artist, thumbnail_path)
+    perf_timings["tags"] = time.perf_counter() - t_tag0
 
     return DownloadedAudio(
         file_path=mp3_path,
@@ -266,7 +403,9 @@ def _sync_download(
         duration=duration,
         thumbnail_path=thumbnail_path,
         filesize=filesize,
-        folder_path=output_dir
+        folder_path=output_dir,
+        perf_timings=perf_timings,
+        invocations=invocations
     )
 
 

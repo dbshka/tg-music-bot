@@ -92,36 +92,40 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
         track_id = match.group(1)
 
     if track_id:
-        try:
-            api_url = f"https://api.music.yandex.net/tracks/{track_id}"
-            headers = {"User-Agent": "Yandex-Music-API"}
-            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    results = data.get("result", [])
-                    if results and isinstance(results, list):
-                        item = results[0]
-                        title = item.get("title")
-                        artists = ", ".join([a.get("name") for a in item.get("artists", []) if a.get("name")])
-                        duration = int(item.get("durationMs", 0) / 1000) or None
-                        cover = item.get("coverUri")
-                        if not cover and item.get("artists"):
-                            cover = item.get("artists")[0].get("cover", {}).get("uri")
-                        thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+        for ua in ["YandexMusic/2024.01.1 (Android; Android 14)", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "Yandex-Music-API"]:
+            try:
+                api_url = f"https://api.music.yandex.net/tracks/{track_id}"
+                headers = {
+                    "User-Agent": ua,
+                    "Accept": "application/json"
+                }
+                async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        results = data.get("result", [])
+                        if results and isinstance(results, list):
+                            item = results[0]
+                            title = item.get("title")
+                            artists = ", ".join([a.get("name") for a in item.get("artists", []) if a.get("name")])
+                            duration = int(item.get("durationMs", 0) / 1000) or None
+                            cover = item.get("coverUri")
+                            if not cover and item.get("artists"):
+                                cover = item.get("artists")[0].get("cover", {}).get("uri")
+                            thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
 
-                        if title:
-                            search_query = f"{artists} - {title}" if artists else title
-                            return ExtractedTrack(
-                                platform="Яндекс Музыка",
-                                target=f"ytsearch3:{search_query}",
-                                is_search=True,
-                                title=title,
-                                artist=artists,
-                                thumbnail_url=thumb_url,
-                                duration=duration
-                            )
-        except Exception:
-            pass
+                            if title:
+                                search_query = f"{artists} - {title}" if artists else title
+                                return ExtractedTrack(
+                                    platform="Яндекс Музыка",
+                                    target=f"ytsearch3:{search_query}",
+                                    is_search=True,
+                                    title=title,
+                                    artist=artists,
+                                    thumbnail_url=thumb_url,
+                                    duration=duration
+                                )
+            except Exception:
+                continue
 
     # Резервный парсинг HTML (OpenGraph / Title)
     headers = {
@@ -491,10 +495,11 @@ async def resolve_track_url(url: str) -> ExtractedTrack:
 
     async with aiohttp.ClientSession() as session:
         # 1. Яндекс Музыка
-        if "music.yandex." in domain:
+        if "music.yandex." in domain or ("yandex." in domain and ("/album/" in url or "/track/" in url)):
             track = await extract_yandex_music_info(url, session)
             if track:
                 return track
+            raise ValueError("Не удалось получить информацию о треке Яндекс Музыки. Попробуйте отправить название трека текстом.")
 
         # 2. Spotify
         if "spotify.com" in domain:
