@@ -1,0 +1,8 @@
+aiogram>=3.17.0
+yt-dlp>=2025.01.26
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+mutagen>=1.47.0
+pillow>=10.0.0
+aiohttp-socks>=0.10.0
+

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+cookies.txt
+*.db
+bot_database.db
+
+# Загрузки и временные файлы
+downloads/
+*.mp3
+*.webm
+*.m4a
+*.webp
+
+# Разрешаем логотипы проекта
+!logo*.png
+!logo*.jpg
+
+# IDE
+.idea/
+.vscode/
+
