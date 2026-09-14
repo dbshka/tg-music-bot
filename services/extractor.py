@@ -339,81 +339,185 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
         except Exception:
             pass
 
-    # Уровень 6: HTML парсинг страницы (с поддержкой промо-тегов Яндекса)
+    # Уровень 6: HTML парсинг страницы (Next.js SSR state: preloadedTrack, preloadedAlbum, preloadedArtist, промо-теги)
     clean_url = url.split("?")[0]
     request_urls = [clean_url]
+    if "music.yandex.ru" in clean_url:
+        request_urls.append(clean_url.replace("music.yandex.ru", "music.yandex.com"))
+    elif "music.yandex.com" in clean_url:
+        request_urls.append(clean_url.replace("music.yandex.com", "music.yandex.ru"))
     if CUSTOM_API_SERVER:
         request_urls.insert(0, f"{CUSTOM_API_SERVER}/proxy/{clean_url}")
 
     html_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "ru,en;q=0.9"
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
 
     for req_url in request_urls:
         try:
             async with session.get(req_url, headers=html_headers, timeout=aiohttp.ClientTimeout(total=4.5)) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    title = None
-                    artist = None
-                    duration = None
-                    thumbnail_url = None
+                if resp.status != 200:
+                    continue
+                html = await resp.text()
+                clean_html = html.replace('\\"', '"').replace('\\\\', '\\')
 
-                    all_og_titles = re.findall(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
-                    all_og_titles += re.findall(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', html)
-
-                    for og_t in all_og_titles:
-                        og_t_clean = og_t.strip()
-                        if "Слушайте на Яндекс Музыке:" in og_t_clean:
-                            pm = re.search(r'Слушайте на Яндекс Музыке:\s*(.+?)\s+[—–-]\s+(.+?)(?:\s+[—–-]\s+альбом|\s+[—–-]\s+слушать|\.|$)', og_t_clean)
-                            if pm:
-                                artist = artist or pm.group(1).strip()
-                                title = title or pm.group(2).strip()
-                            dur_m = re.search(r'Время звучания\s*(\d+):(\d+)', og_t_clean)
-                            if dur_m and not duration:
-                                duration = int(dur_m.group(1)) * 60 + int(dur_m.group(2))
-                        elif not title:
-                            title = og_t_clean
-
-                    if not artist:
-                        d_match = re.search(r'property=["\']og:description["\']\s+content=["\']([^"\']+)["\']', html)
-                        if not d_match:
-                            d_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', html)
-                        if d_match:
-                            parts = re.split(r'[\u00b7\u2022]', d_match.group(1).strip())
-                            if parts:
-                                artist = parts[0].strip()
-
-                    if not title or not artist:
-                        t_tag = re.search(r'<title>([^<]+?)\s+[—–-]\s+слушать онлайн', html)
-                        if t_tag:
-                            raw = t_tag.group(1).strip()
-                            if " — " in raw:
-                                p = raw.split(" — ", 1)
-                                artist = artist or p[0].strip()
-                                title = title or p[1].strip()
-
-                    i_match = re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
-                    if not i_match:
-                        i_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html)
-                    if i_match:
-                        thumbnail_url = i_match.group(1).strip()
-                        if thumbnail_url.startswith("//"):
-                            thumbnail_url = "https:" + thumbnail_url
-                        thumbnail_url = thumbnail_url.replace("%%", "600x600")
-
-                    if title:
-                        search_query = f"{artist} - {title}" if artist else title
+                # А. Поиск preloadedTrack (Next.js SSR state)
+                idx_t = clean_html.find('preloadedTrack')
+                if idx_t != -1:
+                    chunk = clean_html[idx_t:idx_t+3500]
+                    tm = re.search(r'"title":\s*"([^"]+)"', chunk)
+                    am = re.findall(r'"artists":\s*\[(.*?)\]', chunk)
+                    art_names = re.findall(r'"name":\s*"([^"]+)"', am[0]) if am else []
+                    dm = re.search(r'"durationMs":\s*(\d+)', chunk)
+                    dur = int(int(dm.group(1)) / 1000) if dm else None
+                    cm = re.search(r'"coverUri":\s*"([^"]+)"', chunk)
+                    thumb = f"https://{cm.group(1).replace('%%', '600x600')}" if cm else None
+                    if tm:
+                        title = tm.group(1)
+                        art_str = ", ".join(art_names)
+                        q = f"{art_str} - {title}" if art_str else title
                         return ExtractedTrack(
                             platform="Яндекс Музыка",
-                            target=f"ytsearch3:{search_query}",
+                            target=f"ytsearch3:{q}",
                             is_search=True,
                             title=title,
-                            artist=artist,
-                            thumbnail_url=thumbnail_url,
-                            duration=duration
+                            artist=art_str,
+                            thumbnail_url=thumb,
+                            duration=dur
                         )
+
+                # Б. Поиск preloadedAlbum (Next.js SSR state)
+                idx_a = clean_html.find('preloadedAlbum')
+                if idx_a != -1:
+                    chunk = clean_html[idx_a:idx_a+4000]
+                    tm = re.search(r'"title":\s*"([^"]+)"', chunk)
+                    am = re.findall(r'"artists":\s*\[(.*?)\]', chunk)
+                    art_names = re.findall(r'"name":\s*"([^"]+)"', am[0]) if am else []
+                    cm = re.search(r'"coverUri":\s*"([^"]+)"', chunk)
+                    thumb = f"https://{cm.group(1).replace('%%', '600x600')}" if cm else None
+                    
+                    vol_tracks = re.findall(r'\{\s*"id":\s*"?\d+"?,\s*"realId":\s*"?\d+"?,\s*"title":\s*"([^"]+)"', chunk)
+                    track_title = vol_tracks[0] if vol_tracks else (tm.group(1) if tm else None)
+                    if track_title:
+                        art_str = ", ".join(art_names)
+                        q = f"{art_str} - {track_title}" if art_str else track_title
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{q}",
+                            is_search=True,
+                            title=track_title,
+                            artist=art_str,
+                            thumbnail_url=thumb
+                        )
+
+                # В. Поиск preloadedArtist
+                idx_art = clean_html.find('preloadedArtist')
+                if idx_art != -1:
+                    chunk = clean_html[idx_art:idx_art+2000]
+                    nm = re.search(r'"name":\s*"([^"]+)"', chunk)
+                    if nm:
+                        art_name = nm.group(1)
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{art_name}",
+                            is_search=True,
+                            title=art_name,
+                            artist=art_name
+                        )
+
+                # Г. Поиск в meta description Next.js
+                # Пример: Слушать трек Gazan 67 (Six Seven) онлайн альбом 67 (Six Seven) на Яндекс Музыке...
+                m_desc = re.search(r'"name":"description","content":\s*"([^"]+?)"', clean_html)
+                if m_desc:
+                    desc_text = m_desc.group(1)
+                    tr_match = re.search(r'Слушать трек\s+(.+?)\s+онлайн\s+(?:альбом|на Яндекс)', desc_text)
+                    if tr_match:
+                        raw_track = tr_match.group(1).strip()
+                        dur_m = re.search(r'Длительность дорожки\s+(\d+):(\d+)', desc_text)
+                        dur = int(dur_m.group(1)) * 60 + int(dur_m.group(2)) if dur_m else None
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{raw_track}",
+                            is_search=True,
+                            title=raw_track,
+                            artist="",
+                            duration=dur
+                        )
+                    alb_match = re.search(r'Слушать альбом\s+(.+?)\s+исполнителя\s+(.+?)\s+на Яндекс', desc_text)
+                    if alb_match:
+                        alb_t = alb_match.group(1).strip()
+                        alb_a = alb_match.group(2).strip()
+                        q = f"{alb_a} - {alb_t}"
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{q}",
+                            is_search=True,
+                            title=alb_t,
+                            artist=alb_a
+                        )
+
+                # Д. Резервный поиск по OpenGraph и title тегам
+                title = None
+                artist = None
+                duration = None
+                thumbnail_url = None
+
+                all_og_titles = re.findall(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
+                all_og_titles += re.findall(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', html)
+
+                for og_t in all_og_titles:
+                    og_t_clean = og_t.strip()
+                    if "Слушайте на Яндекс Музыке:" in og_t_clean:
+                        pm = re.search(r'Слушайте на Яндекс Музыке:\s*(.+?)\s+[—–-]\s+(.+?)(?:\s+[—–-]\s+альбом|\s+[—–-]\s+слушать|\.|$)', og_t_clean)
+                        if pm:
+                            artist = artist or pm.group(1).strip()
+                            title = title or pm.group(2).strip()
+                        dur_m = re.search(r'Время звучания\s*(\d+):(\d+)', og_t_clean)
+                        if dur_m and not duration:
+                            duration = int(dur_m.group(1)) * 60 + int(dur_m.group(2))
+                    elif not title:
+                        title = og_t_clean
+
+                if not artist:
+                    d_match = re.search(r'property=["\']og:description["\']\s+content=["\']([^"\']+)["\']', html)
+                    if not d_match:
+                        d_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', html)
+                    if d_match:
+                        parts = re.split(r'[\u00b7\u2022]', d_match.group(1).strip())
+                        if parts:
+                            artist = parts[0].strip()
+
+                if not title or not artist:
+                    t_tag = re.search(r'<title>([^<]+?)\s+[—–-]\s+слушать онлайн', html)
+                    if t_tag:
+                        raw = t_tag.group(1).strip()
+                        if " — " in raw:
+                            p = raw.split(" — ", 1)
+                            artist = artist or p[0].strip()
+                            title = title or p[1].strip()
+
+                i_match = re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
+                if not i_match:
+                    i_match = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html)
+                if i_match:
+                    thumbnail_url = i_match.group(1).strip()
+                    if thumbnail_url.startswith("//"):
+                        thumbnail_url = "https:" + thumbnail_url
+                    thumbnail_url = thumbnail_url.replace("%%", "600x600")
+
+                if title:
+                    search_query = f"{artist} - {title}" if artist else title
+                    return ExtractedTrack(
+                        platform="Яндекс Музыка",
+                        target=f"ytsearch3:{search_query}",
+                        is_search=True,
+                        title=title,
+                        artist=artist,
+                        thumbnail_url=thumbnail_url,
+                        duration=duration
+                    )
         except Exception:
             continue
 
