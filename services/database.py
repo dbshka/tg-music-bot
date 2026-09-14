@@ -141,9 +141,15 @@ def normalize_cache_key(query: str) -> str:
                 qs = urllib.parse.parse_qs(parsed.query)
                 if "i" in qs:
                     return f"applemusic:{qs['i'][0]}"
-                am_match = re.search(r'(?:/id|/song/)(\d+)', parsed.path)
-                if am_match:
-                    return f"applemusic:{am_match.group(1)}"
+                m_path = re.search(r'/(?:id|song|album)(?:/[^/\s?]+)*/(\d+)', parsed.path)
+                if m_path:
+                    return f"applemusic:{m_path.group(1)}"
+                m_id = re.search(r'/id(\d+)', parsed.path)
+                if m_id:
+                    return f"applemusic:{m_id.group(1)}"
+                m_digits = re.search(r'/(\d+)(?:[?]|$)', parsed.path)
+                if m_digits:
+                    return f"applemusic:{m_digits.group(1)}"
 
 
             # Общий случай для URL: отсекаем query параметры и конечный слеш

@@ -265,17 +265,38 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
 
 
 
+def extract_apple_music_id(url: str) -> Optional[str]:
+    """Извлекает цифровой ID трека или альбома из любого формата ссылок Apple Music."""
+    m_i = re.search(r"[?&]i=(\d+)", url)
+    if m_i:
+        return m_i.group(1)
+    # Ссылки вида /song/name/12345, /album/name/12345, /song/12345, /album/12345
+    m_path = re.search(r'/(?:id|song|album)(?:/[^/\s?]+)*/(\d+)', url)
+    if m_path:
+        return m_path.group(1)
+    m_id = re.search(r'/id(\d+)', url)
+    if m_id:
+        return m_id.group(1)
+    m_digits = re.search(r'/(\d+)(?:[?]|$)', url)
+    if m_digits:
+        return m_digits.group(1)
+    return None
+
+
+def _clean_apple_music_branding(s: Optional[str]) -> Optional[str]:
+    """Удаляет брендовые приписки Apple Music (on Apple Music, в Apple Music, - Single и т.д.)."""
+    if not s:
+        return s
+    s = s.replace('\xa0', ' ')
+    s = re.sub(r'\s+(?:on|в|sur|en|auf|su)\s+Apple\s*Music.*$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*Apple\s*Music.*$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*-\s*(?:Single|Album|EP)\s*$', '', s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
     """Извлекает информацию о треке Apple Music через официальный lookup API по ID трека или OpenGraph."""
-    track_id = None
-    match = re.search(r"[?&]i=(\d+)", url)
-    if match:
-        track_id = match.group(1)
-    else:
-        # Поддержка /id123456, /song/123456, /album/123456, /album/name/123456
-        match_id = re.search(r'(?:/id|/song/|/album/(?:[^/\s?]+/)?|/album/)(\d+)(?:[?]|$)', url)
-        if match_id:
-            track_id = match_id.group(1)
+    track_id = extract_apple_music_id(url)
 
     if track_id:
         try:
@@ -289,8 +310,8 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
                     results = data.get("results", [])
                     if results:
                         item = results[0]
-                        artist = item.get("artistName")
-                        title = item.get("trackName") or item.get("collectionName")
+                        artist = _clean_apple_music_branding(item.get("artistName"))
+                        title = _clean_apple_music_branding(item.get("trackName") or item.get("collectionName"))
                         artwork = item.get("artworkUrl100")
                         if artwork:
                             artwork = artwork.replace("100x100bb", "600x600bb")
@@ -319,13 +340,18 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
                 og_title = re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
                 og_img = re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
                 if og_title:
-                    raw_title = og_title.group(1).replace(" - Single", "").replace(" - Album", "")
+                    raw_title = _clean_apple_music_branding(og_title.group(1))
                     artist = None
                     title = raw_title
-                    if " by " in raw_title:
+                    if " — песня исполнителя " in raw_title:
+                        title, artist = raw_title.split(" — песня исполнителя ", 1)
+                    elif " by " in raw_title:
                         title, artist = raw_title.split(" by ", 1)
                     elif " — " in raw_title:
                         artist, title = raw_title.split(" — ", 1)
+
+                    artist = _clean_apple_music_branding(artist)
+                    title = _clean_apple_music_branding(title)
                     thumb = og_img.group(1) if og_img else None
                     search_query = f"{artist} - {title}" if artist else title
                     return ExtractedTrack(

@@ -568,8 +568,8 @@ def _sync_download(
     if thumb_candidates:
         thumbnail_path = _convert_thumbnail_to_jpg(thumb_candidates[0])
 
-    extracted_title = custom_title or info.get("track") or info.get("title") or "Unknown Track"
-    extracted_artist = custom_artist or info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist"
+    extracted_title = _clean_audio_branding(custom_title or info.get("track") or info.get("title") or "Unknown Track")
+    extracted_artist = _clean_audio_branding(custom_artist or info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist")
     duration = int(info.get("duration") or 0)
 
     t_tag0 = time.perf_counter()
@@ -589,6 +589,17 @@ def _sync_download(
     )
 
 
+def _clean_audio_branding(text: Optional[str]) -> Optional[str]:
+    """Удаляет брендовые приписки платформ (on Apple Music, в Apple Music, - Topic) из названий и исполнителей."""
+    if not text:
+        return text
+    text = text.replace('\xa0', ' ')
+    text = re.sub(r'\s*-\s*(?:Topic|Тема)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+(?:on|в|sur|en|auf|su)\s+Apple\s*Music.*$', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*Apple\s*Music.*$', '', text, flags=re.IGNORECASE)
+    return text.strip()
+
+
 def _build_fallback_queries(
     custom_artist: Optional[str],
     custom_title: Optional[str],
@@ -603,8 +614,7 @@ def _build_fallback_queries(
     # 1. Очистка артиста
     clean_artist = ""
     if custom_artist:
-        a = custom_artist
-        a = re.sub(r'\s*-\s*(?:Topic|Тема)\b', '', a, flags=re.IGNORECASE)
+        a = _clean_audio_branding(custom_artist)
         a = re.sub(r'[/\\:;*?"<>|]+', ' ', a)
         clean_artist = " ".join(a.split()).strip()
 
@@ -612,7 +622,7 @@ def _build_fallback_queries(
     clean_title = ""
     title_no_feat = ""
     if custom_title:
-        t = custom_title
+        t = _clean_audio_branding(custom_title)
         t = re.sub(
             r'\s*[\(\[](?:Official|Music Video|Audio|Lyric|Video|Remix|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
             '',
