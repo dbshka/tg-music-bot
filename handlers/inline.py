@@ -35,6 +35,8 @@ router = Router(name="inline_router")
 # Защита от одновременных дублирующих скачиваний одного и того же трека при быстром вводе текста
 _IN_FLIGHT_DOWNLOADS: Dict[str, asyncio.Task] = {}
 _IN_FLIGHT_LOCK = asyncio.Lock()
+_PENDING_USER_QUERIES: Dict[int, str] = {}
+_USER_QUERY_LOCK = asyncio.Lock()
 
 
 @router.inline_query()
@@ -125,6 +127,18 @@ async def handle_inline_query(inline_query: InlineQuery):
         await inline_query.answer([short_hint], cache_time=10, is_personal=True)
         return
 
+    # Дебаунс: если пользователь активно печатает, ждем 350 мс перед запуском тяжелой загрузки
+    if user_id:
+        async with _USER_QUERY_LOCK:
+            _PENDING_USER_QUERIES[user_id] = raw_query
+
+        await asyncio.sleep(0.35)
+
+        async with _USER_QUERY_LOCK:
+            if _PENDING_USER_QUERIES.get(user_id) != raw_query:
+                # Пользователь успел напечатать следующий символ — отменяем промежуточный поиск
+                return
+
     # Защита от параллельного запуска нескольких скачиваний одного и того же трека (дедупликация)
     task = None
     async with _IN_FLIGHT_LOCK:
@@ -169,10 +183,26 @@ async def handle_inline_query(inline_query: InlineQuery):
 
     downloaded_audio: Optional[DownloadedAudio] = None
     try:
-        # Жесткий таймаут 7.5 секунд, чтобы уложиться в лимит Telegram API на ответ
-        downloaded_audio = await asyncio.wait_for(asyncio.shield(task), timeout=7.5)
+        # Увеличенный таймаут 22 секунды (лимит Telegram Bot API на ответ ~25-30 сек)
+        downloaded_audio = await asyncio.wait_for(asyncio.shield(task), timeout=22.0)
     except asyncio.TimeoutError:
-        logger.warning("Inline скачивание превысило таймаут 7.5с для '%s'", raw_query[:40])
+        logger.info("Inline скачивание продолжается в фоне для '%s'", raw_query[:40])
+        # Отдаем карточку ожидания, чтобы пользователь видел статус, а задача докачается в фоне
+        pending_article = InlineQueryResultArticle(
+            id=f"pending_{abs(hash(raw_query)) % 1000000}",
+            title=f"⏳ Загрузка: {raw_query[:35]}...",
+            description="Трек скачивается и обрабатывается. Нажмите сюда или повторите запрос через пару секунд!",
+            input_message_content=InputTextMessageContent(
+                message_text=(
+                    f"⏳ <b>Трек обрабатывается:</b> <i>{html.escape(raw_query[:80])}</i>\n\n"
+                    "Бот прямо сейчас загружает его в базу в высоком качестве. "
+                    "Пожалуйста, повторите поиск через несколько секунд или откройте @musicAutoSaver_bot."
+                ),
+                parse_mode="HTML"
+            )
+        )
+        await inline_query.answer([pending_article], cache_time=2, is_personal=True)
+        return
     except Exception as err:
         logger.warning("Inline ошибка скачивания '%s': %s", raw_query[:40], err)
     finally:
@@ -219,6 +249,7 @@ async def handle_inline_query(inline_query: InlineQuery):
 
             if sent_msg and sent_msg.audio:
                 file_id = sent_msg.audio.file_id
+                # Сохраняем исходный запрос
                 await save_cached_track_async(
                     query=cache_key,
                     file_id=file_id,
@@ -226,6 +257,15 @@ async def handle_inline_query(inline_query: InlineQuery):
                     artist=downloaded_audio.artist,
                     duration=downloaded_audio.duration
                 )
+                # Сохраняем популярные комбинации имени и названия для мгновенных будущих поисков
+                if downloaded_audio.artist and downloaded_audio.title:
+                    art = downloaded_audio.artist.strip()
+                    tit = downloaded_audio.title.strip()
+                    await save_cached_track_async(f"{art} - {tit}", file_id, tit, art, downloaded_audio.duration)
+                    await save_cached_track_async(f"{art} {tit}", file_id, tit, art, downloaded_audio.duration)
+                    await save_cached_track_async(f"{tit} {art}", file_id, tit, art, downloaded_audio.duration)
+                    await save_cached_track_async(tit, file_id, tit, art, downloaded_audio.duration)
+
                 results.append(
                     InlineQueryResultCachedAudio(
                         id=f"new_{file_id[:16]}",
@@ -239,7 +279,7 @@ async def handle_inline_query(inline_query: InlineQuery):
 
     # 5. Если результаты есть — отдаем в Telegram
     if results:
-        await inline_query.answer(results, cache_time=30, is_personal=True)
+        await inline_query.answer(results, cache_time=60, is_personal=True)
         return
 
     # 6. Если ничего не найдено или произошла ошибка
@@ -255,7 +295,7 @@ async def handle_inline_query(inline_query: InlineQuery):
             parse_mode="HTML"
         )
     )
-    await inline_query.answer([not_found_article], cache_time=10, is_personal=True)
+    await inline_query.answer([not_found_article], cache_time=3, is_personal=True)
 
 
 @router.chosen_inline_result()
