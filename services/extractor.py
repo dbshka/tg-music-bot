@@ -154,6 +154,55 @@ async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tu
     return None, None, None, None
 
 
+async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTrack]:
+    """
+    Определяет канонические метаданные студийного оригинала трека через Deezer / iTunes API:
+    - Официальное имя исполнителя
+    - Официальное название трека (без лишнего мусора)
+    - Эталонная длительность трека в секундах (duration)
+    - Официальная студийная обложка альбома в высоком разрешении
+    Работает за < 200 мс без необходимости в API ключах.
+    """
+    clean_q = re.sub(r'[\W_]+', ' ', query).strip()
+    if not clean_q or len(clean_q) < 2:
+        return None
+
+    session = get_shared_session()
+    # 1. Приоритетный поиск в Deezer API (< 200 мс)
+    try:
+        d_artist, d_title, d_cover, d_dur = await _search_deezer(session, clean_q)
+        if d_artist and d_title and d_dur:
+            return ExtractedTrack(
+                platform="Canonical/Deezer",
+                target=f"ytsearch5:{d_artist} - {d_title}",
+                is_search=True,
+                title=d_title,
+                artist=d_artist,
+                thumbnail_url=d_cover,
+                duration=d_dur
+            )
+    except Exception as ex:
+        logger.debug("Ошибка канонического поиска Deezer: %s", ex)
+
+    # 2. Резервный поиск в iTunes Search API (< 300 мс)
+    try:
+        it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, clean_q)
+        if it_artist and it_title and it_dur:
+            return ExtractedTrack(
+                platform="Canonical/iTunes",
+                target=f"ytsearch5:{it_artist} - {it_title}",
+                is_search=True,
+                title=it_title,
+                artist=it_artist,
+                thumbnail_url=it_cover,
+                duration=it_dur
+            )
+    except Exception as ex:
+        logger.debug("Ошибка канонического поиска iTunes: %s", ex)
+
+    return None
+
+
 async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Извлекает оригинальные метаданные (название, автор, обложка) в обход геоблоков через глобальный прокси."""
     try:
@@ -181,13 +230,45 @@ async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) 
     return None, None, None
 
 
+async def _extract_spotify_embed_metadata(track_id: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
+    """
+    Извлекает метаданные трека напрямую через открытый Spotify Embed API:
+    https://open.spotify.com/embed/track/{track_id}
+    Возвращает точные (artist, title, cover_url, duration_seconds) без необходимости в API ключах.
+    """
+    try:
+        url = f"https://open.spotify.com/embed/track/{track_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+                import json
+                m_data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+                if m_data:
+                    data = json.loads(m_data.group(1))
+                    entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
+                    if entity:
+                        title = entity.get('title') or entity.get('name')
+                        artists_list = [a.get('name') for a in entity.get('artists', []) if a.get('name')]
+                        artist = ", ".join(artists_list) if artists_list else None
+                        dur_ms = entity.get('duration') or 0
+                        duration = int(dur_ms / 1000) if dur_ms > 0 else None
+                        images = entity.get('visualIdentity', {}).get('image', [])
+                        cover = images[0].get('url') if images else None
+                        if title and artist:
+                            return artist, title, cover, duration
+    except Exception as e:
+        logger.debug("Ошибка извлечения Spotify embed: %s", e)
+    return None, None, None, None
+
+
 async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
     """
     Извлекает метаданные трека Spotify.
-    Оптимизирован для минимальной латентности:
-    1. Запускает параллельно Spotify oEmbed (~200 мс) и Microlink.
-    2. При необходимости валидирует артиста и длительность через быстрый iTunes Search (< 400 мс).
-    3. Исключает 5-секундное зависание Deezer при известных названии и артисте.
+    1. Напрямую опрашивает Spotify Embed API для получения точных исполнителя, названия и эталонной длительности.
+    2. При необходимости использует oEmbed и Deezer/iTunes для гарантированного нахождения эталонного хронометража.
     """
     track_id_match = re.search(r'track/([a-zA-Z0-9]+)', url)
     track_id = track_id_match.group(1) if track_id_match else None
@@ -198,62 +279,44 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
     thumbnail_url = None
     duration = None
 
-    # Быстрый опрос oEmbed
-    async def _fetch_oembed():
+    # 1. Приоритетное прямое извлечение через Spotify Embed API
+    if track_id:
+        artist, title, thumbnail_url, duration = await _extract_spotify_embed_metadata(track_id, session)
+
+    # 2. Быстрый опрос oEmbed, если embed не вернул артиста или длительность
+    if not (title and artist and duration):
         try:
             oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(clean_url)}"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("title"), data.get("thumbnail_url")
+                    oe_raw = data.get("title")
+                    thumbnail_url = thumbnail_url or data.get("thumbnail_url")
+                    if oe_raw and " - " in oe_raw:
+                        parts = oe_raw.split(" - ", 1)
+                        artist = artist or parts[0].strip()
+                        title = title or parts[1].strip()
+                    elif oe_raw:
+                        title = title or oe_raw
         except Exception:
             pass
-        return None, None
 
-    # 1. Быстрый опрос Spotify oEmbed (~150-250 мс)
-    oe_title, oe_thumb = await _fetch_oembed()
-    if oe_title:
-        thumbnail_url = oe_thumb
-        if " - " in oe_title:
-            parts = oe_title.split(" - ", 1)
-            artist = parts[0].strip()
-            title = parts[1].strip()
-        else:
-            title = oe_title
-
-    # 2. Если oEmbed не ответил или не дал автора — резервный опрос Microlink
-    if not (title and artist):
-        m_artist, m_title, m_thumb = await _extract_microlink_metadata(clean_url, session)
-        if m_title:
-            title = m_title
-            artist = m_artist or artist
-            thumbnail_url = m_thumb or thumbnail_url
-
-    # Если артист или длительность ещё не определены — быстрый запрос в iTunes API (< 500 мс)
+    # 3. Резервный поиск канонического эталона через Deezer / iTunes
     if title and (not artist or not duration):
         search_q = f"{artist} {title}" if artist else title
-        it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, search_q)
-        if it_artist:
-            artist = artist or it_artist
-            title = it_title or title
-            thumbnail_url = thumbnail_url or it_cover
-            duration = it_dur
-
-    # Резервный поиск в Deezer с коротким таймаутом (только если артист все еще неизвестен)
-    if title and not artist:
-        d_artist, d_title, d_cover, d_dur = await _search_deezer(session, title)
-        if d_artist:
-            artist = d_artist
-            title = d_title or title
-            thumbnail_url = thumbnail_url or d_cover
-            duration = d_dur
+        canonical = await resolve_canonical_track_info_async(search_q)
+        if canonical:
+            artist = artist or canonical.artist
+            title = title or canonical.title
+            thumbnail_url = thumbnail_url or canonical.thumbnail_url
+            duration = duration or canonical.duration
 
     if title:
         search_query = f"{artist} - {title}" if artist else title
         return ExtractedTrack(
             platform="Spotify",
-            target=f"ytsearch3:{search_query}",
+            target=f"ytsearch5:{search_query}",
             is_search=True,
             title=title,
             artist=artist,
@@ -320,7 +383,7 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
                         duration = int(item.get("trackTimeMillis", 0) / 1000) or None
                         return ExtractedTrack(
                             platform="Apple Music",
-                            target=f"ytsearch3:{search_query}",
+                            target=f"ytsearch5:{search_query}",
                             is_search=True,
                             title=title,
                             artist=artist,
@@ -354,13 +417,21 @@ async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> 
                     title = _clean_apple_music_branding(title)
                     thumb = og_img.group(1) if og_img else None
                     search_query = f"{artist} - {title}" if artist else title
+
+                    duration = None
+                    canonical = await resolve_canonical_track_info_async(search_query)
+                    if canonical:
+                        duration = canonical.duration
+                        thumb = thumb or canonical.thumbnail_url
+
                     return ExtractedTrack(
                         platform="Apple Music",
-                        target=f"ytsearch3:{search_query}",
+                        target=f"ytsearch5:{search_query}",
                         is_search=True,
                         title=title,
                         artist=artist,
-                        thumbnail_url=thumb
+                        thumbnail_url=thumb,
+                        duration=duration
                     )
     except Exception:
         pass

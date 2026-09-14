@@ -231,7 +231,12 @@ def _sync_download(
             inv_idx1 = len(invocations) + 1
             t_s0 = time.perf_counter()
 
-            search_query = query_or_url.split(":", 1)[1] if ":" in query_or_url else query_or_url
+            if custom_artist and custom_title:
+                clean_search = f"{custom_artist} - {custom_title}"
+            else:
+                clean_search = query_or_url.split(":", 1)[1] if ":" in query_or_url else query_or_url
+
+            search_query_lower = clean_search.lower()
             entries = []
 
             def _fetch_candidates(target_q, src_name):
@@ -251,10 +256,10 @@ def _sync_download(
                     return []
 
             import concurrent.futures
-            # Запускаем YouTube и SoundCloud параллельно
+            # Запускаем YouTube и SoundCloud параллельно с расширенным пулом кандидатов
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                f_yt = executor.submit(_fetch_candidates, f"ytsearch2:{search_query}", "youtube")
-                f_sc = executor.submit(_fetch_candidates, f"scsearch2:{search_query}", "soundcloud")
+                f_yt = executor.submit(_fetch_candidates, f"ytsearch5:{clean_search}", "youtube")
+                f_sc = executor.submit(_fetch_candidates, f"scsearch4:{clean_search}", "soundcloud")
 
                 done, not_done = concurrent.futures.wait([f_yt, f_sc], timeout=6.0)
                 for f in done:
@@ -283,59 +288,59 @@ def _sync_download(
             if not entries:
                 raise ValueError("Трек не найден по данному запросу.")
 
-            # 2. Интеллектуальный скоринг и ранжирование кандидатов
+            # 2. Интеллектуальный скоринг и проверка подлинности кандидатов
             t_c0 = time.perf_counter()
-            search_query_lower = search_query.lower()
 
             unwanted_terms = [
-                ("remix", 250.0),
-                ("cover", 300.0),
-                ("кавер", 300.0),
-                ("slowed", 300.0),
-                ("reverb", 250.0),
-                ("speed up", 300.0),
-                ("sped up", 300.0),
-                ("432hz", 300.0),
-                ("432 hz", 300.0),
-                ("528hz", 300.0),
-                ("bass boosted", 300.0),
-                ("bassboosted", 300.0),
-                ("nightcore", 300.0),
-                ("tribute", 300.0),
-                ("karaoke", 350.0),
-                ("караоке", 350.0),
-                ("instrumental", 250.0),
-                ("инструментал", 250.0),
-                ("parody", 350.0),
-                ("пародия", 350.0),
-                ("reaction", 350.0),
-                ("реакция", 350.0),
-                ("1 hour", 350.0),
-                ("10 hours", 350.0),
-                ("1 час", 350.0),
-                ("10 часов", 350.0),
+                ("remix", 600.0), ("ремикс", 600.0), ("bootleg", 600.0), ("flip", 600.0),
+                ("mashup", 600.0), ("vip mix", 600.0), ("mix", 400.0),
+                ("cover", 700.0), ("кавер", 700.0), ("tribute", 700.0),
+                ("acoustic cover", 700.0), ("piano cover", 700.0), ("guitar cover", 700.0),
+                ("slowed", 700.0), ("slow", 400.0), ("reverb", 700.0), ("reverbed", 700.0),
+                ("slowed + reverb", 800.0), ("slowed and reverb", 800.0), ("slowed reverb", 800.0),
+                ("speed up", 700.0), ("speedup", 700.0), ("sped up", 700.0), ("spedup", 700.0),
+                ("fast version", 700.0), ("nightcore", 700.0), ("daycore", 700.0), ("slowcore", 700.0),
+                ("8d", 900.0), ("8d audio", 900.0), ("8d music", 900.0), ("3d audio", 900.0), ("spatial audio", 900.0),
+                ("edit", 500.0), ("fan edit", 700.0), ("tiktok", 700.0), ("tik tok", 700.0), ("tiktok version", 700.0),
+                ("432hz", 700.0), ("432 hz", 700.0), ("528hz", 700.0), ("528 hz", 700.0),
+                ("bass boosted", 700.0), ("bassboosted", 700.0),
+                ("karaoke", 800.0), ("караоке", 800.0), ("instrumental", 700.0), ("инструментал", 700.0),
+                ("minus", 600.0), ("минус", 600.0), ("backing track", 700.0),
+                ("parody", 800.0), ("пародия", 800.0), ("reaction", 800.0), ("реакция", 800.0),
+                ("1 hour", 900.0), ("10 hours", 900.0), ("1 час", 900.0), ("10 часов", 900.0),
+                ("loop", 700.0), ("extended", 500.0)
             ]
 
             def _candidate_penalty(e):
                 cand_title = (e.get("title") or "").lower()
+                cand_uploader = (e.get("uploader") or "").lower()
+                cand_channel = (e.get("channel") or "").lower()
                 dur = e.get("duration") or 0
                 fmt_str = (str(e.get("formats", "")) + str(e.get("format_id", ""))).lower()
-                is_prev = "preview" in fmt_str or (expected_duration and expected_duration > 60 and 0 < dur <= 35)
-                penalty = 1000.0 if is_prev else 0.0
+                is_prev = "preview" in fmt_str or (expected_duration and expected_duration > 50 and 0 < dur <= 35)
+                if is_prev:
+                    return 5000.0
 
-                # Жесткий штраф за ремиксы, каверы и замедления, если пользователь явно их не искал
+                penalty = 0.0
+
+                # Жесткий штраф за ремиксы, каверы, 8D, замедления и спидапы, если пользователь явно их не искал
                 for term, p_val in unwanted_terms:
-                    if term in cand_title and term not in search_query_lower:
+                    if (term in cand_title or term in cand_uploader) and term not in search_query_lower:
                         penalty += p_val
 
+                # Строгое сравнение длительности с эталоном оригинального трека
                 if expected_duration:
                     diff = abs(dur - expected_duration)
-                    if diff <= 15:
-                        penalty += diff
-                    elif diff <= 45:
-                        penalty += 20.0 + diff
+                    if diff <= 4:
+                        penalty -= 60.0  # Идеальное соответствие студийному хронометражу
+                    elif diff <= 8:
+                        penalty -= 20.0  # Допуск на паузы клипа
+                    elif diff <= 14:
+                        penalty += diff * 5.0
+                    elif diff <= 22:
+                        penalty += 300.0 + (diff * 15.0)
                     else:
-                        penalty += 100.0 + diff
+                        penalty += 1500.0 + (diff * 20.0)  # Спидап/кавер/нарезка — дисквалифицирующий штраф
                 else:
                     if dur >= 45:
                         penalty += 0.0
@@ -346,17 +351,22 @@ def _sync_download(
 
                 cand_src = e.get("_source") or source
                 if cand_src == "youtube":
-                    uploader = str(e.get("uploader") or "")
-                    channel = str(e.get("channel") or "")
-                    is_topic = uploader.endswith("- Topic") or channel.endswith("- Topic") or " - Topic" in uploader or " - Topic" in channel
+                    is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
                     # Релизы Topic на YouTube — это официальные студийные аудиозаписи от лейблов!
                     if is_topic and cookies_info.get("active"):
-                        penalty -= 25.0
+                        penalty -= 150.0
                     elif is_topic and not cookies_info.get("active"):
-                        penalty += 60.0
+                        penalty -= 100.0
+                    elif "vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel:
+                        penalty -= 80.0
                 elif cand_src == "soundcloud":
-                    # На SoundCloud много любительских каверов, поэтому не даем безусловный бонус
-                    pass
+                    if custom_artist:
+                        ca = custom_artist.lower().strip()
+                        if ca in cand_uploader or ca.replace(" ", "") in cand_uploader.replace(" ", ""):
+                            penalty -= 50.0
+                        else:
+                            # Неофициальный любительский загрузчик на SoundCloud
+                            penalty += 250.0
 
                 return penalty
 
@@ -364,7 +374,7 @@ def _sync_download(
             t_c1 = time.perf_counter()
             perf_timings["candidate_selection"] += (t_c1 - t_c0)
 
-            # 3. Цикл скачивания лучших кандидатов
+            # 3. Цикл скачивания лучших кандидатов с пост-валидацией длительности
             dl_opts = dict(options)
             dl_opts["extract_flat"] = False
 
@@ -416,6 +426,29 @@ def _sync_download(
                     if not audio_files:
                         raise FileNotFoundError("Аудиофайл не был создан после обработки кандидата.")
 
+                    # СТРОГАЯ ПОСТ-ВАЛИДАЦИЯ ДЛИТЕЛЬНОСТИ
+                    actual_dur = int(res_info.get("duration") or 0)
+                    if not actual_dur and audio_files:
+                        try:
+                            from mutagen import File as MutagenFile
+                            mf = MutagenFile(audio_files[0])
+                            if mf and mf.info and hasattr(mf.info, "length"):
+                                actual_dur = int(mf.info.length)
+                        except Exception:
+                            pass
+
+                    if expected_duration and expected_duration > 35 and actual_dur > 0:
+                        real_diff = abs(actual_dur - expected_duration)
+                        if real_diff > 20:
+                            print(f"{req_tag}[AUTHENTICITY] Отклонен кандидат #{cand_idx+1} '{cand_title}': длительность {actual_dur}s отличается от оригинала {expected_duration}s на {real_diff}s (> 20s)!", flush=True)
+                            for temp_f in output_dir.iterdir():
+                                if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                                    try:
+                                        temp_f.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                            continue
+
                     if hook_times["dl_start"] and hook_times["dl_end"]:
                         dur_net = hook_times["dl_end"] - hook_times["dl_start"]
                     else:
@@ -456,27 +489,41 @@ def _sync_download(
                                 pass
 
                     # Если YouTube блокирует IP датацентра (bot-check / 429 / Sign in)
-                    # Пропускаем остальные варианты с YouTube, но обязательно пробуем SoundCloud!
                     is_ip_blocked = any(m in cand_err_str for m in ["confirm you’re not a bot", "confirm you're not a bot", "sign in", "bot", "429", "too many requests"])
                     if is_ip_blocked and cand_source == "youtube":
                         print(f"{req_tag}[DOWNLOADER] YouTube заблокировал кандидата #{cand_idx+1}. Пропускаем YouTube и переключаемся на SoundCloud...", flush=True)
                         youtube_blocked = True
                     continue
 
-            # Если все кандидаты из списка упали, пробуем экстренный поиск в SoundCloud
+            # Если все кандидаты из списка упали, пробуем экстренный поиск в SoundCloud с валидацией длительности
             if last_cand_error:
-                print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{search_query}' напрямую в SoundCloud...", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{clean_search}' в SoundCloud...", flush=True)
                 try:
                     sc_opts = dict(options)
                     sc_opts.pop("cookiefile", None)
                     sc_opts.pop("extractor_args", None)
-                    sc_opts["extract_flat"] = False
+                    sc_opts["extract_flat"] = True
                     with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
-                        sc_info = ydl_sc.extract_info(f"scsearch1:{search_query}", download=True)
-                        if sc_info and "entries" in sc_info and sc_info["entries"]:
-                            return sc_info["entries"][0]
-                        elif sc_info:
-                            return sc_info
+                        sc_raw = ydl_sc.extract_info(f"scsearch4:{clean_search}", download=False)
+                        sc_entries = [e for e in sc_raw.get("entries", []) if e]
+                        for se in sc_entries:
+                            se["_source"] = "soundcloud"
+                        if sc_entries:
+                            sc_ranked = sorted(sc_entries, key=_candidate_penalty)
+                            for s_cand in sc_ranked:
+                                s_dur = s_cand.get("duration") or 0
+                                if expected_duration and expected_duration > 35 and abs(s_dur - expected_duration) > 20:
+                                    continue
+                                s_url = s_cand.get("webpage_url") or s_cand.get("url")
+                                if s_url:
+                                    sc_opts_dl = dict(options)
+                                    sc_opts_dl["extract_flat"] = False
+                                    with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
+                                        res_cand = ydl_sc_dl.extract_info(s_url, download=True)
+                                        res_dur = int(res_cand.get("duration") or s_dur)
+                                        if expected_duration and expected_duration > 35 and abs(res_dur - expected_duration) > 20:
+                                            continue
+                                        return res_cand
                 except Exception as sc_err:
                     print(f"{req_tag}[DOWNLOADER] Экстренный поиск SoundCloud не удался: {sc_err}", flush=True)
                 raise last_cand_error

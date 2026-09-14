@@ -12,7 +12,7 @@ from aiogram.types import Message, FSInputFile
 from aiogram.utils.chat_action import ChatActionSender
 
 from config import MAX_FILE_SIZE_BYTES
-from services.extractor import find_first_url, resolve_track_url
+from services.extractor import find_first_url, resolve_track_url, resolve_canonical_track_info_async
 from services.downloader import download_track
 from services.database import (
     log_user_activity_async,
@@ -163,7 +163,7 @@ async def handle_music_request(message: Message):
                     async with DOWNLOAD_SEMAPHORE:
                         async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
                             downloaded_audio = await download_track(
-                                query_or_url=f"ytsearch1:{track_info.artist} - {track_info.title}",
+                                query_or_url=f"ytsearch5:{track_info.artist} - {track_info.title}",
                                 custom_title=track_info.title,
                                 custom_artist=track_info.artist,
                                 thumbnail_url=track_info.thumbnail_url,
@@ -314,11 +314,32 @@ async def handle_music_request(message: Message):
         downloaded_audio = None
         try:
             print(f"[MUSIC][request_id={req_id}] search query='{user_text}'", flush=True)
-            print(f"[MUSIC][request_id={req_id}] download_track START query='ytsearch3:{user_text}'", flush=True)
+
+            # Пробуем мгновенно определить канонические данные студийного релиза (артист, название, длительность)
+            canonical = await resolve_canonical_track_info_async(user_text)
+            if canonical and canonical.artist and canonical.title:
+                search_target = canonical.target
+                custom_title = canonical.title
+                custom_artist = canonical.artist
+                thumbnail_url = canonical.thumbnail_url
+                expected_dur = canonical.duration
+                print(f"[MUSIC][request_id={req_id}] Распознан оригинал: '{custom_artist} - {custom_title}' ({expected_dur}s)", flush=True)
+            else:
+                search_target = f"ytsearch5:{user_text}"
+                custom_title = None
+                custom_artist = None
+                thumbnail_url = None
+                expected_dur = None
+
+            print(f"[MUSIC][request_id={req_id}] download_track START target='{search_target}' expected_dur={expected_dur}", flush=True)
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
                     downloaded_audio = await download_track(
-                        query_or_url=f"ytsearch3:{user_text}",
+                        query_or_url=search_target,
+                        custom_title=custom_title,
+                        custom_artist=custom_artist,
+                        thumbnail_url=thumbnail_url,
+                        expected_duration=expected_dur,
                         request_id=req_id
                     )
             print(f"[MUSIC][request_id={req_id}] download_track SUCCESS title='{downloaded_audio.title}' duration={downloaded_audio.duration}s size={downloaded_audio.filesize} bytes", flush=True)

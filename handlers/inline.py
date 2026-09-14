@@ -25,7 +25,7 @@ from services.database import (
     log_user_activity_async,
     increment_user_download_async
 )
-from services.extractor import find_first_url, resolve_track_url
+from services.extractor import find_first_url, resolve_track_url, resolve_canonical_track_info_async
 from services.downloader import download_track, DownloadedAudio
 from handlers.music import DOWNLOAD_SEMAPHORE
 
@@ -114,7 +114,7 @@ async def _download_and_cache(cache_key: str, raw_query: str, url: Optional[str]
                             direct_err, track_info.artist, track_info.title
                         )
                         downloaded_audio = await download_track(
-                            query_or_url=f"ytsearch1:{track_info.artist} - {track_info.title}",
+                            query_or_url=f"ytsearch5:{track_info.artist} - {track_info.title}",
                             custom_title=track_info.title,
                             custom_artist=track_info.artist,
                             thumbnail_url=track_info.thumbnail_url,
@@ -124,8 +124,26 @@ async def _download_and_cache(cache_key: str, raw_query: str, url: Optional[str]
                     else:
                         raise
             else:
+                canonical = await resolve_canonical_track_info_async(raw_query)
+                if canonical and canonical.artist and canonical.title:
+                    target_q = canonical.target
+                    c_title = canonical.title
+                    c_artist = canonical.artist
+                    c_thumb = canonical.thumbnail_url
+                    c_dur = canonical.duration
+                else:
+                    target_q = f"ytsearch5:{raw_query}"
+                    c_title = None
+                    c_artist = None
+                    c_thumb = None
+                    c_dur = None
+
                 downloaded_audio = await download_track(
-                    query_or_url=f"ytsearch1:{raw_query}",
+                    query_or_url=target_q,
+                    custom_title=c_title,
+                    custom_artist=c_artist,
+                    thumbnail_url=c_thumb,
+                    expected_duration=c_dur,
                     request_id=f"in_{req_id}"
                 )
 
