@@ -28,7 +28,6 @@ from services.database import (
 from services.extractor import find_first_url, resolve_track_url
 from services.downloader import download_track, DownloadedAudio
 from handlers.music import DOWNLOAD_SEMAPHORE
-from handlers.tag_editor import get_audio_edit_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router(name="inline_router")
@@ -94,19 +93,13 @@ async def handle_inline_query(inline_query: InlineQuery):
             if not any(c["file_id"] == fc["file_id"] for c in cached_candidates):
                 cached_candidates.append(fc)
 
-    # Формируем InlineQueryResultCachedAudio для найденных треков из кэша
+    # Формируем InlineQueryResultCachedAudio для найденных треков из кэша (чистый вид без кнопок и лишних подписей)
     for idx, c in enumerate(cached_candidates[:5]):
         file_id = c["file_id"]
-        title = c.get("title") or "Unknown Track"
-        artist = c.get("artist") or "Unknown Artist"
-        caption = f"🎧 <b>{html.escape(artist)} — {html.escape(title)}</b>\nvia @musicAutoSaver_bot"
         results.append(
             InlineQueryResultCachedAudio(
                 id=f"cached_{file_id[:16]}_{idx}",
-                audio_file_id=file_id,
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=get_audio_edit_keyboard()
+                audio_file_id=file_id
             )
         )
 
@@ -207,8 +200,7 @@ async def handle_inline_query(inline_query: InlineQuery):
                     title=downloaded_audio.title,
                     performer=downloaded_audio.artist,
                     duration=downloaded_audio.duration,
-                    thumbnail=thumb_file,
-                    reply_markup=get_audio_edit_keyboard()
+                    thumbnail=thumb_file
                 )
             except (TelegramForbiddenError, TelegramBadRequest):
                 # Если пользователь не писал боту в ЛС, используем чат ADMIN_ID для получения file_id
@@ -234,14 +226,10 @@ async def handle_inline_query(inline_query: InlineQuery):
                     artist=downloaded_audio.artist,
                     duration=downloaded_audio.duration
                 )
-                caption = f"🎧 <b>{html.escape(downloaded_audio.artist)} — {html.escape(downloaded_audio.title)}</b>\nvia @musicAutoSaver_bot"
                 results.append(
                     InlineQueryResultCachedAudio(
                         id=f"new_{file_id[:16]}",
-                        audio_file_id=file_id,
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=get_audio_edit_keyboard()
+                        audio_file_id=file_id
                     )
                 )
         except Exception as upload_err:
