@@ -119,11 +119,13 @@ def get_cookies_info() -> dict:
         try:
             content = target.read_text(encoding="utf-8", errors="ignore")
             lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
+            has_auth = any(token in content for token in ["LOGIN_INFO", "SAPISID", "__Secure-1PSID", "__Secure-3PSID"])
             return {
                 "active": True,
                 "path": str(target),
                 "size": target.stat().st_size,
-                "cookie_count": len(lines)
+                "cookie_count": len(lines),
+                "is_authenticated": has_auth
             }
         except Exception:
             pass
@@ -131,7 +133,8 @@ def get_cookies_info() -> dict:
         "active": False,
         "path": str(target),
         "size": 0,
-        "cookie_count": 0
+        "cookie_count": 0,
+        "is_authenticated": False
     }
 
 

@@ -109,12 +109,21 @@ async def main():
     # Проверка статуса cookies для YouTube
     cookie_info = get_cookies_info()
     if cookie_info["active"]:
-        logger.info(
-            "🍪 Cookies активны: %s (%d байт, %d записей)",
-            cookie_info["path"],
-            cookie_info["size"],
-            cookie_info["cookie_count"]
-        )
+        if cookie_info.get("is_authenticated"):
+            logger.info(
+                "🍪 Cookies активны и авторизованы: %s (%d байт, %d кук)",
+                cookie_info["path"],
+                cookie_info["size"],
+                cookie_info["cookie_count"]
+            )
+        else:
+            logger.warning(
+                "⚠️ Cookies активны (%d байт, %d кук), но в них НЕТ сессии авторизации Google (отсутствует LOGIN_INFO / SAPISID). "
+                "Это гостевой экспорт! На серверных IP (Render/AWS) YouTube требует вход под аккаунтом Google. "
+                "Экспортируйте cookies.txt из браузера с активным входом в YouTube.",
+                cookie_info["size"],
+                cookie_info["cookie_count"]
+            )
     else:
         logger.warning(
             "⚠️ Cookies НЕ обнаружены! На сервере Render YouTube может требовать авторизацию (Sign in to confirm you're not a bot). "

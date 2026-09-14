@@ -524,7 +524,13 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
     Извлекает название, автора и обложку трека из YouTube через публичный oEmbed API.
     Работает со 100% надежностью без cookies и без блокировок, гарантируя метаданные для Fallback.
     """
-    clean_url = url.split('&')[0] if 'watch?v=' in url else url
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    video_id = qs.get("v", [""])[0]
+    if not video_id and ("youtu.be" in parsed.netloc or "/shorts/" in parsed.path):
+        video_id = parsed.path.strip("/").split("/")[-1]
+
+    clean_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else url
     oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(clean_url)}&format=json"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -534,6 +540,9 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
                 raw_title = data.get("title") or ""
                 author = data.get("author_name") or ""
                 thumb = data.get("thumbnail_url")
+
+                # Очистка названия канала от суффиксов YouTube (- Topic / - Тема)
+                author = re.sub(r'\s*-\s*(?:Topic|Тема)\b', '', author, flags=re.IGNORECASE).strip()
 
                 title = raw_title
                 artist = author

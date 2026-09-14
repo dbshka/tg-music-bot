@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import shutil
 import threading
 import time
@@ -475,6 +476,72 @@ def _sync_download(
     )
 
 
+def _build_fallback_queries(
+    custom_artist: Optional[str],
+    custom_title: Optional[str],
+    query_or_url: str
+) -> list[str]:
+    """
+    Генерирует ранжированный список очищенных поисковых запросов для fallback (SoundCloud / YouTube).
+    Удаляет спецсимволы, суффиксы YouTube (- Topic / - Тема), feat-конструкции и лишние теги.
+    """
+    queries = []
+
+    # 1. Очистка артиста
+    clean_artist = ""
+    if custom_artist:
+        a = custom_artist
+        a = re.sub(r'\s*-\s*(?:Topic|Тема)\b', '', a, flags=re.IGNORECASE)
+        a = re.sub(r'[/\\:;*?"<>|]+', ' ', a)
+        clean_artist = " ".join(a.split()).strip()
+
+    # 2. Очистка названия
+    clean_title = ""
+    title_no_feat = ""
+    if custom_title:
+        t = custom_title
+        t = re.sub(
+            r'\s*[\(\[](?:Official|Music Video|Audio|Lyric|Video|Remix|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
+            '',
+            t,
+            flags=re.IGNORECASE
+        )
+        t = re.sub(r'[/\\:;*?"<>|]+', ' ', t)
+        clean_title = " ".join(t.split()).strip()
+
+        t_nf = re.sub(r'\s*[\(\[](?:feat\.?|ft\.?)[^\)\]]*[\)\]]', '', clean_title, flags=re.IGNORECASE)
+        t_nf = re.sub(r'\s+(?:feat\.?|ft\.?)\s+.*$', '', t_nf, flags=re.IGNORECASE)
+        title_no_feat = " ".join(t_nf.split()).strip()
+
+    if clean_artist and clean_title:
+        queries.append(f"{clean_artist} {clean_title}")
+    if clean_artist and title_no_feat and title_no_feat != clean_title:
+        queries.append(f"{clean_artist} {title_no_feat}")
+    if clean_title:
+        queries.append(clean_title)
+    if title_no_feat and title_no_feat != clean_title:
+        queries.append(title_no_feat)
+
+    if not queries:
+        if query_or_url.startswith(("scsearch", "ytsearch")):
+            raw = query_or_url.split(":", 1)[1]
+            queries.append(re.sub(r'[/\\:;*?"<>|]+', ' ', raw).strip())
+        else:
+            path_parts = [p for p in urllib.parse.urlparse(query_or_url).path.split('/') if p and p not in ('sets', 'track', 'song', 'watch')]
+            if path_parts:
+                slug = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ").replace("—", " ")
+                queries.append(re.sub(r'[/\\:;*?"<>|]+', ' ', slug).strip())
+
+    seen = set()
+    deduped = []
+    for q in queries:
+        norm = " ".join(q.split()).strip()
+        if norm and norm.lower() not in seen:
+            seen.add(norm.lower())
+            deduped.append(norm)
+    return deduped
+
+
 async def download_track(
     query_or_url: str,
     custom_title: Optional[str] = None,
@@ -531,35 +598,32 @@ async def download_track(
         elapsed = time.time() - t_start
         print(f"{req_tag}[DOWNLOADER] [OK] Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
         return audio
-    except BaseException as primary_error:
+    except asyncio.CancelledError:
         cancel_event.set()
         shutil.rmtree(output_dir, ignore_errors=True)
-        if isinstance(primary_error, asyncio.CancelledError):
-            raise
+        raise
+    except Exception as primary_error:
         elapsed = time.time() - t_start
         print(f"{req_tag}[DOWNLOADER] Первичная загрузка {query_or_url} ({elapsed:.2f}s) вернула ошибку: {primary_error}", flush=True)
 
-        fallback_query = None
-        if custom_artist and custom_title:
-            fallback_query = f"{custom_artist} - {custom_title}"
-        elif custom_title:
-            fallback_query = custom_title
-        elif query_or_url.startswith("scsearch"):
-            fallback_query = query_or_url.split(":", 1)[1]
-        elif query_or_url.startswith("ytsearch"):
-            fallback_query = query_or_url.split(":", 1)[1]
-        else:
-            path_parts = [p for p in urllib.parse.urlparse(query_or_url).path.split('/') if p and p not in ('sets', 'track', 'song', 'watch')]
-            if path_parts:
-                fallback_query = " ".join(path_parts[-2:]).replace("-", " ").replace("_", " ").replace("—", " ")
+        shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        fallback_queries = _build_fallback_queries(custom_artist, custom_title, query_or_url)
+        is_bot_blocked = any(
+            marker in str(primary_error).lower()
+            for marker in ["confirm you’re not a bot", "confirm you're not a bot", "http error 429", "too many requests", "bot."]
+        )
 
         # 1. Fallback в YouTube Search (поиск аудиорелиза из 5 кандидатов)
-        if fallback_query and not query_or_url.startswith("ytsearch"):
+        # Пропускаем, если YouTube заблокировал IP проверкой на бота или ошибкой 429
+        if fallback_queries and not query_or_url.startswith("ytsearch") and not is_bot_blocked:
+            yt_query = fallback_queries[0]
             try:
-                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch5:{fallback_query}", flush=True)
+                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch5:{yt_query}", flush=True)
                 audio = await asyncio.to_thread(
                     _sync_download,
-                    f"ytsearch5:{fallback_query}",
+                    f"ytsearch5:{yt_query}",
                     output_dir,
                     custom_title,
                     custom_artist,
@@ -585,39 +649,42 @@ async def download_track(
                 return audio
             except Exception as yt_err:
                 print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
+        elif is_bot_blocked:
+            print(f"{req_tag}[DOWNLOADER] Обнаружена блокировка YouTube IP (bot-check / 429). Пропускаем YouTube Search и сразу переходим к SoundCloud Fallback.", flush=True)
 
-        # 2. Fallback в SoundCloud (выбирает полный трек среди 5 кандидатов)
-        if fallback_query and not query_or_url.startswith("scsearch"):
-            try:
-                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fallback_query}", flush=True)
-                audio = await asyncio.to_thread(
-                    _sync_download,
-                    f"scsearch5:{fallback_query}",
-                    output_dir,
-                    custom_title,
-                    custom_artist,
-                    bitrate,
-                    bool(thumbnail_url),
-                    expected_duration,
-                    request_id,
-                    cancel_event
-                )
-                if expected_duration and expected_duration > 60 and audio.duration <= 35:
-                    raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
+        # 2. Fallback в SoundCloud (выбирает полный трек среди нескольких вариантов запроса)
+        if not query_or_url.startswith("scsearch"):
+            for fb_q in fallback_queries:
+                try:
+                    print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fb_q}", flush=True)
+                    audio = await asyncio.to_thread(
+                        _sync_download,
+                        f"scsearch5:{fb_q}",
+                        output_dir,
+                        custom_title,
+                        custom_artist,
+                        bitrate,
+                        bool(thumbnail_url),
+                        expected_duration,
+                        request_id,
+                        cancel_event
+                    )
+                    if expected_duration and expected_duration > 60 and audio.duration <= 35:
+                        raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
 
-                if thumb_task:
-                    try:
-                        downloaded_thumb = await thumb_task
-                        if downloaded_thumb and not audio.thumbnail_path:
-                            audio.thumbnail_path = downloaded_thumb
-                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
-                    except Exception:
-                        pass
-                elapsed_fb = time.time() - t_start
-                print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
-                return audio
-            except Exception as sc_err:
-                print(f"{req_tag}[DOWNLOADER] Fallback SoundCloud не удался: {sc_err}", flush=True)
+                    if thumb_task:
+                        try:
+                            downloaded_thumb = await thumb_task
+                            if downloaded_thumb and not audio.thumbnail_path:
+                                audio.thumbnail_path = downloaded_thumb
+                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                        except Exception:
+                            pass
+                    elapsed_fb = time.time() - t_start
+                    print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
+                    return audio
+                except Exception as sc_err:
+                    print(f"{req_tag}[DOWNLOADER] Fallback SoundCloud '{fb_q}' не удался: {sc_err}", flush=True)
 
         shutil.rmtree(output_dir, ignore_errors=True)
         raise primary_error
