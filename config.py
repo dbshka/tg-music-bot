@@ -19,7 +19,7 @@ MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
 # Битрейт аудио по умолчанию (кбит/с)
 DEFAULT_AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192")
-BOT_VERSION = "2.5.4"
+BOT_VERSION = "2.5.5"
 
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
@@ -30,6 +30,7 @@ if CUSTOM_API_SERVER:
 
 # ID администратора для просмотра статистики и управления
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6874119454"))
+STORAGE_CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID")
 DB_PATH = BASE_DIR / "bot_database.db"
 
 # Настройки cookies для YouTube (обход блокировок хостинга)
