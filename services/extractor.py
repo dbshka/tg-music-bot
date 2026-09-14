@@ -211,25 +211,24 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
             pass
         return None, None
 
-    # Запускаем параллельно oEmbed и Microlink
-    oembed_task = asyncio.create_task(_fetch_oembed())
-    microlink_task = asyncio.create_task(_extract_microlink_metadata(clean_url, session))
-
-    (oe_title, oe_thumb), (m_artist, m_title, m_thumb) = await asyncio.gather(
-        oembed_task, microlink_task, return_exceptions=False
-    )
-
-    if m_title and m_artist:
-        title = m_title
-        artist = m_artist
-        thumbnail_url = m_thumb or oe_thumb
-    elif oe_title:
-        title = oe_title
+    # 1. Быстрый опрос Spotify oEmbed (~150-250 мс)
+    oe_title, oe_thumb = await _fetch_oembed()
+    if oe_title:
         thumbnail_url = oe_thumb
         if " - " in oe_title:
             parts = oe_title.split(" - ", 1)
             artist = parts[0].strip()
             title = parts[1].strip()
+        else:
+            title = oe_title
+
+    # 2. Если oEmbed не ответил или не дал автора — резервный опрос Microlink
+    if not (title and artist):
+        m_artist, m_title, m_thumb = await _extract_microlink_metadata(clean_url, session)
+        if m_title:
+            title = m_title
+            artist = m_artist or artist
+            thumbnail_url = m_thumb or thumbnail_url
 
     # Если артист или длительность ещё не определены — быстрый запрос в iTunes API (< 500 мс)
     if title and (not artist or not duration):
@@ -447,7 +446,13 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     elif "soundcloud.com" in domain:
         platform_name = "SoundCloud"
     elif "vk.com" in domain:
-        platform_name = "VK Музыка"
+        if "/audio" in url or "/music" in url or "z=audio" in url:
+            raise ValueError(
+                "Загрузка по прямым ссылкам ВК Музыки не поддерживается (ВКонтакте закрыл доступ к аудио для внешних серверов без авторизации).\n\n"
+                "💡 Пожалуйста, отправьте название трека или исполнителя текстом (например: MiyaGi — Captain). "
+                "Бот моментально найдёт и пришлёт MP3!"
+            )
+        platform_name = "VK Видео"
     elif "bandcamp.com" in domain:
         platform_name = "Bandcamp"
     elif "tiktok.com" in domain:

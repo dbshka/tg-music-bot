@@ -8,21 +8,21 @@ app_port: 7860
 pinned: false
 ---
 
-# 🎵 Telegram Music Downloader Bot (v2.2.0)
+# 🎵 Telegram Music Downloader Bot (v2.3.0)
 
 Высокопроизводительный асинхронный Telegram-бот для загрузки музыки в формате **MP3** по ссылкам из популярных стриминговых сервисов, а также по текстовому названию песни.
 
 ## ✨ Возможности
 
 - 🔗 **Поддержка платформ:**
-  - 🔎 **Поиск по названию (универсальный)**: введите имя артиста или название трека (например: `The Weeknd - Blinding Lights` или `Gazan - 67`). Бот моментально найдёт и скачает трек в MP3 с тегами и обложкой! *(Рекомендуется для треков из Яндекс Музыки)*.
-  - 🟢 **Spotify**: треки, альбомы (`open.spotify.com`), короткие ссылки `spotify.link/...` (oEmbed + iTunes Search API).
+  - 🔎 **Поиск по названию (универсальный)**: введите имя артиста или название трека (например: `The Weeknd - Blinding Lights`, `MiyaGi - Captain` или `Gazan - 67`). Бот моментально найдёт и скачает трек в MP3 с тегами и обложкой! *(Рекомендуется для любых треков из Яндекс Музыки и ВК Музыки)*.
+  - 🟢 **Spotify**: треки, альбомы (`open.spotify.com`), короткие ссылки `spotify.link/...` (мгновенный oEmbed + iTunes API).
   - 🍎 **Apple Music**: треки и альбомы `music.apple.com` через официальный iTunes Lookup API.
-  - 🔴 **YouTube / YouTube Music**: `youtube.com`, `music.youtube.com`, `youtu.be`, `YouTube Shorts` с умным обходом дата-центровых IP-блокировок.
+  - 🔴 **YouTube / YouTube Music**: `youtube.com`, `music.youtube.com`, `youtu.be`, `YouTube Shorts` с мгновенным Fallback в SoundCloud при bot-check.
   - 🟠 **SoundCloud**: прямая загрузка аудиофайлов без пережатия и многоуровневый fallback.
-  - 🔵 **VK Музыка / VK Видео**: `vk.com/...`.
+  - 🔵 **VK Видео / Клипы**: `vk.com/video...`. *(Прямые ссылки аудио закрыты ВКонтакте без авторизации; для треков ВК используйте поиск текстом)*.
   - 🎸 **Bandcamp, TikTok, Vimeo и др.**
-- ⚡ **Архитектура v2.2.0**:
+- ⚡ **Архитектура v2.3.0 (Ultra-Fast)**:
   - **Connection Pooling**: единый пул соединений `aiohttp.ClientSession` (-200 мс на сетевой запрос).
   - **L1 RAM LRU кэш**: моментальная отдача закэшированных треков за **0.01 мс**.
   - **1-pass Mutagen ID3**: однопроходная запись метаданных и обложек альбомов без повторной перезаписи файлов.

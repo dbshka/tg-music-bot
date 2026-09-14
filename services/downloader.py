@@ -154,10 +154,8 @@ def _sync_download(
         "writethumbnail": not skip_thumbnail,
         "quiet": True,
         "no_warnings": True,
-        # Ускорение сети: 5 параллельных потоков загрузки фрагментов и увеличенный размер чанка
-        "concurrent_fragment_downloads": 5,
+        # Оптимизация сети: достаточный буфер сокетов
         "buffersize": 64 * 1024,
-        "http_chunk_size": 10485760,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -165,11 +163,10 @@ def _sync_download(
                 "preferredquality": bitrate,
             }
         ],
-        # Оптимальная конфигурация MP3: 1 поток кодировщика (экономия CPU), compression_level 2 (высокое качество звука)
+        # Оптимальная быстрая конфигурация MP3: все доступные потоки CPU, без замедляющих алгоритмов сжатия
         "postprocessor_args": {
             "FFmpegExtractAudio": [
-                "-threads", "1",
-                "-compression_level", "2",
+                "-threads", "0",
                 "-joint_stereo", "1",
                 "-vn"
             ]
@@ -355,7 +352,8 @@ def _sync_download(
                         shutil.rmtree(output_dir, ignore_errors=True)
                         raise
                     last_cand_error = cand_err
-                    print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}). Пробуем следующего...", flush=True)
+                    cand_err_str = str(cand_err).lower()
+                    print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}).", flush=True)
                     # Очищаем неполные или временные файлы перед следующей попыткой
                     for temp_f in output_dir.iterdir():
                         if temp_f.is_file() and not temp_f.name.startswith("cover"):
@@ -363,6 +361,13 @@ def _sync_download(
                                 temp_f.unlink(missing_ok=True)
                             except Exception:
                                 pass
+
+                    # Если YouTube блокирует IP датацентра (bot-check / 429 / Sign in)
+                    # Все остальные кандидаты YouTube также 100% упадут. Не тратим 30-40 секунд зря — мгновенно переходим к Fallback!
+                    is_ip_blocked = any(m in cand_err_str for m in ["confirm you’re not a bot", "confirm you're not a bot", "sign in", "bot", "429", "too many requests"])
+                    if is_ip_blocked and source == "youtube":
+                        print(f"{req_tag}[DOWNLOADER] YouTube заблокировал IP датацентра. Немедленно прерываем перебор кандидатов YouTube для мгновенного Fallback в SoundCloud!", flush=True)
+                        break
                     continue
 
             if last_cand_error:
@@ -621,9 +626,10 @@ async def download_track(
             output_dir.mkdir(parents=True, exist_ok=True)
 
         fallback_queries = _build_fallback_queries(custom_artist, custom_title, query_or_url)
+        err_msg = str(primary_error).lower()
         is_bot_blocked = any(
-            marker in str(primary_error).lower()
-            for marker in ["confirm you’re not a bot", "confirm you're not a bot", "http error 429", "too many requests", "bot."]
+            marker in err_msg
+            for marker in ["confirm you’re not a bot", "confirm you're not a bot", "http error 429", "too many requests", "bot", "sign in"]
         )
 
         # 1. Fallback в YouTube Search (поиск аудиорелиза из 5 кандидатов)
@@ -665,9 +671,9 @@ async def download_track(
         elif is_bot_blocked:
             print(f"{req_tag}[DOWNLOADER] Обнаружена блокировка YouTube IP (bot-check / 429). Пропускаем YouTube Search и сразу переходим к SoundCloud Fallback.", flush=True)
 
-        # 2. Fallback в SoundCloud (выбирает полный трек среди нескольких вариантов запроса)
+        # 2. Fallback в SoundCloud (выбирает полный трек среди лучших вариантов запроса)
         if not query_or_url.startswith("scsearch"):
-            for fb_q in fallback_queries:
+            for fb_q in fallback_queries[:2]:
                 try:
                     print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fb_q}", flush=True)
                     audio = await asyncio.to_thread(
