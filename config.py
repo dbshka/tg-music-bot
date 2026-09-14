@@ -19,7 +19,10 @@ MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
 # Битрейт аудио по умолчанию (кбит/с)
 DEFAULT_AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192")
-BOT_VERSION = "2.0.0"
+BOT_VERSION = "2.1.0"
+
+# Токен Яндекс Музыки (опционально для прямого авторизованного доступа к API без геоблоков)
+YANDEX_MUSIC_TOKEN = os.getenv("YANDEX_MUSIC_TOKEN") or os.getenv("YANDEX_TOKEN")
 
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
