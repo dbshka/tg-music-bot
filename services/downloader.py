@@ -285,11 +285,48 @@ def _sync_download(
 
             # 2. Интеллектуальный скоринг и ранжирование кандидатов
             t_c0 = time.perf_counter()
+            search_query_lower = search_query.lower()
+
+            unwanted_terms = [
+                ("remix", 250.0),
+                ("cover", 300.0),
+                ("кавер", 300.0),
+                ("slowed", 300.0),
+                ("reverb", 250.0),
+                ("speed up", 300.0),
+                ("sped up", 300.0),
+                ("432hz", 300.0),
+                ("432 hz", 300.0),
+                ("528hz", 300.0),
+                ("bass boosted", 300.0),
+                ("bassboosted", 300.0),
+                ("nightcore", 300.0),
+                ("tribute", 300.0),
+                ("karaoke", 350.0),
+                ("караоке", 350.0),
+                ("instrumental", 250.0),
+                ("инструментал", 250.0),
+                ("parody", 350.0),
+                ("пародия", 350.0),
+                ("reaction", 350.0),
+                ("реакция", 350.0),
+                ("1 hour", 350.0),
+                ("10 hours", 350.0),
+                ("1 час", 350.0),
+                ("10 часов", 350.0),
+            ]
+
             def _candidate_penalty(e):
+                cand_title = (e.get("title") or "").lower()
                 dur = e.get("duration") or 0
                 fmt_str = (str(e.get("formats", "")) + str(e.get("format_id", ""))).lower()
                 is_prev = "preview" in fmt_str or (expected_duration and expected_duration > 60 and 0 < dur <= 35)
                 penalty = 1000.0 if is_prev else 0.0
+
+                # Жесткий штраф за ремиксы, каверы и замедления, если пользователь явно их не искал
+                for term, p_val in unwanted_terms:
+                    if term in cand_title and term not in search_query_lower:
+                        penalty += p_val
 
                 if expected_duration:
                     diff = abs(dur - expected_duration)
@@ -312,13 +349,14 @@ def _sync_download(
                     uploader = str(e.get("uploader") or "")
                     channel = str(e.get("channel") or "")
                     is_topic = uploader.endswith("- Topic") or channel.endswith("- Topic") or " - Topic" in uploader or " - Topic" in channel
-                    # На серверных/облачных IP YouTube Topic релизы часто блокируются бот-проверкой
-                    if is_topic and not cookies_info.get("active"):
+                    # Релизы Topic на YouTube — это официальные студийные аудиозаписи от лейблов!
+                    if is_topic and cookies_info.get("active"):
+                        penalty -= 25.0
+                    elif is_topic and not cookies_info.get("active"):
                         penalty += 60.0
                 elif cand_src == "soundcloud":
-                    # SoundCloud надежен без бот-чеков
-                    if not cookies_info.get("active"):
-                        penalty -= 5.0
+                    # На SoundCloud много любительских каверов, поэтому не даем безусловный бонус
+                    pass
 
                 return penalty
 

@@ -144,14 +144,27 @@ async def handle_inline_query(inline_query: InlineQuery):
                 async with DOWNLOAD_SEMAPHORE:
                     if url:
                         track_info = await resolve_track_url(url)
-                        return await download_track(
-                            query_or_url=track_info.target,
-                            custom_title=track_info.title,
-                            custom_artist=track_info.artist,
-                            thumbnail_url=track_info.thumbnail_url,
-                            expected_duration=track_info.duration,
-                            request_id=f"in_{req_id}"
-                        )
+                        try:
+                            return await download_track(
+                                query_or_url=track_info.target,
+                                custom_title=track_info.title,
+                                custom_artist=track_info.artist,
+                                thumbnail_url=track_info.thumbnail_url,
+                                expected_duration=track_info.duration,
+                                request_id=f"in_{req_id}"
+                            )
+                        except Exception as direct_err:
+                            if track_info.title and track_info.artist:
+                                logger.info("Inline прямая ссылка не скачалась (%s), переключаемся на поиск %s - %s", direct_err, track_info.artist, track_info.title)
+                                return await download_track(
+                                    query_or_url=f"ytsearch1:{track_info.artist} - {track_info.title}",
+                                    custom_title=track_info.title,
+                                    custom_artist=track_info.artist,
+                                    thumbnail_url=track_info.thumbnail_url,
+                                    expected_duration=track_info.duration,
+                                    request_id=f"in_{req_id}_fb"
+                                )
+                            raise
                     else:
                         return await download_track(
                             query_or_url=f"ytsearch1:{raw_query}",

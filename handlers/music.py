@@ -144,16 +144,34 @@ async def handle_music_request(message: Message):
             )
 
             print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}'", flush=True)
-            async with DOWNLOAD_SEMAPHORE:
-                async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
-                    downloaded_audio = await download_track(
-                        query_or_url=track_info.target,
-                        custom_title=track_info.title,
-                        custom_artist=track_info.artist,
-                        thumbnail_url=track_info.thumbnail_url,
-                        expected_duration=track_info.duration,
-                        request_id=req_id
-                    )
+            try:
+                async with DOWNLOAD_SEMAPHORE:
+                    async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
+                        downloaded_audio = await download_track(
+                            query_or_url=track_info.target,
+                            custom_title=track_info.title,
+                            custom_artist=track_info.artist,
+                            thumbnail_url=track_info.thumbnail_url,
+                            expected_duration=track_info.duration,
+                            request_id=req_id
+                        )
+            except Exception as dl_err:
+                # Если прямая ссылка недоступна (например, SoundCloud Go+ / 404),
+                # но мы извлекли автора и название — скачиваем оригинальную студийную версию через поиск!
+                if track_info.title and track_info.artist:
+                    print(f"[MUSIC][request_id={req_id}] Прямая ссылка не отдала аудио ({dl_err}), скачиваем оригинал через поиск: '{track_info.artist} - {track_info.title}'", flush=True)
+                    async with DOWNLOAD_SEMAPHORE:
+                        async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
+                            downloaded_audio = await download_track(
+                                query_or_url=f"ytsearch1:{track_info.artist} - {track_info.title}",
+                                custom_title=track_info.title,
+                                custom_artist=track_info.artist,
+                                thumbnail_url=track_info.thumbnail_url,
+                                expected_duration=track_info.duration,
+                                request_id=f"{req_id}_fb"
+                            )
+                else:
+                    raise dl_err
             print(f"[MUSIC][request_id={req_id}] download_track SUCCESS title='{downloaded_audio.title}' duration={downloaded_audio.duration}s size={downloaded_audio.filesize} bytes", flush=True)
 
             file_p = Path(downloaded_audio.file_path)

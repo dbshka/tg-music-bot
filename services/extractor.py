@@ -395,6 +395,43 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
     return None
 
 
+async def extract_soundcloud_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
+    """
+    Извлекает оригинальные метаданные трека SoundCloud через официальный oEmbed API.
+    Очищает UTM-метки трекинга и парсит точное название и автора трека.
+    """
+    try:
+        clean_url = url.split("?")[0].rstrip("/")
+        oembed_url = f"https://soundcloud.com/oembed?url={urllib.parse.quote(clean_url)}&format=json"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                raw_title = data.get("title") or ""
+                author = data.get("author_name") or ""
+                thumb = data.get("thumbnail_url")
+
+                title = raw_title
+                artist = author
+                if " by " in raw_title:
+                    parts = raw_title.rsplit(" by ", 1)
+                    title = parts[0].strip()
+                    if not artist:
+                        artist = parts[1].strip()
+
+                return ExtractedTrack(
+                    platform="SoundCloud",
+                    target=clean_url,
+                    is_search=False,
+                    title=title,
+                    artist=artist,
+                    thumbnail_url=thumb
+                )
+    except Exception:
+        pass
+    return None
+
+
 async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] = None) -> ExtractedTrack:
     """
     Анализирует переданный URL и определяет способ загрузки:
@@ -402,7 +439,8 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     - Spotify -> OpenGraph / oEmbed / iTunes -> ytsearch
     - Apple Music -> iTunes lookup -> ytsearch
     - YouTube -> oEmbed метаданные + прямая загрузка
-    - SoundCloud, VK, Bandcamp и др. -> прямая загрузка через yt-dlp
+    - SoundCloud -> oEmbed метаданные + прямая загрузка (с автоматическим Fallback)
+    - VK, Bandcamp и др. -> прямая загрузка через yt-dlp
     """
     if session is None:
         session = get_shared_session()
@@ -438,6 +476,12 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
         yt_track = await extract_youtube_info(url, session)
         if yt_track:
             return yt_track
+
+    # 5. SoundCloud (извлекаем точные метаданные через oEmbed и очищаем UTM-метки)
+    if "soundcloud.com" in domain:
+        sc_track = await extract_soundcloud_info(url, session)
+        if sc_track:
+            return sc_track
 
     # Прочие сервисы, поддерживаемые yt-dlp напрямую
     platform_name = "Музыкальный сервис"
