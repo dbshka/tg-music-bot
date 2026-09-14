@@ -331,8 +331,12 @@ def _sync_download(
             dl_opts["extract_flat"] = False
 
             last_cand_error = None
-            for cand_idx, selected_entry in enumerate(ranked_candidates[:3]):
+            youtube_blocked = False
+            for cand_idx, selected_entry in enumerate(ranked_candidates):
                 cand_source = selected_entry.get("_source") or source
+                if youtube_blocked and cand_source == "youtube":
+                    continue
+
                 target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
                 if target_url and not target_url.startswith("http") and "soundcloud" not in cand_source:
                     target_url = f"https://www.youtube.com/watch?v={target_url}"
@@ -414,14 +418,29 @@ def _sync_download(
                                 pass
 
                     # Если YouTube блокирует IP датацентра (bot-check / 429 / Sign in)
-                    # Все остальные кандидаты YouTube также 100% упадут. Не тратим 30-40 секунд зря — мгновенно переходим к Fallback!
+                    # Пропускаем остальные варианты с YouTube, но обязательно пробуем SoundCloud!
                     is_ip_blocked = any(m in cand_err_str for m in ["confirm you’re not a bot", "confirm you're not a bot", "sign in", "bot", "429", "too many requests"])
-                    if is_ip_blocked and source == "youtube":
-                        print(f"{req_tag}[DOWNLOADER] YouTube заблокировал IP датацентра. Немедленно прерываем перебор кандидатов YouTube для мгновенного Fallback в SoundCloud!", flush=True)
-                        break
+                    if is_ip_blocked and cand_source == "youtube":
+                        print(f"{req_tag}[DOWNLOADER] YouTube заблокировал кандидата #{cand_idx+1}. Пропускаем YouTube и переключаемся на SoundCloud...", flush=True)
+                        youtube_blocked = True
                     continue
 
+            # Если все кандидаты из списка упали, пробуем экстренный поиск в SoundCloud
             if last_cand_error:
+                print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{search_query}' напрямую в SoundCloud...", flush=True)
+                try:
+                    sc_opts = dict(options)
+                    sc_opts.pop("cookiefile", None)
+                    sc_opts.pop("extractor_args", None)
+                    sc_opts["extract_flat"] = False
+                    with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
+                        sc_info = ydl_sc.extract_info(f"scsearch1:{search_query}", download=True)
+                        if sc_info and "entries" in sc_info and sc_info["entries"]:
+                            return sc_info["entries"][0]
+                        elif sc_info:
+                            return sc_info
+                except Exception as sc_err:
+                    print(f"{req_tag}[DOWNLOADER] Экстренный поиск SoundCloud не удался: {sc_err}", flush=True)
                 raise last_cand_error
             raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
         else:

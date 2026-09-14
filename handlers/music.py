@@ -403,7 +403,14 @@ async def handle_music_request(message: Message):
             print(f"[MUSIC][request_id={req_id}] ERROR at text search: {e}\n{traceback.format_exc()}", flush=True)
             logger.exception("Ошибка при поиске трека %s", user_text)
             err_str = str(e)
-            user_friendly = f"❌ <b>Трек не найден или произошла ошибка:</b>\n<i>{html.escape(err_str[:250])}</i>"
+            if "Sign in to confirm you’re not a bot" in err_str or "Sign in to confirm you're not a bot" in err_str or "Sign in to confirm" in err_str:
+                user_friendly = (
+                    "❌ <b>YouTube запросил авторизацию (проверка на бота на сервере).</b>\n\n"
+                    "💡 <b>Как решить навсегда:</b> войдите в свой Google-аккаунт на YouTube в браузере, "
+                    "экспортируйте <code>cookies.txt</code> и обновите его в панели Render (Secret Files)."
+                )
+            else:
+                user_friendly = f"❌ <b>Трек не найден или произошла ошибка:</b>\n<i>{html.escape(err_str[:250])}</i>"
             try:
                 await status_msg.edit_text(user_friendly, parse_mode="HTML")
             except Exception:
