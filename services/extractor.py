@@ -479,13 +479,27 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
                     flags=re.IGNORECASE
                 ).strip()
 
+                duration = None
+                # Сверяем канонические метаданные студийного релиза (артист, длительность, студийная обложка)
+                search_seed = f"{artist} - {title}" if (artist and artist != title) else (title or artist)
+                if search_seed:
+                    canonical = await resolve_canonical_track_info_async(search_seed)
+                    if canonical:
+                        duration = canonical.duration
+                        thumb = thumb or canonical.thumbnail_url
+                        if canonical.artist and (not artist or artist == title):
+                            artist = canonical.artist
+                        if canonical.title:
+                            title = canonical.title
+
                 return ExtractedTrack(
                     platform="YouTube / YouTube Music",
-                    target=url,
+                    target=clean_url,
                     is_search=False,
                     title=title or raw_title,
                     artist=artist or author,
-                    thumbnail_url=thumb
+                    thumbnail_url=thumb,
+                    duration=duration
                 )
     except Exception:
         pass

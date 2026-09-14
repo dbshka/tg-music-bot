@@ -169,7 +169,8 @@ def _sync_download(
 
     ydl_opts = {
         # Приоритет отдаем прямому M4A (AAC) аудиопотоку: без долгой перекодировки FFmpeg в MP3 (-3..5 сек)
-        "format": "ba[ext=m4a]/ba[protocol^=http][ext=m4a]/ba[ext=mp3]/ba[protocol^=http][ext=mp3]/ba/best",
+        # Если прямого M4A нет, берем лучший аудиопоток (webm/opus) либо видео+аудио поток для извлечения звука
+        "format": "ba[ext=m4a]/ba[ext=mp3]/ba/bv*+ba/b/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "writethumbnail": not skip_thumbnail,
@@ -193,24 +194,24 @@ def _sync_download(
     }
 
     # Клиенты YouTube:
-    # Android клиент работает в разы быстрее desktop и исключает ошибки SABR streaming и 403
+    # TV клиент не требует GVS PO Token и исключает ошибки SABR streaming и 'Requested format is not available'
     is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
 
     if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
+                "player_client": ["tv", "web", "mweb", "android", "ios"],
             }
         }
         print(f"{req_tag}[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
+                "player_client": ["tv", "web", "mweb", "android"],
             }
         }
-        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты android, ios, mweb)", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты tv, web, mweb, android)", flush=True)
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
@@ -584,18 +585,62 @@ def _sync_download(
         info = _execute_extraction(ydl_opts)
     except Exception as extract_err:
         err_msg = str(extract_err).lower()
-        if "cookiefile" in ydl_opts and ("sign in" in err_msg or "bot" in err_msg or "cookie" in err_msg or "reload" in err_msg or "403" in err_msg):
-            print(f"[DOWNLOADER] Сессия cookies недействительна ({extract_err}). Пробуем чистый запуск без cookies...", flush=True)
+        should_retry_no_cookies = "cookiefile" in ydl_opts and any(
+            m in err_msg for m in [
+                "sign in", "bot", "cookie", "reload", "403",
+                "requested format", "format", "not available", "unavailable"
+            ]
+        )
+        def _fallback_direct_search(last_err):
+            if is_search:
+                raise last_err
+            fb_title = custom_title
+            fb_artist = custom_artist
+            if not fb_title:
+                try:
+                    f_opts = dict(options)
+                    f_opts["extract_flat"] = True
+                    f_opts["noplaylist"] = True
+                    with yt_dlp.YoutubeDL(f_opts) as ydl_flat:
+                        flat_info = ydl_flat.extract_info(query_or_url, download=False)
+                        if flat_info:
+                            fb_title = flat_info.get("title")
+                            raw_up = flat_info.get("uploader") or ""
+                            fb_artist = re.sub(r'\s*-\s*(?:Topic|Тема)\b', '', raw_up, flags=re.IGNORECASE).strip()
+                except Exception:
+                    pass
+            if fb_title or fb_artist:
+                search_q = f"{fb_artist} - {fb_title}" if (fb_artist and fb_title) else (fb_title or fb_artist)
+                print(f"[DOWNLOADER] Прямая ссылка не отдала аудио ({last_err}), экстренный Fallback через поиск '{search_q}'...", flush=True)
+                return _sync_download(
+                    query_or_url=f"ytsearch5:{search_q}",
+                    output_dir=output_dir,
+                    custom_title=fb_title,
+                    custom_artist=fb_artist,
+                    bitrate=bitrate,
+                    skip_thumbnail=skip_thumbnail,
+                    expected_duration=expected_duration,
+                    request_id=request_id,
+                    cancel_event=cancel_event
+                )
+            raise last_err
+
+        if should_retry_no_cookies:
+            print(f"[DOWNLOADER] Сессия cookies вызвала ошибку ({extract_err}). Пробуем чистый запуск без cookies с TV клиентом...", flush=True)
             ydl_opts_retry = dict(ydl_opts)
             ydl_opts_retry.pop("cookiefile", None)
+            ydl_opts_retry["format"] = "ba[ext=m4a]/ba[ext=mp3]/ba/bv*+ba/b/best"
             ydl_opts_retry["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["android", "ios", "mweb", "web"],
+                    "player_client": ["tv", "web", "android"],
                 }
             }
-            info = _execute_extraction(ydl_opts_retry)
+            try:
+                info = _execute_extraction(ydl_opts_retry)
+            except Exception as retry_err:
+                return _fallback_direct_search(retry_err)
         else:
-            raise extract_err
+            return _fallback_direct_search(extract_err)
 
     if "entries" in info:
         if not info["entries"]:

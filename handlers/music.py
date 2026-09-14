@@ -156,14 +156,22 @@ async def handle_music_request(message: Message):
                             request_id=req_id
                         )
             except Exception as dl_err:
-                # Если прямая ссылка недоступна (например, SoundCloud Go+ / 404),
-                # но мы извлекли автора и название — скачиваем оригинальную студийную версию через поиск!
+                # Если прямая ссылка недоступна (SoundCloud Go+, ошибка формата YouTube Music и т.д.),
+                # скачиваем оригинальную студийную версию через всесторонний поиск!
+                fallback_query = None
                 if track_info.title and track_info.artist:
-                    print(f"[MUSIC][request_id={req_id}] Прямая ссылка не отдала аудио ({dl_err}), скачиваем оригинал через поиск: '{track_info.artist} - {track_info.title}'", flush=True)
+                    fallback_query = f"{track_info.artist} - {track_info.title}"
+                elif track_info.title:
+                    fallback_query = track_info.title
+                elif track_info.artist:
+                    fallback_query = track_info.artist
+
+                if fallback_query:
+                    print(f"[MUSIC][request_id={req_id}] Прямая ссылка не отдала аудио ({dl_err}), скачиваем оригинал через поиск: '{fallback_query}'", flush=True)
                     async with DOWNLOAD_SEMAPHORE:
                         async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
                             downloaded_audio = await download_track(
-                                query_or_url=f"ytsearch5:{track_info.artist} - {track_info.title}",
+                                query_or_url=f"ytsearch5:{fallback_query}",
                                 custom_title=track_info.title,
                                 custom_artist=track_info.artist,
                                 thumbnail_url=track_info.thumbnail_url,
