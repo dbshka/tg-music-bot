@@ -15,6 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN, PROXY, CUSTOM_API_SERVER, DOWNLOADS_DIR, get_cookies_info
 from services.database import init_db
+from services.http_client import close_shared_session
 from handlers.admin import router as admin_router
 from handlers.music import router as music_router
 from handlers.tag_editor import router as tag_editor_router
@@ -183,6 +184,7 @@ async def main():
     finally:
         if runner:
             await runner.cleanup()
+        await close_shared_session()
         await bot.session.close()
 
 

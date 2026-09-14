@@ -17,8 +17,8 @@ from aiogram.types import (
 )
 
 from config import DOWNLOADS_DIR, MAX_FILE_SIZE_BYTES
-from services.tag_editor import read_mp3_tags, apply_mp3_tags
-from services.database import log_user_activity, increment_user_tag_edit
+from services.tag_editor import read_mp3_tags_async, apply_mp3_tags_async
+from services.database import log_user_activity_async, increment_user_tag_edit_async
 
 logger = logging.getLogger(__name__)
 router = Router(name="tag_editor_router")
@@ -127,7 +127,7 @@ async def render_menu(bot: Bot, chat_id: int, state: FSMContext):
 @router.message(F.audio | (F.document & F.document.file_name.endswith(".mp3")))
 async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
     if message.from_user:
-        log_user_activity(message.from_user.id, message.from_user.username, message.from_user.full_name)
+        await log_user_activity_async(message.from_user.id, message.from_user.username, message.from_user.full_name)
 
     audio_obj = message.audio or message.document
     if audio_obj.file_size and audio_obj.file_size > MAX_FILE_SIZE_BYTES:
@@ -153,7 +153,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
 
     try:
         await bot.download(audio_obj, destination=local_file_path)
-        meta = read_mp3_tags(local_file_path)
+        meta = await read_mp3_tags_async(local_file_path)
 
         # Если Telegram предоставил теги из заголовка сообщения
         initial_title = getattr(audio_obj, "title", None) or meta.title
@@ -210,7 +210,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
 
     try:
         await bot.download(audio_obj, destination=local_file_path)
-        meta = read_mp3_tags(local_file_path)
+        meta = await read_mp3_tags_async(local_file_path)
 
         initial_title = audio_obj.title or meta.title
         initial_performer = audio_obj.performer or meta.artist
@@ -329,7 +329,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
         mp3_path = Path(file_path)
         cover_path = Path(data["cover_path"]) if data.get("cover_path") else None
 
-        updated_mp3, final_cover = apply_mp3_tags(
+        updated_mp3, final_cover = await apply_mp3_tags_async(
             file_path=mp3_path,
             title=data.get("title"),
             artist=data.get("artist"),
@@ -350,7 +350,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
         )
 
         if callback.from_user:
-            increment_user_tag_edit(callback.from_user.id)
+            await increment_user_tag_edit_async(callback.from_user.id)
 
         await callback.message.delete()
 

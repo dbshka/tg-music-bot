@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import threading
 import time
 import urllib.parse
 import uuid
@@ -18,9 +19,10 @@ if 'yt_dlp.YoutubeDL' in sys.modules:
 
 from PIL import Image
 from mutagen.easyid3 import EasyID3
-from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, ID3NoHeaderError
 
 from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
+from services.http_client import get_shared_session
 
 
 @dataclass
@@ -68,55 +70,61 @@ def _apply_custom_metadata(
     artist: Optional[str],
     cover_path: Optional[Path] = None
 ):
-    """Записывает точные ID3-теги названия, исполнителя и обложки."""
+    """
+    Записывает ID3-теги названия, исполнителя и обложки в один атомарный проход.
+    Исключает двойную перезапись MP3-файла на диск.
+    """
     try:
         try:
-            audio = EasyID3(mp3_path)
+            id3 = ID3(mp3_path)
         except ID3NoHeaderError:
-            audio = EasyID3()
-            audio.save(mp3_path)
+            id3 = ID3()
 
         if title:
-            audio["title"] = title
+            id3["TIT2"] = TIT2(encoding=3, text=title)
         if artist:
-            audio["artist"] = artist
-        audio.save(mp3_path)
+            id3["TPE1"] = TPE1(encoding=3, text=artist)
 
         # Вшиваем обложку в тег ID3 APIC
         if cover_path and cover_path.exists():
-            id3 = ID3(mp3_path)
-            with open(cover_path, "rb") as albumart:
-                id3.add(
-                    APIC(
-                        encoding=3,
-                        mime="image/jpeg",
-                        type=3,  # 3 is for album front cover
-                        desc="Cover",
-                        data=albumart.read()
+            try:
+                with open(cover_path, "rb") as albumart:
+                    id3.delall("APIC")
+                    id3.add(
+                        APIC(
+                            encoding=3,
+                            mime="image/jpeg",
+                            type=3,  # 3 is for album front cover
+                            desc="Cover",
+                            data=albumart.read()
+                        )
                     )
-                )
-            id3.save(v2_version=3)
+            except Exception:
+                pass
+
+        # Одиночный сброс на диск
+        id3.save(mp3_path, v2_version=3)
     except Exception:
         pass
 
 
 async def _download_remote_thumbnail(url: str, target_path: Path) -> Optional[Path]:
-    """Скачивает обложку по URL, если yt-dlp её не предоставил."""
+    """Скачивает обложку по URL через shared session, если yt-dlp её не предоставил."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    raw_thumb = target_path.with_suffix(".temp_img")
-                    with open(raw_thumb, "wb") as f:
-                        f.write(data)
-                    jpg_thumb = _convert_thumbnail_to_jpg(raw_thumb)
-                    if raw_thumb.exists() and raw_thumb != jpg_thumb:
-                        raw_thumb.unlink(missing_ok=True)
-                    return jpg_thumb
+        session = get_shared_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                raw_thumb = target_path.with_suffix(".temp_img")
+                raw_thumb.write_bytes(data)
+                jpg_thumb = await asyncio.to_thread(_convert_thumbnail_to_jpg, raw_thumb)
+                if raw_thumb.exists() and raw_thumb != jpg_thumb:
+                    raw_thumb.unlink(missing_ok=True)
+                return jpg_thumb
     except Exception:
         pass
     return None
+
 
 
 def _sync_download(
@@ -127,7 +135,8 @@ def _sync_download(
     bitrate: str = DEFAULT_AUDIO_BITRATE,
     skip_thumbnail: bool = False,
     expected_duration: Optional[int] = None,
-    request_id: Optional[str] = None
+    request_id: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
@@ -155,11 +164,12 @@ def _sync_download(
                 "preferredquality": bitrate,
             }
         ],
-        # Максимальное ускорение кодирования MP3 на Render (compression_level 9 в 7-10 раз быстрее уровня 0)
+        # Оптимальная конфигурация MP3: 1 поток кодировщика (экономия CPU), compression_level 2 (высокое качество звука)
         "postprocessor_args": {
             "FFmpegExtractAudio": [
-                "-threads", "0",
-                "-compression_level", "9",
+                "-threads", "1",
+                "-compression_level", "2",
+                "-joint_stereo", "1",
                 "-vn"
             ]
         },
@@ -286,6 +296,8 @@ def _sync_download(
 
                 hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
                 def p_hook(d):
+                    if cancel_event and cancel_event.is_set():
+                        raise RuntimeError("Download cancelled by user")
                     if d.get("status") == "downloading" and not hook_times["dl_start"]:
                         hook_times["dl_start"] = time.perf_counter()
                     elif d.get("status") == "finished":
@@ -338,6 +350,9 @@ def _sync_download(
                     print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
                     return res_info
                 except Exception as cand_err:
+                    if cancel_event and cancel_event.is_set():
+                        shutil.rmtree(output_dir, ignore_errors=True)
+                        raise
                     last_cand_error = cand_err
                     print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}). Пробуем следующего...", flush=True)
                     # Очищаем неполные или временные файлы перед следующей попыткой
@@ -358,6 +373,8 @@ def _sync_download(
             dl_opts = dict(options)
             hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
             def p_hook(d):
+                if cancel_event and cancel_event.is_set():
+                    raise RuntimeError("Download cancelled by user")
                 if d.get("status") == "downloading" and not hook_times["dl_start"]:
                     hook_times["dl_start"] = time.perf_counter()
                 elif d.get("status") == "finished":
@@ -475,6 +492,7 @@ async def download_track(
     output_dir = DOWNLOADS_DIR / session_id
     output_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
+    cancel_event = threading.Event()
 
     # Параллельная загрузка обложки в фоне во время скачивания аудио (экономит 0.5-1.5 сек)
     thumb_task = None
@@ -493,7 +511,8 @@ async def download_track(
             bitrate,
             bool(thumbnail_url),
             expected_duration,
-            request_id
+            request_id,
+            cancel_event
         )
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
@@ -512,7 +531,11 @@ async def download_track(
         elapsed = time.time() - t_start
         print(f"{req_tag}[DOWNLOADER] [OK] Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
         return audio
-    except Exception as primary_error:
+    except BaseException as primary_error:
+        cancel_event.set()
+        shutil.rmtree(output_dir, ignore_errors=True)
+        if isinstance(primary_error, asyncio.CancelledError):
+            raise
         elapsed = time.time() - t_start
         print(f"{req_tag}[DOWNLOADER] Первичная загрузка {query_or_url} ({elapsed:.2f}s) вернула ошибку: {primary_error}", flush=True)
 
@@ -543,7 +566,8 @@ async def download_track(
                     bitrate,
                     bool(thumbnail_url),
                     expected_duration,
-                    request_id
+                    request_id,
+                    cancel_event
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
                     raise ValueError(f"Fallback YouTube вернул превью ({audio.duration}s)")
@@ -575,7 +599,8 @@ async def download_track(
                     bitrate,
                     bool(thumbnail_url),
                     expected_duration,
-                    request_id
+                    request_id,
+                    cancel_event
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
                     raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")

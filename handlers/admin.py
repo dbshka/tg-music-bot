@@ -7,7 +7,7 @@ from aiogram.types import Message
 from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
 
 from config import ADMIN_ID
-from services.database import get_bot_stats, get_all_user_ids
+from services.database import get_bot_stats_async, get_all_user_ids_async
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_router")
@@ -19,7 +19,7 @@ async def cmd_stats(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    stats = get_bot_stats()
+    stats = await get_bot_stats_async()
 
     # Топ пользователей по скачиваниям
     top_lines = []
@@ -73,7 +73,7 @@ async def cmd_broadcast(message: Message, bot: Bot):
         return
 
     broadcast_text = parts[1].strip()
-    user_ids = get_all_user_ids()
+    user_ids = await get_all_user_ids_async()
     total_users = len(user_ids)
 
     if total_users == 0:

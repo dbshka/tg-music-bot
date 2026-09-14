@@ -1,11 +1,11 @@
 import os
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 from PIL import Image
 
 import mutagen
-from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, ID3NoHeaderError
 from mutagen.mp3 import MP3
 
@@ -20,7 +20,7 @@ class AudioMetadata:
 
 
 def read_mp3_tags(file_path: Path) -> AudioMetadata:
-    """Считывает текущие теги MP3-файла."""
+    """Считывает текущие теги MP3-файла за одно чтение."""
     title = "Без названия"
     artist = "Неизвестный исполнитель"
     album = ""
@@ -30,27 +30,18 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
     try:
         mp3_audio = MP3(file_path)
         duration = int(mp3_audio.info.length or 0)
-    except Exception:
-        pass
-
-    try:
-        id3 = ID3(file_path)
-        # Проверяем наличие обложки (APIC)
-        for tag in id3.values():
-            if isinstance(tag, APIC):
-                has_cover = True
-                break
-    except Exception:
-        pass
-
-    try:
-        easy = EasyID3(file_path)
-        if "title" in easy and easy["title"]:
-            title = easy["title"][0]
-        if "artist" in easy and easy["artist"]:
-            artist = easy["artist"][0]
-        if "album" in easy and easy["album"]:
-            album = easy["album"][0]
+        tags = mp3_audio.tags
+        if tags:
+            if "TIT2" in tags and tags["TIT2"].text:
+                title = str(tags["TIT2"].text[0])
+            if "TPE1" in tags and tags["TPE1"].text:
+                artist = str(tags["TPE1"].text[0])
+            if "TALB" in tags and tags["TALB"].text:
+                album = str(tags["TALB"].text[0])
+            for tag in tags.values():
+                if isinstance(tag, APIC):
+                    has_cover = True
+                    break
     except Exception:
         pass
 
@@ -61,6 +52,11 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
         has_cover=has_cover,
         duration=duration
     )
+
+
+async def read_mp3_tags_async(file_path: Path) -> AudioMetadata:
+    """Асинхронное считывание тегов MP3 без блокировки event loop."""
+    return await asyncio.to_thread(read_mp3_tags, file_path)
 
 
 def prepare_cover_image(image_path: Path, output_path: Path) -> Path:
@@ -98,10 +94,9 @@ def apply_mp3_tags(
 
     final_cover_jpg = None
     if cover_path and cover_path.exists():
-        # Подготовим качественный JPEG
         final_cover_jpg = prepare_cover_image(cover_path, file_path.parent / "cover_converted")
         with open(final_cover_jpg, "rb") as albumart:
-            id3.delall("APIC")  # удаляем старые обложки
+            id3.delall("APIC")
             id3.add(
                 APIC(
                     encoding=3,
@@ -114,3 +109,15 @@ def apply_mp3_tags(
 
     id3.save(file_path, v2_version=3)
     return file_path, final_cover_jpg
+
+
+async def apply_mp3_tags_async(
+    file_path: Path,
+    title: Optional[str] = None,
+    artist: Optional[str] = None,
+    album: Optional[str] = None,
+    cover_path: Optional[Path] = None
+) -> Tuple[Path, Optional[Path]]:
+    """Асинхронная запись тегов и обложки без блокировки event loop."""
+    return await asyncio.to_thread(apply_mp3_tags, file_path, title, artist, album, cover_path)
+

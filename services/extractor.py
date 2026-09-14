@@ -1,3 +1,4 @@
+import asyncio
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -5,6 +6,7 @@ from typing import Optional, Tuple
 import aiohttp
 
 from config import CUSTOM_API_SERVER
+from services.http_client import get_shared_session
 
 
 @dataclass
@@ -285,11 +287,11 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
 
 
 async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-    """Поиск по Deezer API (не путает треки и исполнителей, в отличие от одиночного запроса к iTunes)."""
+    """Поиск по Deezer API с жестким таймаутом (2.5с) во избежание зависаний."""
     try:
         encoded = urllib.parse.quote(query)
         api_url = f"https://api.deezer.com/search?q={encoded}"
-        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 results = data.get("data", [])
@@ -306,11 +308,11 @@ async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Op
 
 
 async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-    """Резервный поиск по iTunes API с валидацией совпадения названия трека."""
+    """Резервный поиск по iTunes API с валидацией совпадения названия трека (быстрый ответ < 500 мс)."""
     try:
         encoded = urllib.parse.quote(query)
         api_url = f"https://itunes.apple.com/search?term={encoded}&media=music&limit=5"
-        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 results = data.get("results", [])
@@ -336,7 +338,7 @@ async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) 
     try:
         api_url = f"https://api.microlink.io/?url={urllib.parse.quote(url)}"
         headers = {"User-Agent": "Mozilla/5.0"}
-        async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=7)) as resp:
+        async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == "success":
@@ -361,80 +363,64 @@ async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) 
 async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
     """
     Извлекает метаданные трека Spotify.
-    Гарантированно определяет точного автора и название без подмены треков.
+    Оптимизирован для минимальной латентности:
+    1. Запускает параллельно Spotify oEmbed (~200 мс) и Microlink.
+    2. При необходимости валидирует артиста и длительность через быстрый iTunes Search (< 400 мс).
+    3. Исключает 5-секундное зависание Deezer при известных названии и артисте.
     """
     track_id_match = re.search(r'track/([a-zA-Z0-9]+)', url)
     track_id = track_id_match.group(1) if track_id_match else None
     clean_url = f"https://open.spotify.com/track/{track_id}" if track_id else url
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-
     title = None
     artist = None
     thumbnail_url = None
+    duration = None
 
-    # Попытка 1: Глобальный экстрактор (100% точно извлекает реального артиста из Spotify в обход любых геоблоков)
-    m_artist, m_title, m_image = await _extract_microlink_metadata(clean_url, session)
+    # Быстрый опрос oEmbed
+    async def _fetch_oembed():
+        try:
+            oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(clean_url)}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("title"), data.get("thumbnail_url")
+        except Exception:
+            pass
+        return None, None
+
+    # Запускаем параллельно oEmbed и Microlink
+    oembed_task = asyncio.create_task(_fetch_oembed())
+    microlink_task = asyncio.create_task(_extract_microlink_metadata(clean_url, session))
+
+    (oe_title, oe_thumb), (m_artist, m_title, m_thumb) = await asyncio.gather(
+        oembed_task, microlink_task, return_exceptions=False
+    )
+
     if m_title and m_artist:
         title = m_title
         artist = m_artist
-        thumbnail_url = m_image
+        thumbnail_url = m_thumb or oe_thumb
+    elif oe_title:
+        title = oe_title
+        thumbnail_url = oe_thumb
+        if " - " in oe_title:
+            parts = oe_title.split(" - ", 1)
+            artist = parts[0].strip()
+            title = parts[1].strip()
 
-    # Попытка 2: чтение HTML напрямую или через воркер (если доступен прокси)
-    if not title or not artist:
-        request_urls = [clean_url]
-        if CUSTOM_API_SERVER:
-            request_urls.insert(0, f"{CUSTOM_API_SERVER}/proxy/{clean_url}")
+    # Если артист или длительность ещё не определены — быстрый запрос в iTunes API (< 500 мс)
+    if title and (not artist or not duration):
+        search_q = f"{artist} {title}" if artist else title
+        it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, search_q)
+        if it_artist:
+            artist = artist or it_artist
+            title = it_title or title
+            thumbnail_url = thumbnail_url or it_cover
+            duration = it_dur
 
-        for target_req_url in request_urls:
-            try:
-                async with session.get(target_req_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        html = await resp.text()
-                        if "Listening is everything" not in html and ("og:title" in html or "twitter:title" in html):
-                            og_title = re.search(r'property="og:title"\s+content="([^"]+)"', html)
-                            og_desc = re.search(r'property="og:description"\s+content="([^"]+)"', html)
-                            og_img = re.search(r'property="og:image"\s+content="([^"]+)"', html)
-
-                            if og_title:
-                                title = og_title.group(1).strip()
-                            if og_desc:
-                                desc = og_desc.group(1).strip()
-                                parts = re.split(r'[\u00b7\u2022]', desc)
-                                if parts and "Song" not in parts[0] and "Spotify" not in parts[0]:
-                                    artist = parts[0].strip()
-                            if og_img:
-                                thumbnail_url = og_img.group(1).strip()
-                            if title and artist:
-                                break
-            except Exception:
-                pass
-
-    # Попытка 2: Spotify oEmbed
-    if not title or not thumbnail_url:
-        try:
-            oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(clean_url)}"
-            async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if not title:
-                        title = data.get("title")
-                    if not thumbnail_url:
-                        thumbnail_url = data.get("thumbnail_url")
-        except Exception:
-            pass
-
-    # Если есть title и artist, пробуем получить точную длительность из Deezer
-    duration = None
-    if title and artist:
-        _, _, _, d_dur = await _search_deezer(session, f"{artist} {title}")
-        if d_dur:
-            duration = d_dur
-
-    # Попытка 3: Если есть заголовок, но нет артиста — ищем в Deezer, затем в iTunes
+    # Резервный поиск в Deezer с коротким таймаутом (только если артист все еще неизвестен)
     if title and not artist:
         d_artist, d_title, d_cover, d_dur = await _search_deezer(session, title)
         if d_artist:
@@ -442,13 +428,6 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
             title = d_title or title
             thumbnail_url = thumbnail_url or d_cover
             duration = d_dur
-        else:
-            it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, title)
-            if it_artist:
-                artist = it_artist
-                title = it_title or title
-                thumbnail_url = thumbnail_url or it_cover
-                duration = it_dur
 
     if title:
         search_query = f"{artist} - {title}" if artist else title
@@ -463,6 +442,7 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
         )
 
     return None
+
 
 
 async def extract_apple_music_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
@@ -586,53 +566,54 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
     return None
 
 
-async def resolve_track_url(url: str) -> ExtractedTrack:
+async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] = None) -> ExtractedTrack:
     """
     Анализирует переданный URL и определяет способ загрузки:
     - Яндекс Музыка -> OpenGraph парсинг -> ytsearch
-    - Spotify -> OpenGraph / oEmbed / Deezer -> ytsearch
+    - Spotify -> OpenGraph / oEmbed / iTunes -> ytsearch
     - Apple Music -> iTunes lookup -> ytsearch
     - YouTube -> oEmbed метаданные + прямая загрузка
     - SoundCloud, VK, Bandcamp и др. -> прямая загрузка через yt-dlp
     """
     parsed = urllib.parse.urlparse(url)
     domain = parsed.netloc.lower()
+    if session is None:
+        session = get_shared_session()
 
-    async with aiohttp.ClientSession() as session:
-        # 1. Яндекс Музыка
-        if "music.yandex." in domain or ("yandex." in domain and ("/album/" in url or "/track/" in url)):
-            track = await extract_yandex_music_info(url, session)
-            if track:
-                return track
-            # Резервное извлечение слага из пути URL, если он текстовый
-            path_parts = [p for p in parsed.path.split('/') if p and p not in ('album', 'track')]
-            slug_query = " ".join(path_parts).replace('-', ' ').replace('_', ' ')
-            if slug_query and not slug_query.replace(' ', '').isdigit():
-                return ExtractedTrack(
-                    platform="Яндекс Музыка",
-                    target=f"ytsearch3:{slug_query}",
-                    is_search=True,
-                    title=slug_query
-                )
-            raise ValueError("Не удалось получить информацию о треке Яндекс Музыки. Попробуйте отправить название трека текстом.")
+    # 1. Яндекс Музыка
+    if "music.yandex." in domain or ("yandex." in domain and ("/album/" in url or "/track/" in url)):
+        track = await extract_yandex_music_info(url, session)
+        if track:
+            return track
+        # Резервное извлечение слага из пути URL, если он текстовый
+        path_parts = [p for p in parsed.path.split('/') if p and p not in ('album', 'track')]
+        slug_query = " ".join(path_parts).replace('-', ' ').replace('_', ' ')
+        if slug_query and not slug_query.replace(' ', '').isdigit():
+            return ExtractedTrack(
+                platform="Яндекс Музыка",
+                target=f"ytsearch3:{slug_query}",
+                is_search=True,
+                title=slug_query
+            )
+        raise ValueError("Не удалось получить информацию о треке Яндекс Музыки. Попробуйте отправить название трека текстом.")
 
-        # 2. Spotify
-        if "spotify.com" in domain:
-            track = await extract_spotify_info(url, session)
-            if track:
-                return track
+    # 2. Spotify
+    if "spotify.com" in domain:
+        track = await extract_spotify_info(url, session)
+        if track:
+            return track
 
-        # 3. Apple Music
-        if "apple.com" in domain:
-            track = await extract_apple_music_info(url, session)
-            if track:
-                return track
+    # 3. Apple Music
+    if "apple.com" in domain:
+        track = await extract_apple_music_info(url, session)
+        if track:
+            return track
 
-        # 4. YouTube / YouTube Music (извлекаем точные метаданные для мгновенного SoundCloud Fallback)
-        if "youtube.com" in domain or "youtu.be" in domain:
-            yt_track = await extract_youtube_info(url, session)
-            if yt_track:
-                return yt_track
+    # 4. YouTube / YouTube Music (извлекаем точные метаданные для мгновенного SoundCloud Fallback)
+    if "youtube.com" in domain or "youtu.be" in domain:
+        yt_track = await extract_youtube_info(url, session)
+        if yt_track:
+            return yt_track
 
     # Прочие сервисы, поддерживаемые yt-dlp напрямую
     platform_name = "Музыкальный сервис"
@@ -652,3 +633,4 @@ async def resolve_track_url(url: str) -> ExtractedTrack:
         target=url,
         is_search=False
     )
+
