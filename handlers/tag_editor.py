@@ -124,7 +124,7 @@ async def render_menu(bot: Bot, chat_id: int, state: FSMContext):
 # -------------------------------------------------------------
 # 1. Приём входящего MP3-файла (аудио или документ)
 # -------------------------------------------------------------
-@router.message(F.audio | (F.document & F.document.file_name.endswith(".mp3")))
+@router.message(F.audio | (F.document & (F.document.file_name.endswith(".mp3") | F.document.file_name.endswith(".m4a"))))
 async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
     if message.from_user:
         await log_user_activity_async(message.from_user.id, message.from_user.username, message.from_user.full_name)
@@ -149,7 +149,9 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
     session_dir.mkdir(parents=True, exist_ok=True)
-    local_file_path = session_dir / "track.mp3"
+    raw_fname = getattr(audio_obj, "file_name", "") or "track.mp3"
+    ext = Path(raw_fname).suffix.lower() if Path(raw_fname).suffix.lower() in [".mp3", ".m4a"] else ".mp3"
+    local_file_path = session_dir / f"track{ext}"
 
     try:
         await bot.download(audio_obj, destination=local_file_path)
@@ -206,7 +208,9 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
     session_dir.mkdir(parents=True, exist_ok=True)
-    local_file_path = session_dir / "track.mp3"
+    raw_fname = getattr(audio_obj, "file_name", "") or "track.mp3"
+    ext = Path(raw_fname).suffix.lower() if Path(raw_fname).suffix.lower() in [".mp3", ".m4a"] else ".mp3"
+    local_file_path = session_dir / f"track{ext}"
 
     try:
         await bot.download(audio_obj, destination=local_file_path)

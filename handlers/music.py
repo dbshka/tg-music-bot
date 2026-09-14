@@ -139,7 +139,7 @@ async def handle_music_request(message: Message):
             await status_msg.edit_text(
                 f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>\n"
                 f"Платформа: <b>{track_info.platform}</b>\n"
-                f"<i>Конвертация в MP3...</i>",
+                f"<i>Загрузка аудиопотока...</i>",
                 parse_mode="HTML"
             )
 

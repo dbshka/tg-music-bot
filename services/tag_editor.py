@@ -8,6 +8,7 @@ from PIL import Image
 import mutagen
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, ID3NoHeaderError
 from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, MP4Cover
 
 
 @dataclass
@@ -20,12 +21,35 @@ class AudioMetadata:
 
 
 def read_mp3_tags(file_path: Path) -> AudioMetadata:
-    """Считывает текущие теги MP3-файла за одно чтение."""
+    """Считывает текущие теги MP3 или M4A файла за одно чтение."""
     title = "Без названия"
     artist = "Неизвестный исполнитель"
     album = ""
     has_cover = False
     duration = 0
+
+    ext = file_path.suffix.lower()
+    if ext in [".m4a", ".mp4"]:
+        try:
+            mp4_audio = MP4(file_path)
+            duration = int(mp4_audio.info.length or 0)
+            if "\xa9nam" in mp4_audio and mp4_audio["\xa9nam"]:
+                title = str(mp4_audio["\xa9nam"][0])
+            if "\xa9ART" in mp4_audio and mp4_audio["\xa9ART"]:
+                artist = str(mp4_audio["\xa9ART"][0])
+            if "\xa9alb" in mp4_audio and mp4_audio["\xa9alb"]:
+                album = str(mp4_audio["\xa9alb"][0])
+            if "covr" in mp4_audio and mp4_audio["covr"]:
+                has_cover = True
+        except Exception:
+            pass
+        return AudioMetadata(
+            title=title,
+            artist=artist,
+            album=album,
+            has_cover=has_cover,
+            duration=duration
+        )
 
     try:
         mp3_audio = MP3(file_path)
@@ -55,12 +79,12 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
 
 
 async def read_mp3_tags_async(file_path: Path) -> AudioMetadata:
-    """Асинхронное считывание тегов MP3 без блокировки event loop."""
+    """Асинхронное считывание тегов MP3/M4A без блокировки event loop."""
     return await asyncio.to_thread(read_mp3_tags, file_path)
 
 
 def prepare_cover_image(image_path: Path, output_path: Path) -> Path:
-    """Приводит изображение к квадратному формату JPEG до 640x640 для Telegram и ID3."""
+    """Приводит изображение к квадратному формату JPEG до 640x640 для Telegram и ID3/MP4."""
     with Image.open(image_path) as img:
         rgb_img = img.convert("RGB")
         rgb_img.thumbnail((640, 640))
@@ -77,9 +101,31 @@ def apply_mp3_tags(
     cover_path: Optional[Path] = None
 ) -> Tuple[Path, Optional[Path]]:
     """
-    Записывает обновленные ID3-теги и обложку в MP3.
-    Возвращает (mp3_path, cover_jpg_path).
+    Записывает обновленные теги и обложку в MP3 или M4A.
+    Возвращает (file_path, cover_jpg_path).
     """
+    final_cover_jpg = None
+    if cover_path and cover_path.exists():
+        final_cover_jpg = prepare_cover_image(cover_path, file_path.parent / "cover_converted")
+
+    ext = file_path.suffix.lower()
+    if ext in [".m4a", ".mp4"]:
+        try:
+            mp4 = MP4(file_path)
+            if title is not None:
+                mp4["\xa9nam"] = [title]
+            if artist is not None:
+                mp4["\xa9ART"] = [artist]
+            if album is not None:
+                mp4["\xa9alb"] = [album]
+            if final_cover_jpg and final_cover_jpg.exists():
+                with open(final_cover_jpg, "rb") as f:
+                    mp4["covr"] = [MP4Cover(f.read(), imageformat=MP4Cover.FORMAT_JPEG)]
+            mp4.save()
+            return file_path, final_cover_jpg
+        except Exception:
+            pass
+
     try:
         id3 = ID3(file_path)
     except ID3NoHeaderError:
@@ -92,9 +138,7 @@ def apply_mp3_tags(
     if album is not None:
         id3["TALB"] = TALB(encoding=3, text=album)
 
-    final_cover_jpg = None
-    if cover_path and cover_path.exists():
-        final_cover_jpg = prepare_cover_image(cover_path, file_path.parent / "cover_converted")
+    if final_cover_jpg and final_cover_jpg.exists():
         with open(final_cover_jpg, "rb") as albumart:
             id3.delall("APIC")
             id3.add(

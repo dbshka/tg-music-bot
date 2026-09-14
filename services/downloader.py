@@ -21,6 +21,7 @@ if 'yt_dlp.YoutubeDL' in sys.modules:
 from PIL import Image
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, ID3NoHeaderError
+from mutagen.mp4 import MP4, MP4Cover
 
 from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
 from services.http_client import get_shared_session
@@ -66,18 +67,39 @@ def _convert_thumbnail_to_jpg(thumb_path: Path) -> Optional[Path]:
 
 
 def _apply_custom_metadata(
-    mp3_path: Path,
+    audio_path: Path,
     title: Optional[str],
     artist: Optional[str],
     cover_path: Optional[Path] = None
 ):
     """
-    Записывает ID3-теги названия, исполнителя и обложки в один атомарный проход.
-    Исключает двойную перезапись MP3-файла на диск.
+    Записывает теги названия, исполнителя и обложки в один атомарный проход.
+    Поддерживает как MP3 (ID3), так и M4A/AAC (MP4 атомы).
     """
+    ext = audio_path.suffix.lower()
+    if ext in [".m4a", ".mp4"]:
+        try:
+            mp4 = MP4(audio_path)
+            if title:
+                mp4["\xa9nam"] = [title]
+            if artist:
+                mp4["\xa9ART"] = [artist]
+            if cover_path and cover_path.exists():
+                try:
+                    with open(cover_path, "rb") as f:
+                        c_data = f.read()
+                    image_fmt = MP4Cover.FORMAT_JPEG if cover_path.suffix.lower() in [".jpg", ".jpeg"] else MP4Cover.FORMAT_PNG
+                    mp4["covr"] = [MP4Cover(c_data, imageformat=image_fmt)]
+                except Exception:
+                    pass
+            mp4.save()
+        except Exception:
+            pass
+        return
+
     try:
         try:
-            id3 = ID3(mp3_path)
+            id3 = ID3(audio_path)
         except ID3NoHeaderError:
             id3 = ID3()
 
@@ -104,7 +126,7 @@ def _apply_custom_metadata(
                 pass
 
         # Одиночный сброс на диск
-        id3.save(mp3_path, v2_version=3)
+        id3.save(audio_path, v2_version=3)
     except Exception:
         pass
 
@@ -146,9 +168,8 @@ def _sync_download(
     cookies_info = get_cookies_info()
 
     ydl_opts = {
-        # Приоритет отдаем прямым прогрессивным HTTP MP3/M4A аудиопотокам
-        # (в десятки раз быстрее HLS чанков и исключает лишнюю перекодировку MP3)
-        "format": "ba[protocol^=http][ext=mp3]/ba[protocol^=http][ext=m4a]/ba[ext=m4a]/ba[protocol^=http]/ba/best",
+        # Приоритет отдаем прямому M4A (AAC) аудиопотоку: без долгой перекодировки FFmpeg в MP3 (-3..5 сек)
+        "format": "ba[ext=m4a]/ba[protocol^=http][ext=m4a]/ba[ext=mp3]/ba[protocol^=http][ext=mp3]/ba/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "writethumbnail": not skip_thumbnail,
@@ -159,15 +180,13 @@ def _sync_download(
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": bitrate,
+                "preferredcodec": "m4a",
             }
         ],
-        # Оптимальная быстрая конфигурация MP3: все доступные потоки CPU, без замедляющих алгоритмов сжатия
+        # Быстрая конфигурация: все доступные потоки CPU, без лишнего пережатия
         "postprocessor_args": {
             "FFmpegExtractAudio": [
                 "-threads", "0",
-                "-joint_stereo", "1",
                 "-vn"
             ]
         },
@@ -208,32 +227,58 @@ def _sync_download(
     def _execute_extraction(options):
         source = "soundcloud" if (query_or_url.startswith("scsearch") or "soundcloud.com" in query_or_url) else "youtube"
         if is_search:
-            # 1. Извлекаем кандидатов поиска БЕЗ полного скачивания веб-страниц (extract_flat=True)
-            search_opts = dict(options)
-            search_opts["extract_flat"] = True
-            search_opts["noplaylist"] = True
-
-            search_opts["ignoreerrors"] = True
-
+            # 1. Параллельный опрос YouTube + SoundCloud для мгновенного нахождения лучшего трека
             inv_idx1 = len(invocations) + 1
             t_s0 = time.perf_counter()
-            with yt_dlp.YoutubeDL(search_opts) as ydl_search:
-                search_info = ydl_search.extract_info(query_or_url, download=False)
+
+            search_query = query_or_url.split(":", 1)[1] if ":" in query_or_url else query_or_url
+            entries = []
+
+            def _fetch_candidates(target_q, src_name):
+                s_opts = dict(options)
+                s_opts["extract_flat"] = True
+                s_opts["noplaylist"] = True
+                s_opts["ignoreerrors"] = True
+                try:
+                    with yt_dlp.YoutubeDL(s_opts) as ydl_s:
+                        info = ydl_s.extract_info(target_q, download=False)
+                        items = [e for e in info.get("entries", []) if e]
+                        for item in items:
+                            item["_source"] = src_name
+                        return items
+                except Exception as ex:
+                    print(f"{req_tag}[SEARCH] Ошибка поиска {src_name}: {ex}", flush=True)
+                    return []
+
+            import concurrent.futures
+            # Запускаем YouTube и SoundCloud параллельно
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                f_yt = executor.submit(_fetch_candidates, f"ytsearch2:{search_query}", "youtube")
+                f_sc = executor.submit(_fetch_candidates, f"scsearch2:{search_query}", "soundcloud")
+
+                done, not_done = concurrent.futures.wait([f_yt, f_sc], timeout=6.0)
+                for f in done:
+                    try:
+                        res = f.result()
+                        if res:
+                            entries.extend(res)
+                    except Exception:
+                        pass
+
             t_s1 = time.perf_counter()
             dur_s = t_s1 - t_s0
             perf_timings["search"] += dur_s
 
-            entries = [e for e in search_info.get("entries", []) if e]
             invocations.append({
                 "invocation": inv_idx1,
-                "purpose": "candidate_search",
-                "source": source,
+                "purpose": "parallel_candidate_search",
+                "source": "youtube+soundcloud",
                 "start": t_s0 - t_start_all,
                 "end": t_s1 - t_start_all,
                 "duration": dur_s,
                 "result": f"OK ({len(entries)} candidates)"
             })
-            print(f"{req_tag}[YTDLP] invocation=#{inv_idx1} purpose='candidate_search' source='{source}' start={t_s0 - t_start_all:.2f}s end={t_s1 - t_start_all:.2f}s duration={dur_s:.2f}s result='OK ({len(entries)} candidates)'", flush=True)
+            print(f"{req_tag}[YTDLP] invocation=#{inv_idx1} purpose='parallel_candidate_search' start={t_s0 - t_start_all:.2f}s end={t_s1 - t_start_all:.2f}s duration={dur_s:.2f}s result='OK ({len(entries)} candidates)'", flush=True)
 
             if not entries:
                 raise ValueError("Трек не найден по данному запросу.")
@@ -262,13 +307,18 @@ def _sync_download(
                     else:
                         penalty += 80.0
 
-                if source == "youtube":
+                cand_src = e.get("_source") or source
+                if cand_src == "youtube":
                     uploader = str(e.get("uploader") or "")
                     channel = str(e.get("channel") or "")
                     is_topic = uploader.endswith("- Topic") or channel.endswith("- Topic") or " - Topic" in uploader or " - Topic" in channel
                     # На серверных/облачных IP YouTube Topic релизы часто блокируются бот-проверкой
                     if is_topic and not cookies_info.get("active"):
                         penalty += 60.0
+                elif cand_src == "soundcloud":
+                    # SoundCloud надежен без бот-чеков
+                    if not cookies_info.get("active"):
+                        penalty -= 5.0
 
                 return penalty
 
@@ -276,21 +326,22 @@ def _sync_download(
             t_c1 = time.perf_counter()
             perf_timings["candidate_selection"] += (t_c1 - t_c0)
 
-            # 3. Цикл скачивания лучших кандидатов (до 4 попыток)
+            # 3. Цикл скачивания лучших кандидатов
             dl_opts = dict(options)
             dl_opts["extract_flat"] = False
 
             last_cand_error = None
-            for cand_idx, selected_entry in enumerate(ranked_candidates[:4]):
+            for cand_idx, selected_entry in enumerate(ranked_candidates[:3]):
+                cand_source = selected_entry.get("_source") or source
                 target_url = selected_entry.get("webpage_url") or selected_entry.get("url") or selected_entry.get("id")
-                if target_url and not target_url.startswith("http") and "soundcloud" not in source:
+                if target_url and not target_url.startswith("http") and "soundcloud" not in cand_source:
                     target_url = f"https://www.youtube.com/watch?v={target_url}"
                 if not target_url:
                     continue
 
                 cand_title = selected_entry.get("title") or target_url
                 cand_dur = selected_entry.get("duration") or 0
-                print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1}/{min(4, len(ranked_candidates))}: '{cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
+                print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1} ({cand_source}): '{cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
 
                 hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
                 def p_hook(d):
@@ -318,10 +369,10 @@ def _sync_download(
                     t_d1 = time.perf_counter()
                     dur_dl_all = t_d1 - t_d0
 
-                    # Проверяем появление готового MP3 файла
-                    mp3_files = list(output_dir.glob("*.mp3"))
-                    if not mp3_files:
-                        raise FileNotFoundError("Аудиофайл MP3 не был создан после обработки кандидата.")
+                    # Проверяем появление готового аудиофайла (M4A или MP3)
+                    audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"]]
+                    if not audio_files:
+                        raise FileNotFoundError("Аудиофайл не был создан после обработки кандидата.")
 
                     if hook_times["dl_start"] and hook_times["dl_end"]:
                         dur_net = hook_times["dl_end"] - hook_times["dl_start"]
@@ -339,13 +390,13 @@ def _sync_download(
                     invocations.append({
                         "invocation": inv_idx2,
                         "purpose": f"stream_download_cand_{cand_idx+1}",
-                        "source": source,
+                        "source": cand_source,
                         "start": t_d0 - t_start_all,
                         "end": t_d1 - t_start_all,
                         "duration": dur_dl_all,
                         "result": "OK"
                     })
-                    print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
+                    print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
                     return res_info
                 except Exception as cand_err:
                     if cancel_event and cancel_event.is_set():
@@ -447,12 +498,12 @@ def _sync_download(
             raise ValueError("Трек не найден по данному запросу.")
         info = info["entries"][0]
 
-    mp3_files = list(output_dir.glob("*.mp3"))
-    if not mp3_files:
-        raise FileNotFoundError("Аудиофайл MP3 не был создан после обработки.")
+    audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"]]
+    if not audio_files:
+        raise FileNotFoundError("Аудиофайл не был создан после обработки.")
 
-    mp3_path = mp3_files[0]
-    filesize = mp3_path.stat().st_size
+    audio_path = audio_files[0]
+    filesize = audio_path.stat().st_size
 
     # Находим обложку
     thumb_candidates = list(output_dir.glob("*.webp")) + list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
@@ -465,11 +516,11 @@ def _sync_download(
     duration = int(info.get("duration") or 0)
 
     t_tag0 = time.perf_counter()
-    _apply_custom_metadata(mp3_path, extracted_title, extracted_artist, thumbnail_path)
+    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, thumbnail_path)
     perf_timings["tags"] = time.perf_counter() - t_tag0
 
     return DownloadedAudio(
-        file_path=mp3_path,
+        file_path=audio_path,
         title=extracted_title,
         artist=extracted_artist,
         duration=duration,
