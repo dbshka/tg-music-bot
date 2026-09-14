@@ -173,18 +173,37 @@ async def handle_music_request(message: Message):
             await status_msg.edit_text("📤 <i>Отправка трека в Telegram...</i>", parse_mode="HTML")
 
             audio_file = FSInputFile(downloaded_audio.file_path)
-            thumb_file = FSInputFile(downloaded_audio.thumbnail_path) if downloaded_audio.thumbnail_path else None
+            thumb_path = downloaded_audio.thumbnail_path
+            thumb_file = (
+                FSInputFile(thumb_path)
+                if (thumb_path and thumb_path.exists() and thumb_path.is_file() and thumb_path.stat().st_size > 0)
+                else None
+            )
 
             t_u0 = time.perf_counter()
             print(f"[MUSIC][request_id={req_id}] send_audio START", flush=True)
-            sent_msg = await message.answer_audio(
-                audio=audio_file,
-                title=downloaded_audio.title,
-                performer=downloaded_audio.artist,
-                duration=downloaded_audio.duration,
-                thumbnail=thumb_file,
-                reply_markup=get_audio_edit_keyboard()
-            )
+            try:
+                sent_msg = await message.answer_audio(
+                    audio=audio_file,
+                    title=downloaded_audio.title,
+                    performer=downloaded_audio.artist,
+                    duration=downloaded_audio.duration,
+                    thumbnail=thumb_file,
+                    reply_markup=get_audio_edit_keyboard()
+                )
+            except Exception as send_err:
+                if thumb_file:
+                    print(f"[MUSIC][request_id={req_id}] send_audio with thumbnail failed ({send_err}), retrying without thumbnail...", flush=True)
+                    sent_msg = await message.answer_audio(
+                        audio=audio_file,
+                        title=downloaded_audio.title,
+                        performer=downloaded_audio.artist,
+                        duration=downloaded_audio.duration,
+                        thumbnail=None,
+                        reply_markup=get_audio_edit_keyboard()
+                    )
+                else:
+                    raise
             t_telegram = time.perf_counter() - t_u0
             print(f"[MUSIC][request_id={req_id}] send_audio SUCCESS in {t_telegram:.2f}s", flush=True)
 
@@ -291,18 +310,37 @@ async def handle_music_request(message: Message):
             await status_msg.edit_text("📤 <i>Отправка трека в Telegram...</i>", parse_mode="HTML")
 
             audio_file = FSInputFile(downloaded_audio.file_path)
-            thumb_file = FSInputFile(downloaded_audio.thumbnail_path) if downloaded_audio.thumbnail_path else None
+            thumb_path = downloaded_audio.thumbnail_path
+            thumb_file = (
+                FSInputFile(thumb_path)
+                if (thumb_path and thumb_path.exists() and thumb_path.is_file() and thumb_path.stat().st_size > 0)
+                else None
+            )
 
             t_u0 = time.perf_counter()
             print(f"[MUSIC][request_id={req_id}] send_audio START", flush=True)
-            sent_msg = await message.answer_audio(
-                audio=audio_file,
-                title=downloaded_audio.title,
-                performer=downloaded_audio.artist,
-                duration=downloaded_audio.duration,
-                thumbnail=thumb_file,
-                reply_markup=get_audio_edit_keyboard()
-            )
+            try:
+                sent_msg = await message.answer_audio(
+                    audio=audio_file,
+                    title=downloaded_audio.title,
+                    performer=downloaded_audio.artist,
+                    duration=downloaded_audio.duration,
+                    thumbnail=thumb_file,
+                    reply_markup=get_audio_edit_keyboard()
+                )
+            except Exception as send_err:
+                if thumb_file:
+                    print(f"[MUSIC][request_id={req_id}] send_audio with thumbnail failed ({send_err}), retrying without thumbnail...", flush=True)
+                    sent_msg = await message.answer_audio(
+                        audio=audio_file,
+                        title=downloaded_audio.title,
+                        performer=downloaded_audio.artist,
+                        duration=downloaded_audio.duration,
+                        thumbnail=None,
+                        reply_markup=get_audio_edit_keyboard()
+                    )
+                else:
+                    raise
             t_telegram = time.perf_counter() - t_u0
             print(f"[MUSIC][request_id={req_id}] send_audio SUCCESS in {t_telegram:.2f}s", flush=True)
 

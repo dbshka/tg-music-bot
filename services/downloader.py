@@ -589,11 +589,14 @@ async def download_track(
         if thumb_task:
             try:
                 downloaded_thumb = await thumb_task
-                if downloaded_thumb and not audio.thumbnail_path:
+                if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                     audio.thumbnail_path = downloaded_thumb
                     _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
             except Exception:
                 pass
+
+        if audio.thumbnail_path and not audio.thumbnail_path.exists():
+            audio.thumbnail_path = None
 
         elapsed = time.time() - t_start
         print(f"{req_tag}[DOWNLOADER] [OK] Трек успешно получен за {elapsed:.2f} сек: {audio.title}", flush=True)
@@ -606,8 +609,16 @@ async def download_track(
         elapsed = time.time() - t_start
         print(f"{req_tag}[DOWNLOADER] Первичная загрузка {query_or_url} ({elapsed:.2f}s) вернула ошибку: {primary_error}", flush=True)
 
-        shutil.rmtree(output_dir, ignore_errors=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Очищаем только временные аудиофайлы, сохраняя скачанную обложку
+        if output_dir.exists():
+            for item in output_dir.iterdir():
+                if item.is_file() and not item.name.startswith("cover"):
+                    try:
+                        item.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
         fallback_queries = _build_fallback_queries(custom_artist, custom_title, query_or_url)
         is_bot_blocked = any(
@@ -639,11 +650,13 @@ async def download_track(
                 if thumb_task:
                     try:
                         downloaded_thumb = await thumb_task
-                        if downloaded_thumb and not audio.thumbnail_path:
+                        if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                             audio.thumbnail_path = downloaded_thumb
                             _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
                     except Exception:
                         pass
+                if audio.thumbnail_path and not audio.thumbnail_path.exists():
+                    audio.thumbnail_path = None
                 elapsed_fb = time.time() - t_start
                 print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
@@ -675,11 +688,13 @@ async def download_track(
                     if thumb_task:
                         try:
                             downloaded_thumb = await thumb_task
-                            if downloaded_thumb and not audio.thumbnail_path:
+                            if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                                 audio.thumbnail_path = downloaded_thumb
                                 _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
                         except Exception:
                             pass
+                    if audio.thumbnail_path and not audio.thumbnail_path.exists():
+                        audio.thumbnail_path = None
                     elapsed_fb = time.time() - t_start
                     print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через SoundCloud Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                     return audio
