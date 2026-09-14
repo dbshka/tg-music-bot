@@ -145,11 +145,6 @@ def normalize_cache_key(query: str) -> str:
                 if am_match:
                     return f"applemusic:{am_match.group(1)}"
 
-            # Яндекс Музыка track ID
-            elif "music.yandex." in netloc or "yandex." in netloc:
-                ym_match = re.search(r'track/(\d+)', parsed.path)
-                if ym_match:
-                    return f"yandexmusic:{ym_match.group(1)}"
 
             # Общий случай для URL: отсекаем query параметры и конечный слеш
             clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
