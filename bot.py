@@ -13,7 +13,7 @@ from aiogram.types import BotCommand
 
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN, PROXY, CUSTOM_API_SERVER, DOWNLOADS_DIR, get_cookies_info
+from config import BOT_TOKEN, PROXY, CUSTOM_API_SERVER, DOWNLOADS_DIR, BOT_VERSION, get_cookies_info
 from services.database import init_db
 from services.http_client import close_shared_session
 from handlers.admin import router as admin_router
@@ -104,7 +104,7 @@ async def main():
     dp.include_router(tag_editor_router)
     dp.include_router(music_router)
 
-    logger.info("Бот запускается...")
+    logger.info(f"Бот запускается (v{BOT_VERSION})...")
 
     # Проверка статуса cookies для YouTube
     cookie_info = get_cookies_info()
