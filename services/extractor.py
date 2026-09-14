@@ -311,7 +311,8 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
         playlist_id = m_pl.group(2)
 
     clean_url = url.split("?")[0]
-    logger.info(f"[YANDEX] Resolving track info for URL: {clean_url} (track_id={track_id}, album_id={album_id})")
+    tok_preview = f"{YANDEX_MUSIC_TOKEN[:6]}...{YANDEX_MUSIC_TOKEN[-4:]}" if YANDEX_MUSIC_TOKEN else "NONE"
+    logger.info(f"[YANDEX] Resolving track info for URL: {clean_url} (track_id={track_id}, album_id={album_id}, token={tok_preview})")
 
     api_hosts = ["api.music.yandex.net", "api.music.yandex.kz", "api.music.yandex.by", "api.music.yandex.com"]
 
@@ -583,6 +584,8 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
                 if track:
                     logger.info(f"[YANDEX] Level 7 (Google Translate proxy) success: {track.display_name}")
                     return track
+                else:
+                    logger.warning(f"[YANDEX] Level 7 proxy returned 200 but parsing yielded no track (html len={len(html)})")
             else:
                 logger.warning(f"[YANDEX] Level 7 proxy returned status {resp.status}")
     except Exception as e:
@@ -606,7 +609,7 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
                 m_dur = None
                 if dur_m:
                     m_dur = int(dur_m.group(1)) * 60 + int(dur_m.group(2))
-                m_thumb = item.get("image", {}).get("url")
+                m_thumb = (item.get("image") or {}).get("url")
                 if m_title:
                     search_query = f"{m_artist} - {m_title}" if m_artist else m_title
                     logger.info(f"[YANDEX] Level 8 (Microlink) success: {search_query}")
