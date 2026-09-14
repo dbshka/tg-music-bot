@@ -227,6 +227,45 @@ async def save_cached_track_async(query: str, file_id: str, title: str, artist: 
     await asyncio.to_thread(save_cached_track, query, file_id, title, artist, duration)
 
 
+def search_cached_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Поиск треков в кэше по частичному совпадению названия или исполнителя.
+    Используется для быстрого ответа в Telegram Inline Mode.
+    """
+    clean_q = re.sub(r'[\W_]+', ' ', query.lower()).strip()
+    if not clean_q:
+        return []
+    words = clean_q.split()
+    like_patterns = [f"%{w}%" for w in words]
+
+    # Все слова должны встречаться в title, artist или query_key
+    conditions = []
+    params = []
+    for pat in like_patterns:
+        conditions.append("(LOWER(title) LIKE ? OR LOWER(artist) LIKE ? OR LOWER(query_key) LIKE ?)")
+        params.extend([pat, pat, pat])
+
+    where_clause = " AND ".join(conditions)
+    params.append(limit)
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT file_id, title, artist, duration, query_key FROM tracks_cache WHERE {where_clause} ORDER BY created_at DESC LIMIT ?",
+                tuple(params)
+            )
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+async def search_cached_tracks_async(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Асинхронный поиск треков в кэше для Inline Mode."""
+    return await asyncio.to_thread(search_cached_tracks, query, limit)
+
+
 def log_user_activity(user_id: int, username: Optional[str] = None, full_name: Optional[str] = None):
     """Регистрирует нового пользователя или обновляет время последней активности."""
     now = datetime.datetime.now()
