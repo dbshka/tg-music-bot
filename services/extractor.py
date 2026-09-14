@@ -82,34 +82,76 @@ def find_first_url(text: str) -> Optional[str]:
     return None
 
 
+async def _unshorten_url(url: str, session: aiohttp.ClientSession) -> str:
+    """
+    Раскрывает редиректы для коротких ссылок (ya.cc, clck.ru, vk.cc, t.co, bit.ly, spotify.link, band.link).
+    """
+    short_domains = ("ya.cc", "clck.ru", "vk.cc", "t.co", "goo.gl", "bit.ly", "spotify.link", "band.link", "tinyurl.com")
+    parsed = urllib.parse.urlparse(url)
+    if any(sd in parsed.netloc.lower() for sd in short_domains):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+        try:
+            async with session.head(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                return str(resp.url)
+        except Exception:
+            try:
+                async with session.get(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    return str(resp.url)
+            except Exception:
+                pass
+    return url
+
+
 async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
     """
-    Извлекает точные метаданные трека Яндекс Музыки через официальный API или OpenGraph.
-    Использует 4 уровня отказоустойчивости:
-    1. Direct Track API (api.music.yandex.net/tracks/{id})
-    2. Album Track API (api.music.yandex.net/albums/{id}/with-tracks)
-    3. HTML parsing (og:title, promo banner, og:description, title tag)
-    4. Global metadata proxy (Microlink) в обход любых геоблоков
+    Извлекает точные метаданные трека Яндекс Музыки через мобильный API, альбомы, артистов или OpenGraph.
+    Использует 7 уровней отказоустойчивости:
+    1. Direct Track API (GET api.music.yandex.net/tracks/{id})
+    2. Direct Track API (POST api.music.yandex.net/tracks с track-ids)
+    3. Album API (GET api.music.yandex.net/albums/{id}/with-tracks — для синглов, альбомов и треков)
+    4. Artist Brief API (GET api.music.yandex.net/artists/{id}/brief-info)
+    5. Playlist API (GET api.music.yandex.net/users/{user}/playlists/{kind})
+    6. HTML scraping (OpenGraph / Title / промо-баннеры)
+    7. Global metadata proxy (Microlink)
     """
     track_id = None
     album_id = None
-    match = re.search(r'track/(\d+)', url)
-    if match:
-        track_id = match.group(1)
-    match_album = re.search(r'album/(\d+)', url)
-    if match_album:
-        album_id = match_album.group(1)
+    artist_id = None
+    playlist_user = None
+    playlist_id = None
 
-    # Уровень 1: Direct Track API
+    m_tr = re.search(r'track/(\d+)', url)
+    if m_tr:
+        track_id = m_tr.group(1)
+
+    m_alb = re.search(r'album[s]?/(\d+)', url) or re.search(r'albumId=(\d+)', url)
+    if m_alb:
+        album_id = m_alb.group(1)
+
+    m_art = re.search(r'artist/(\d+)', url)
+    if m_art:
+        artist_id = m_art.group(1)
+
+    m_pl = re.search(r'users/([^/]+)/playlists/(\d+)', url)
+    if m_pl:
+        playlist_user = m_pl.group(1)
+        playlist_id = m_pl.group(2)
+
+    ym_headers = {
+        "User-Agent": "YandexMusic/2024.01.1 (Android; Android 14)",
+        "X-Yandex-Music-Client": "YandexMusicAndroid/24023241",
+        "X-Forwarded-For": "94.41.210.164",
+        "Accept": "application/json",
+        "Accept-Language": "ru,en;q=0.9"
+    }
+
+    # Уровень 1: Direct Track GET API
     if track_id:
         try:
             api_url = f"https://api.music.yandex.net/tracks/{track_id}"
-            headers = {
-                "User-Agent": "YandexMusic/2024.01.1 (Android; Android 14)",
-                "Accept": "application/json",
-                "Accept-Language": "ru"
-            }
-            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
+            async with session.get(api_url, headers=ym_headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     results = data.get("result", [])
@@ -137,55 +179,180 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
         except Exception:
             pass
 
-    # Уровень 2: Album Track API (если трек передан внутри альбома)
-    if album_id and track_id:
+        # Уровень 2: Direct Track POST API (резерв при сбоях GET)
         try:
-            api_url = f"https://api.music.yandex.net/albums/{album_id}/with-tracks"
-            headers = {
-                "User-Agent": "YandexMusic/2024.01.1 (Android; Android 14)",
-                "Accept": "application/json",
-                "Accept-Language": "ru"
-            }
-            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
+            api_url = "https://api.music.yandex.net/tracks"
+            async with session.post(api_url, data={"track-ids": str(track_id)}, headers=ym_headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    album = data.get("result", {})
-                    for vol in album.get("volumes", []):
-                        for tr in vol:
-                            if str(tr.get("id")) == str(track_id):
-                                title = tr.get("title")
-                                artists = ", ".join([a.get("name") for a in tr.get("artists", []) if a.get("name")])
-                                duration = int(tr.get("durationMs", 0) / 1000) or None
-                                cover = tr.get("coverUri") or album.get("coverUri")
-                                thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
-                                if title:
-                                    search_query = f"{artists} - {title}" if artists else title
-                                    return ExtractedTrack(
-                                        platform="Яндекс Музыка",
-                                        target=f"ytsearch3:{search_query}",
-                                        is_search=True,
-                                        title=title,
-                                        artist=artists,
-                                        thumbnail_url=thumb_url,
-                                        duration=duration
-                                    )
+                    results = data.get("result", [])
+                    if results and isinstance(results, list):
+                        item = results[0]
+                        title = item.get("title")
+                        artists = ", ".join([a.get("name") for a in item.get("artists", []) if a.get("name")])
+                        duration = int(item.get("durationMs", 0) / 1000) or None
+                        cover = item.get("coverUri")
+                        if not cover and item.get("artists"):
+                            cover = item.get("artists")[0].get("cover", {}).get("uri")
+                        thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+
+                        if title:
+                            search_query = f"{artists} - {title}" if artists else title
+                            return ExtractedTrack(
+                                platform="Яндекс Музыка",
+                                target=f"ytsearch3:{search_query}",
+                                is_search=True,
+                                title=title,
+                                artist=artists,
+                                thumbnail_url=thumb_url,
+                                duration=duration
+                            )
         except Exception:
             pass
 
-    # Уровень 3: HTML парсинг страницы (с поддержкой промо-тегов Яндекса)
+    # Уровень 3: Album Track API (если передан альбом или трек внутри альбома)
+    if album_id:
+        try:
+            api_url = f"https://api.music.yandex.net/albums/{album_id}/with-tracks"
+            async with session.get(api_url, headers=ym_headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    album = data.get("result", {})
+                    target_track = None
+                    if track_id:
+                        for vol in album.get("volumes", []):
+                            for tr in vol:
+                                if str(tr.get("id")) == str(track_id):
+                                    target_track = tr
+                                    break
+                            if target_track:
+                                break
+
+                    # Если track_id не указан или не найден, берем первый трек альбома (синглы и релизы)
+                    if not target_track:
+                        vols = album.get("volumes", [])
+                        if vols and vols[0]:
+                            target_track = vols[0][0]
+
+                    if target_track:
+                        title = target_track.get("title")
+                        artists = ", ".join([a.get("name") for a in target_track.get("artists", []) if a.get("name")])
+                        duration = int(target_track.get("durationMs", 0) / 1000) or None
+                        cover = target_track.get("coverUri") or album.get("coverUri")
+                        thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+                        if title:
+                            search_query = f"{artists} - {title}" if artists else title
+                            return ExtractedTrack(
+                                platform="Яндекс Музыка",
+                                target=f"ytsearch3:{search_query}",
+                                is_search=True,
+                                title=title,
+                                artist=artists,
+                                thumbnail_url=thumb_url,
+                                duration=duration
+                            )
+                    elif album.get("title"):
+                        alb_title = album.get("title")
+                        alb_artists = ", ".join([a.get("name") for a in album.get("artists", []) if a.get("name")])
+                        cover = album.get("coverUri")
+                        thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+                        search_query = f"{alb_artists} - {alb_title}" if alb_artists else alb_title
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{search_query}",
+                            is_search=True,
+                            title=alb_title,
+                            artist=alb_artists,
+                            thumbnail_url=thumb_url
+                        )
+        except Exception:
+            pass
+
+    # Уровень 4: Artist Brief API (если передана ссылка на исполнителя)
+    if artist_id:
+        try:
+            api_url = f"https://api.music.yandex.net/artists/{artist_id}/brief-info"
+            async with session.get(api_url, headers=ym_headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    res = data.get("result", {})
+                    art = res.get("artist", {})
+                    art_name = art.get("name")
+                    popular = res.get("popularTracks", [])
+                    top_tr = popular[0] if popular else None
+                    cover = art.get("cover", {}).get("uri")
+                    thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+                    if top_tr and top_tr.get("title"):
+                        title = top_tr.get("title")
+                        artists = ", ".join([a.get("name") for a in top_tr.get("artists", []) if a.get("name")]) or art_name
+                        duration = int(top_tr.get("durationMs", 0) / 1000) or None
+                        search_query = f"{artists} - {title}"
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{search_query}",
+                            is_search=True,
+                            title=title,
+                            artist=artists,
+                            thumbnail_url=thumb_url,
+                            duration=duration
+                        )
+                    elif art_name:
+                        return ExtractedTrack(
+                            platform="Яндекс Музыка",
+                            target=f"ytsearch3:{art_name}",
+                            is_search=True,
+                            title=art_name,
+                            artist=art_name,
+                            thumbnail_url=thumb_url
+                        )
+        except Exception:
+            pass
+
+    # Уровень 5: Playlist API (если передана ссылка на плейлист)
+    if playlist_user and playlist_id:
+        try:
+            api_url = f"https://api.music.yandex.net/users/{playlist_user}/playlists/{playlist_id}"
+            async with session.get(api_url, headers=ym_headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    res = data.get("result", {})
+                    tracks = res.get("tracks", [])
+                    if tracks:
+                        tr_wrapper = tracks[0]
+                        tr = tr_wrapper.get("track", tr_wrapper)
+                        title = tr.get("title")
+                        artists = ", ".join([a.get("name") for a in tr.get("artists", []) if a.get("name")])
+                        duration = int(tr.get("durationMs", 0) / 1000) or None
+                        cover = tr.get("coverUri") or res.get("cover", {}).get("uri")
+                        thumb_url = f"https://{cover.replace('%%', '600x600')}" if cover else None
+                        if title:
+                            search_query = f"{artists} - {title}" if artists else title
+                            return ExtractedTrack(
+                                platform="Яндекс Музыка",
+                                target=f"ytsearch3:{search_query}",
+                                is_search=True,
+                                title=title,
+                                artist=artists,
+                                thumbnail_url=thumb_url,
+                                duration=duration
+                            )
+        except Exception:
+            pass
+
+    # Уровень 6: HTML парсинг страницы (с поддержкой промо-тегов Яндекса)
     clean_url = url.split("?")[0]
     request_urls = [clean_url]
     if CUSTOM_API_SERVER:
         request_urls.insert(0, f"{CUSTOM_API_SERVER}/proxy/{clean_url}")
 
-    headers = {
+    html_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "ru,en;q=0.9"
     }
 
     for req_url in request_urls:
         try:
-            async with session.get(req_url, headers=headers, timeout=aiohttp.ClientTimeout(total=4.5)) as resp:
+            async with session.get(req_url, headers=html_headers, timeout=aiohttp.ClientTimeout(total=4.5)) as resp:
                 if resp.status == 200:
                     html = await resp.text()
                     title = None
@@ -250,7 +417,7 @@ async def extract_yandex_music_info(url: str, session: aiohttp.ClientSession) ->
         except Exception:
             continue
 
-    # Уровень 4: Резервный глобальный прокси Microlink
+    # Уровень 7: Резервный глобальный прокси Microlink
     try:
         api_url = f"https://api.microlink.io/?url={urllib.parse.quote(clean_url)}"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -584,18 +751,22 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     - YouTube -> oEmbed метаданные + прямая загрузка
     - SoundCloud, VK, Bandcamp и др. -> прямая загрузка через yt-dlp
     """
-    parsed = urllib.parse.urlparse(url)
-    domain = parsed.netloc.lower()
     if session is None:
         session = get_shared_session()
 
+    # 0. Автоматическое раскрытие коротких ссылок (ya.cc, clck.ru, spotify.link, band.link и др.)
+    url = await _unshorten_url(url, session)
+
+    parsed = urllib.parse.urlparse(url)
+    domain = parsed.netloc.lower()
+
     # 1. Яндекс Музыка
-    if "music.yandex." in domain or ("yandex." in domain and ("/album/" in url or "/track/" in url)):
+    if "music.yandex." in domain or "ya.cc" in domain or ("yandex." in domain and ("/album" in url or "/track" in url or "/artist" in url or "/playlists" in url)):
         track = await extract_yandex_music_info(url, session)
         if track:
             return track
         # Резервное извлечение слага из пути URL, если он текстовый
-        path_parts = [p for p in parsed.path.split('/') if p and p not in ('album', 'track')]
+        path_parts = [p for p in parsed.path.split('/') if p and p not in ('album', 'track', 'artist', 'users', 'playlists')]
         slug_query = " ".join(path_parts).replace('-', ' ').replace('_', ' ')
         if slug_query and not slug_query.replace(' ', '').isdigit():
             return ExtractedTrack(
