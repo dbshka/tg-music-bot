@@ -120,11 +120,20 @@ def _restore_studio_speed_and_pitch_if_needed(
         temp_out = audio_path.with_name(f"restored_{audio_path.name}")
         try:
             import subprocess
+            in_sr = 44100
+            try:
+                from mutagen import File as MutagenFile
+                mf_probe = MutagenFile(audio_path)
+                if mf_probe and mf_probe.info and hasattr(mf_probe.info, "sample_rate") and mf_probe.info.sample_rate:
+                    in_sr = int(mf_probe.info.sample_rate)
+            except Exception:
+                pass
+
             is_m4a = audio_path.suffix.lower() == ".m4a"
-            codec_args = ["-c:a", "aac", "-b:a", "256k"] if is_m4a else ["-c:a", "libmp3lame", "-b:a", "256k"]
+            codec_args = ["-c:a", "aac", "-b:a", "320k"] if is_m4a else ["-c:a", "libmp3lame", "-b:a", "320k"]
             cmd = [
                 "ffmpeg", "-y", "-i", str(audio_path),
-                "-filter:a", f"asetrate=44100*{ratio:.6f},aresample=44100",
+                "-filter:a", f"asetrate={in_sr}*{ratio:.6f},aresample={in_sr}",
                 "-vn"
             ] + codec_args + ["-threads", "0", str(temp_out)]
             res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -382,7 +391,8 @@ def _sync_download(
                 ("soundcloud", f"scsearch4:{clean_search}")
             ]
             if not requested_modifiers:
-                # Добавляем поиск официальной студийной аудиодорожки (YouTube Audio/Topic)
+                # Добавляем поиск официальной студийной аудиодорожки (YouTube Topic / Audio)
+                search_tasks.append(("youtube", f"ytsearch5:{clean_search} Topic"))
                 search_tasks.append(("youtube", f"ytsearch5:{clean_search} Audio"))
 
             clean_core_title = " ".join(core_title_words) if core_title_words else ""
@@ -507,19 +517,19 @@ def _sync_download(
                 cand_src = e.get("_source") or source
                 if cand_src == "youtube":
                     is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
-                    if is_topic and cookies_info.get("active"):
-                        penalty -= 150.0
-                    elif is_topic and not cookies_info.get("active"):
-                        penalty -= 100.0
+                    if is_topic:
+                        penalty -= 350.0  # Официальный студийный релиз лейбла - абсолютный приоритет
                     elif "vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel:
-                        penalty -= 80.0
+                        penalty -= 120.0
                 elif cand_src == "soundcloud":
                     if custom_artist:
                         ca = custom_artist.lower().strip()
                         if ca in cand_uploader or ca.replace(" ", "") in cand_uploader.replace(" ", ""):
                             penalty -= 50.0
                         else:
-                            penalty += 100.0
+                            penalty += 250.0  # Любительские аплоады SoundCloud уступают YouTube
+                    else:
+                        penalty += 250.0
 
                 return penalty
 
@@ -632,23 +642,33 @@ def _sync_download(
                         actual_dur = new_dur
                         res_info["duration"] = new_dur
 
-                    # 3. Восстановление оригинальной 1.0x студийной скорости и тональности (для Apple Music / Spotify и SoundCloud Content ID bypass)
+                    # 3. Восстановление оригинальной 1.0x студийной скорости и тональности (для SoundCloud Content ID bypass)
+                    # Если трек взят из официального YouTube Topic (студийный релиз лейбла) и разница длительности <= 6с,
+                    # НИКОГДА не трогаем его через фильтры, так как это эталонный студийный мастер без каких-либо искажений.
+                    is_official_topic = cand_source == "youtube" and (
+                        "topic" in str(selected_entry.get("uploader") or "").lower() or
+                        "topic" in str(selected_entry.get("channel") or "").lower() or
+                        "topic" in str(res_info.get("uploader") or "").lower() or
+                        "topic" in str(res_info.get("channel") or "").lower()
+                    )
+                    cand_diff_raw = abs(actual_dur - expected_duration) if expected_duration else 0
                     if not requested_modifiers and expected_duration and expected_duration > 35:
-                        restored_dur = _restore_studio_speed_and_pitch_if_needed(
-                            audio_files[0],
-                            expected_duration=expected_duration,
-                            requested_modifiers=requested_modifiers,
-                            actual_dur=actual_dur,
-                            req_tag=req_tag
-                        )
-                        if restored_dur > 0 and restored_dur != actual_dur:
-                            actual_dur = restored_dur
-                            res_info["duration"] = restored_dur
-                            # Очищаем название от меток замедления, если они были
-                            clean_t = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', cand_entry_title, flags=re.IGNORECASE).strip()
-                            if clean_t:
-                                cand_entry_title = clean_t
-                                res_info["title"] = clean_t
+                        if not (is_official_topic and cand_diff_raw <= 6):
+                            restored_dur = _restore_studio_speed_and_pitch_if_needed(
+                                audio_files[0],
+                                expected_duration=expected_duration,
+                                requested_modifiers=requested_modifiers,
+                                actual_dur=actual_dur,
+                                req_tag=req_tag
+                            )
+                            if restored_dur > 0 and restored_dur != actual_dur:
+                                actual_dur = restored_dur
+                                res_info["duration"] = restored_dur
+                                # Очищаем название от меток замедления, если они были
+                                clean_t = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', cand_entry_title, flags=re.IGNORECASE).strip()
+                                if clean_t:
+                                    cand_entry_title = clean_t
+                                    res_info["title"] = clean_t
 
                     # 4. Проверяем допустимость хронометража:
                     diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
