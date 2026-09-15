@@ -155,7 +155,7 @@ async def cmd_search_start(message: Message, state: FSMContext):
     await state.set_state(SearchFSM.waiting_for_artist)
     await message.answer(
         "👤 <b>Шаг 1 из 2:</b> Введите имя <b>исполнителя (автора)</b>:\n"
-        "<i>Например: <code>Dj ZUP RALIi</code> или <code>The Weeknd</code></i>\n\n"
+        "<i>Например: <code>The Weeknd</code> или <code>MiyaGi</code></i>\n\n"
         "💡 <i>Либо можете сразу отправить в формате: <code>Исполнитель — Название</code></i>",
         parse_mode="HTML",
         reply_markup=get_cancel_reply_keyboard()
@@ -175,7 +175,7 @@ async def cb_use_quick_artist(callback: CallbackQuery, state: FSMContext):
     prompt_text = (
         f"👤 Исполнитель: <b>{html.escape(artist)}</b>\n\n"
         f"🎵 <b>Шаг 2 из 2:</b> Теперь введите <b>название трека</b>:\n"
-        f"<i>Например: <code>сакадзуки Slowed</code> или <code>Blinding Lights</code></i>"
+        f"<i>Например: <code>Blinding Lights</code> или <code>Captain</code></i>"
     )
     try:
         await callback.message.edit_text(prompt_text, parse_mode="HTML")
@@ -215,7 +215,7 @@ async def process_search_artist(message: Message, state: FSMContext):
     await message.answer(
         f"👤 Исполнитель: <b>{html.escape(artist_text)}</b>\n\n"
         f"🎵 <b>Шаг 2 из 2:</b> Теперь введите <b>название трека</b>:\n"
-        f"<i>Например: <code>сакадзуки Slowed</code> или <code>Blinding Lights</code></i>",
+        f"<i>Например: <code>Blinding Lights</code> или <code>Captain</code></i>",
         parse_mode="HTML",
         reply_markup=get_cancel_reply_keyboard()
     )
@@ -293,7 +293,7 @@ async def handle_music_request(message: Message, state: FSMContext):
         "🎵 <b>Поиск музыки</b>\n\n"
         "Чтобы в аудиофайле был указан точный исполнитель (а не никнейм автора на YouTube):\n\n"
         "👤 <b>Шаг 1 из 2:</b> Введите имя <b>исполнителя (автора)</b>:\n"
-        "<i>Например: <code>Dj ZUP RALIi</code> или <code>The Weeknd</code></i>\n\n"
+        "<i>Например: <code>The Weeknd</code> или <code>MiyaGi</code></i>\n\n"
         "💡 <i>Совет: вы также можете отправлять треки одной строкой с тире:\n"
         "<code>Исполнитель — Название</code></i>",
         parse_mode="HTML",
