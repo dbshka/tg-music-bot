@@ -13,9 +13,8 @@ from aiogram.types import Message, FSInputFile, CallbackQuery
 from aiogram.utils.chat_action import ChatActionSender
 
 from config import MAX_FILE_SIZE_BYTES
-from services.extractor import find_first_url, resolve_track_url, resolve_canonical_track_info_async
+from services.extractor import find_first_url, resolve_track_url, resolve_text_to_track_info
 from services.downloader import download_track
-from services.search import search_tracks_async, render_search_page, search_cache
 from services.database import (
     log_user_activity_async,
     increment_user_download_async,
@@ -132,26 +131,31 @@ async def handle_music_request(message: Message):
     else:
         print(f"[MUSIC][request_id={req_id}] cache lookup MISS in {t_cache*1000:.2f}ms", flush=True)
 
-    # 1. Если передана ссылка
-    if url:
-        status_msg = await message.reply("🔎 <i>Анализирую ссылку...</i>", parse_mode="HTML")
-        downloaded_audio = None
-        t_cleanup = 0.0
-        try:
-            t_m0 = time.perf_counter()
+    # Распознавание трека: по ссылке либо по текстовому запросу как по виртуальной ссылке
+    downloaded_audio = None
+    t_cleanup = 0.0
+    try:
+        t_m0 = time.perf_counter()
+        if url:
+            status_msg = await message.reply("🔎 <i>Анализирую ссылку...</i>", parse_mode="HTML")
             print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
             track_info = await resolve_track_url(url)
-            t_metadata = time.perf_counter() - t_m0
-            print(f"[MUSIC][request_id={req_id}] resolve_track_url SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}'", flush=True)
+        else:
+            status_msg = await message.reply(f"🔎 <i>Ищу трек:</i> <b>{html.escape(user_text)}</b>...", parse_mode="HTML")
+            print(f"[MUSIC][request_id={req_id}] resolve_text_to_track_info START query='{user_text}'", flush=True)
+            track_info = await resolve_text_to_track_info(user_text)
 
-            await status_msg.edit_text(
-                f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>\n"
-                f"Платформа: <b>{track_info.platform}</b>\n"
-                f"<i>Загрузка аудиопотока...</i>",
-                parse_mode="HTML"
-            )
+        t_metadata = time.perf_counter() - t_m0
+        print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}'", flush=True)
 
-            print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}'", flush=True)
+        platform_label = f"\nПлатформа: <b>{track_info.platform}</b>" if track_info.platform and "Search" not in track_info.platform else ""
+        await status_msg.edit_text(
+            f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>{platform_label}\n"
+            f"<i>Загрузка аудиопотока...</i>",
+            parse_mode="HTML"
+        )
+
+        print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}'", flush=True)
             try:
                 async with DOWNLOAD_SEMAPHORE:
                     async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
@@ -296,7 +300,7 @@ async def handle_music_request(message: Message):
 
         except Exception as e:
             print(f"[MUSIC][request_id={req_id}] ERROR at link processing: {e}\n{traceback.format_exc()}", flush=True)
-            logger.exception("Ошибка при обработке ссылки %s", url)
+            logger.exception("Ошибка при обработке запроса %s", url or user_text)
             err_str = str(e)
             if "Яндекс Музык" in err_str:
                 user_friendly = (
@@ -327,190 +331,3 @@ async def handle_music_request(message: Message):
                 downloaded_audio.cleanup()
                 t_cleanup = time.perf_counter() - t_cl0
                 print(f"[MUSIC][request_id={req_id}] cleanup={t_cleanup:.4f}s", flush=True)
-
-
-    # 2. Если передан обычный текст (поисковой запрос) -> интерактивный список с выбором
-    else:
-        status_msg = await message.reply(
-            f"🔎 <i>Ищу:</i> <b>{html.escape(user_text)}</b>...",
-            parse_mode="HTML"
-        )
-        try:
-            print(f"[MUSIC][request_id={req_id}] search query='{user_text}'", flush=True)
-            items, corrected_query = await search_tracks_async(user_text, limit=30)
-            if not items:
-                await status_msg.edit_text(
-                    f"❌ <b>По запросу «{html.escape(user_text)}» ничего не найдено.</b>\n"
-                    f"Попробуйте уточнить название или отправьте прямую ссылку на трек.",
-                    parse_mode="HTML"
-                )
-                return
-
-            display_query = corrected_query if corrected_query else user_text
-            session_id = search_cache.save(display_query, items)
-            text, keyboard = render_search_page(session_id, display_query, items, page=0)
-            if corrected_query:
-                text = f"💡 <i>Показаны результаты для:</i> <b>{html.escape(corrected_query)}</b>\n\n" + text
-            await status_msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-            print(f"[MUSIC][request_id={req_id}] search SUCCESS found={len(items)} session={session_id} corrected={corrected_query}", flush=True)
-
-        except Exception as e:
-            print(f"[MUSIC][request_id={req_id}] ERROR at text search: {e}\n{traceback.format_exc()}", flush=True)
-            logger.exception("Ошибка при поиске трека %s", user_text)
-            err_str = str(e)
-            if "Sign in to confirm you’re not a bot" in err_str or "Sign in to confirm you're not a bot" in err_str or "Sign in to confirm" in err_str:
-                user_friendly = (
-                    "❌ <b>YouTube запросил авторизацию (проверка на бота на сервере).</b>\n\n"
-                    "💡 <b>Как решить навсегда:</b> войдите в свой Google-аккаунт на YouTube в браузере, "
-                    "экспортируйте <code>cookies.txt</code> и обновите его в панели Render (Secret Files)."
-                )
-            elif "drm protected" in err_str.lower() or "is drm protected" in err_str.lower():
-                user_friendly = (
-                    "⚠️ <b>Этот трек защищен DRM (SoundCloud Go+ / платная подписка).</b>\n\n"
-                    "💡 <b>Решение:</b> попробуйте уточнить запрос (например, указать точного исполнителя) или отправьте ссылку на трек из YouTube/Spotify."
-                )
-            else:
-                user_friendly = f"❌ <b>Ошибка при поиске:</b>\n<i>{html.escape(err_str[:250])}</i>"
-            try:
-                await status_msg.edit_text(user_friendly, parse_mode="HTML")
-            except Exception:
-                pass
-
-
-@router.callback_query(F.data.startswith("mspg:"))
-async def handle_search_pagination(callback: CallbackQuery):
-    """Перелистывание страниц результатов поиска."""
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    session_id = parts[1]
-    target_page = int(parts[2])
-
-    session = search_cache.get(session_id)
-    if not session:
-        await callback.answer("⚠️ Результаты поиска устарели. Отправьте запрос заново.", show_alert=True)
-        return
-
-    text, keyboard = render_search_page(session_id, session.query, session.items, page=target_page)
-    try:
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer()
-    except Exception:
-        await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ms:"))
-async def handle_search_track_select(callback: CallbackQuery):
-    """Загрузка выбранного трека из списка результатов поиска."""
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    session_id = parts[1]
-    item_idx = int(parts[2])
-
-    session = search_cache.get(session_id)
-    if not session or item_idx >= len(session.items):
-        await callback.answer("⚠️ Результаты поиска устарели. Отправьте запрос заново.", show_alert=True)
-        return
-
-    item = session.items[item_idx]
-    await callback.answer(f"⏳ Скачиваю #{item_idx + 1}...")
-
-    # Отправляем сервисное сообщение о ходе загрузки под списком
-    status_msg = await callback.message.reply(
-        f"⏳ <b>Загрузка:</b> <i>{html.escape(item.title)}</i>\n"
-        f"<i>Пожалуйста, подождите...</i>",
-        parse_mode="HTML"
-    )
-    req_id = uuid.uuid4().hex[:8]
-    downloaded_audio = None
-    try:
-        async with DOWNLOAD_SEMAPHORE:
-            async with ChatActionSender.upload_voice(bot=callback.bot, chat_id=callback.message.chat.id):
-                downloaded_audio = await download_track(
-                    query_or_url=item.url,
-                    custom_title=item.title,
-                    custom_artist=item.uploader,
-                    thumbnail_url=item.thumbnail,
-                    expected_duration=item.duration,
-                    request_id=req_id
-                )
-
-        if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
-            size_mb = downloaded_audio.filesize / (1024 * 1024)
-            await status_msg.edit_text(
-                f"❌ <b>Файл слишком большой ({size_mb:.1f} МБ)</b>.\n"
-                f"Telegram разрешает ботам отправлять файлы размером до 50 МБ.",
-                parse_mode="HTML"
-            )
-            return
-
-        await status_msg.edit_text("📤 <i>Отправка трека в Telegram...</i>", parse_mode="HTML")
-
-        audio_file = FSInputFile(downloaded_audio.file_path)
-        thumb_path = downloaded_audio.thumbnail_path
-        thumb_file = (
-            FSInputFile(thumb_path)
-            if (thumb_path and thumb_path.exists() and thumb_path.is_file() and thumb_path.stat().st_size > 0)
-            else None
-        )
-
-        try:
-            sent_msg = await callback.message.answer_audio(
-                audio=audio_file,
-                title=downloaded_audio.title,
-                performer=downloaded_audio.artist,
-                duration=downloaded_audio.duration,
-                thumbnail=thumb_file,
-                reply_markup=get_audio_edit_keyboard()
-            )
-        except Exception as send_err:
-            if thumb_file:
-                sent_msg = await callback.message.answer_audio(
-                    audio=audio_file,
-                    title=downloaded_audio.title,
-                    performer=downloaded_audio.artist,
-                    duration=downloaded_audio.duration,
-                    thumbnail=None,
-                    reply_markup=get_audio_edit_keyboard()
-                )
-            else:
-                raise
-
-        if callback.from_user:
-            await increment_user_download_async(callback.from_user.id)
-
-        # Сохраняем в кэш
-        if sent_msg.audio and sent_msg.audio.file_id:
-            await save_cached_track_async(
-                query=f"{downloaded_audio.artist} - {downloaded_audio.title}",
-                file_id=sent_msg.audio.file_id,
-                title=downloaded_audio.title,
-                artist=downloaded_audio.artist,
-                duration=downloaded_audio.duration
-            )
-
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.exception("Ошибка при скачивании выбранного трека %s", item.title)
-        err_str = str(e)
-        if "drm protected" in err_str.lower() or "is drm protected" in err_str.lower():
-            msg_err = (
-                "⚠️ <b>Этот трек защищен DRM (SoundCloud Go+).</b>\n"
-                "Пожалуйста, выберите другой вариант из списка выше."
-            )
-        else:
-            msg_err = f"❌ <b>Не удалось скачать трек:</b>\n<i>{html.escape(err_str[:200])}</i>"
-        try:
-            await status_msg.edit_text(msg_err, parse_mode="HTML")
-        except Exception:
-            pass
-    finally:
-        if downloaded_audio:
-            downloaded_audio.cleanup()

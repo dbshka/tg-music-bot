@@ -112,11 +112,30 @@ TRACK_MODIFIERS = {
     "super slowed down", "super slowed", "super slow", "ultra slowed",
     "slowed down", "slowed", "slow", "reverb", "reverbed", "slowed + reverb",
     "speed up", "speedup", "sped up", "spedup", "fast version", "sped up + reverb",
-    "remix", "ремикс", "bootleg", "flip", "mashup", "vip mix",
-    "cover", "кавер", "acoustic", "piano",
-    "8d", "nightcore", "daycore", "instrumental", "инструментал", "minus", "минус",
-    "edit", "fan edit"
+    "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix",
+    "cover", "кавер", "acoustic", "акустика", "piano", "пианино",
+    "acapella", "a cappella", "акапелла", "live", "лайв", "концерт",
+    "8d", "16d", "nightcore", "daycore", "instrumental", "инструментал", "minus", "минус",
+    "edit", "fan edit", "karaoke", "караоке", "orchestral", "orchestra", "tribute"
 }
+
+# Таблицы для конвертации раскладки клавиатуры RU <-> EN
+EN_LAYOUT = "`~qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?"
+RU_LAYOUT = "ёЁйцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,"
+EN_TO_RU = str.maketrans(EN_LAYOUT, RU_LAYOUT)
+RU_TO_EN = str.maketrans(RU_LAYOUT, EN_LAYOUT)
+
+
+def convert_keyboard_layout(text: str) -> str:
+    """Конвертирует раскладку клавиатуры между RU и EN."""
+    en_chars = sum(1 for c in text if 'a' <= c.lower() <= 'z')
+    ru_chars = sum(1 for c in text if 'а' <= c.lower() <= 'я' or c in 'ёЁ')
+    if en_chars > ru_chars:
+        return text.translate(EN_TO_RU)
+    elif ru_chars > 0:
+        return text.translate(RU_TO_EN)
+    return text
+
 
 def has_track_modifiers(text: Optional[str]) -> bool:
     if not text:
@@ -266,7 +285,7 @@ async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tu
 
 async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTrack]:
     """
-    Определяет канонические метаданные студийного оригинала трека через iTunes / Deezer API:
+    Определяет канонические метаданные студийного оригинала трека через Deezer / iTunes API:
     - Официальное имя исполнителя
     - Официальное название трека (без лишнего мусора)
     - Эталонная длительность трека в секундах (duration)
@@ -281,23 +300,8 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
         return None
 
     session = get_shared_session()
-    # 1. Приоритетный поиск в iTunes Search API (< 250 мс, каталог Apple Music)
-    try:
-        it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, clean_q)
-        if it_artist and it_title and it_dur:
-            return ExtractedTrack(
-                platform="Canonical/iTunes",
-                target=f"ytsearch5:{it_artist} - {it_title}",
-                is_search=True,
-                title=it_title,
-                artist=it_artist,
-                thumbnail_url=it_cover,
-                duration=it_dur
-            )
-    except Exception as ex:
-        logger.debug("Ошибка канонического поиска iTunes: %s", ex)
 
-    # 2. Резервный поиск в Deezer API (< 200 мс)
+    # 1. Приоритетный поиск в Deezer API (< 200 мс) - чистейший студийный каталог без каверов
     try:
         d_artist, d_title, d_cover, d_dur = await _search_deezer(session, clean_q)
         if d_artist and d_title and d_dur:
@@ -313,7 +317,76 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
     except Exception as ex:
         logger.debug("Ошибка канонического поиска Deezer: %s", ex)
 
+    # 2. Резервный поиск в iTunes Search API (< 250 мс, каталог Apple Music)
+    try:
+        it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, clean_q)
+        if it_artist and it_title and it_dur:
+            return ExtractedTrack(
+                platform="Canonical/iTunes",
+                target=f"ytsearch5:{it_artist} - {it_title}",
+                is_search=True,
+                title=it_title,
+                artist=it_artist,
+                thumbnail_url=it_cover,
+                duration=it_dur
+            )
+    except Exception as ex:
+        logger.debug("Ошибка канонического поиска iTunes: %s", ex)
+
     return None
+
+
+async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
+    """
+    Превращает произвольный текстовый запрос пользователя в виртуальную ссылку / ExtractedTrack,
+    как если бы пользователь отправил ссылку из Spotify:
+    1. Если в запросе есть специфические модификаторы (slowed, remix, reverb и т.д.),
+       канонический оригинал не навязывается, чтобы пользователь получил желаемый звук.
+    2. По обычным запросам опрашивает студийные каталоги (Deezer / iTunes), получая
+       чистые имя исполнителя, название, эталонный хронометраж и официальную студийную обложку.
+    3. При 0 результатах в самую последнюю очередь пробует конвертацию раскладки (RU <-> EN).
+    4. Если метаданных в каталогах нет, формирует безопасный поисковый ExtractedTrack.
+    """
+    clean_q = unicodedata.normalize("NFC", query).strip()
+
+    # 1. Запрос с явными модификаторами (например 'radiohead creep slowed')
+    if has_track_modifiers(clean_q):
+        return ExtractedTrack(
+            platform="TextSearch",
+            target=f"ytsearch5:{clean_q}",
+            is_search=True,
+            title=clean_q,
+            artist=None,
+            thumbnail_url=None,
+            duration=None
+        )
+
+    # 2. Поиск канонического студийного оригинала
+    canonical = await resolve_canonical_track_info_async(clean_q)
+    if canonical:
+        return canonical
+
+    # -------------------------------------------------------------
+    # 3. ТОЛЬКО В САМУЮ ПОСЛЕДНЮЮ ОЧЕРЕДЬ: пробуем смену раскладки (RU <-> EN)
+    # -------------------------------------------------------------
+    flipped = convert_keyboard_layout(clean_q)
+    if flipped.lower() != clean_q.lower():
+        canonical_flipped = await resolve_canonical_track_info_async(flipped)
+        if canonical_flipped:
+            return canonical_flipped
+        # Если в каталогах нет, пробуем искать в YouTube по исправленной раскладке
+        clean_q = flipped
+
+    # 4. Резервный поиск по тексту (редкий звук, SoundCloud и др.)
+    return ExtractedTrack(
+        platform="TextSearch",
+        target=f"ytsearch5:{clean_q}",
+        is_search=True,
+        title=clean_q,
+        artist=None,
+        thumbnail_url=None,
+        duration=None
+    )
 
 
 async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str]]:
