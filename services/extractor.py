@@ -121,7 +121,8 @@ TRACK_MODIFIERS = {
     "with drums", "with drum", "drums version", "drum and bass", "drum & bass", "dnb",
     "драмка", "с драмкой", "с барабанами", "днб",
     "rework", "drill", "дрил", "дрилл", "phonk", "фонк", "jersey club",
-    "club mix", "club edit", "club version", "bass boost", "bass boosted", "808", "type beat"
+    "club mix", "club edit", "club version", "bass boost", "bass boosted", "808", "type beat",
+    "mix", "микс", "dj mix", "radio edit", "extended mix", "extended version", "dance mix"
 }
 
 # Таблицы для конвертации раскладки клавиатуры RU <-> EN

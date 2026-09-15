@@ -401,10 +401,27 @@ async def _execute_download_and_send(
 
         if cached:
             cached_dur = cached.get("duration") or 0
-            # Инвалидация устаревшего кэша по строгому хронометражу - ТОЛЬКО ДЛЯ ССЫЛОК APPLE MUSIC!
+            cached_title = cached.get("title") or ""
+            cached_artist = cached.get("artist") or ""
+            user_mods = extract_modifiers(raw_query)
+            cached_mods = extract_modifiers(f"{cached_title} {cached_artist}")
+
+            should_invalidate = False
+            # 1. Для Apple Music: несовпадение хронометража более чем на 2 сек
             if is_apple_music and track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 2:
+                should_invalidate = True
+            # 2. Для текстового поиска: если в кэше лежит ремикс/микс/драмка, а пользователь искал оригинал
+            elif is_text_input and not user_mods and cached_mods:
+                print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached track '{cached_title}' has unwanted modifiers {cached_mods}. Purging.", flush=True)
+                should_invalidate = True
+            # 3. Для текстового поиска с известным хронометражем: если кэш отличается более чем на 5 сек
+            elif is_text_input and not user_mods and track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 5:
+                print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging.", flush=True)
+                should_invalidate = True
+
+            if should_invalidate:
                 print(
-                    f"[MUSIC][request_id={req_id}] Apple Music cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging stale cache.",
+                    f"[MUSIC][request_id={req_id}] Cache INVALIDATED. Purging stale cache entry.",
                     flush=True
                 )
                 await delete_cached_track_async(cache_key)
