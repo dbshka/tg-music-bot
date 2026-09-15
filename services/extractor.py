@@ -719,6 +719,16 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
                 )
     except Exception:
         pass
+    if video_id:
+        return ExtractedTrack(
+            platform="YouTube / YouTube Music",
+            target=clean_url,
+            is_search=False,
+            title=None,
+            artist=None,
+            thumbnail_url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            duration=None
+        )
     return None
 
 

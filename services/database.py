@@ -233,6 +233,24 @@ async def save_cached_track_async(query: str, file_id: str, title: str, artist: 
     await asyncio.to_thread(save_cached_track, query, file_id, title, artist, duration)
 
 
+def delete_cached_track(query: str):
+    """Удаляет трек из L1 (RAM) и L2 (SQLite) кэша при обнаружении несоответствия длительности/качества."""
+    key = normalize_cache_key(query)
+    _L1_CACHE.pop(key, None)
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM tracks_cache WHERE query_key = ?", (key,))
+            conn.commit()
+    except Exception:
+        pass
+
+
+async def delete_cached_track_async(query: str):
+    """Асинхронное удаление трека из кэша без блокировки event loop."""
+    await asyncio.to_thread(delete_cached_track, query)
+
+
 def search_cached_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     Поиск треков в кэше по частичному совпадению названия или исполнителя.
