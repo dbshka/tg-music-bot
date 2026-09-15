@@ -82,44 +82,13 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     if message.from_user:
         await log_user_activity_async(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    text = (
-        "👋 <b>Привет! Я помогу скачать музыку и настроить её под себя.</b>\n\n"
-        "🎵 <b>Скачать трек</b>\n"
-        "Отправь мне <b>ссылку на песню</b> из YouTube, Spotify, Apple Music, SoundCloud, VK и других платформ.\n\n"
-        "Или нажми кнопку <b>[ 🔍 Найти песню (автор ➔ название) ]</b>, чтобы точно указать исполнителя и название трека!\n\n"
-        "Либо отправь сообщение в формате:\n"
-        "<code>The Weeknd — Blinding Lights</code>\n\n"
-        "✏️ <b>Изменить теги</b>\n"
-        "Под каждым скачанным треком есть кнопка <b>[ ✏️ Изменить теги ]</b>.\n"
-        "Можно изменить:\n"
-        "• название\n"
-        "• исполнителя\n"
-        "• альбом\n"
-        "• обложку\n\n"
-        "📂 <b>Обработать свой MP3</b>\n"
-        "Отправь мне любой <b>MP3-файл</b>, и я помогу изменить его теги и обложку.\n\n"
-        "🎧 <b>Отправь ссылку или нажми кнопку поиска — и я начну.</b>"
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+    await message.answer("👋", reply_markup=get_main_reply_keyboard())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
-    text = (
-        "📖 <b>Как пользоваться ботом:</b>\n\n"
-        "1. <b>Скачивание по ссылке:</b>\n"
-        "   Отправь ссылку (YouTube, Spotify, Apple Music, SoundCloud и др.).\n\n"
-        "2. <b>Поиск по тексту (автор ➔ название):</b>\n"
-        "   • Нажми кнопку <b>[ 🔍 Найти песню (автор ➔ название) ]</b> или команду /search.\n"
-        "   • Бот сначала спросит имя автора, затем название песни — это гарантирует, что в аудиофайле не будет чужих никнеймов и авторов каналов.\n"
-        "   • Или отправь одной строкой с тире: <code>Исполнитель — Название</code>.\n\n"
-        "3. <b>Редактирование тегов и обложки:</b>\n"
-        "   • Нажми <b>[ ✏️ Изменить теги ]</b> под любым отправленным ботом треком.\n"
-        "   • Либо просто пришли боту свой <code>.mp3</code> файл из памяти телефона или компьютера.\n\n"
-        "⚠️ <i>Telegram разрешает отправку файлов размером до 50 МБ.</i>"
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+    await message.answer("📖", reply_markup=get_main_reply_keyboard())
 
 
 @router.message(Command("version"))

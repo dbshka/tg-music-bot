@@ -19,7 +19,7 @@ MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
 # Битрейт аудио по умолчанию (кбит/с)
 DEFAULT_AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192")
-BOT_VERSION = "2.9.8"
+BOT_VERSION = "2.9.9"
 
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
