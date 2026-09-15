@@ -156,18 +156,27 @@ async def handle_music_request(message: Message):
                             request_id=req_id
                         )
             except Exception as dl_err:
-                # Если прямая ссылка недоступна (SoundCloud Go+, ошибка формата YouTube Music и т.д.),
-                # скачиваем оригинальную студийную версию через всесторонний поиск!
+                # Если прямая ссылка недоступна (SoundCloud Go+, bot-check YouTube и т.д.),
+                # автоматически скачиваем трек через всесторонний поиск!
                 fallback_query = None
-                if track_info.title and track_info.artist:
-                    fallback_query = f"{track_info.artist} - {track_info.title}"
-                elif track_info.title:
-                    fallback_query = track_info.title
-                elif track_info.artist:
-                    fallback_query = track_info.artist
+                clean_artist = re.sub(r'[/\\_]+', ' ', track_info.artist or '').strip()
+                clean_title = re.sub(r'[/\\_]+', ' ', track_info.title or '').strip()
+                clean_title = re.sub(
+                    r'\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Official\s*Audio|Lyric\s*Video|Video|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
+                    '',
+                    clean_title,
+                    flags=re.IGNORECASE
+                ).strip()
+
+                if clean_artist and clean_title and clean_artist.lower() not in clean_title.lower():
+                    fallback_query = f"{clean_artist} - {clean_title}"
+                elif clean_title:
+                    fallback_query = clean_title
+                elif clean_artist:
+                    fallback_query = clean_artist
 
                 if fallback_query:
-                    print(f"[MUSIC][request_id={req_id}] Прямая ссылка не отдала аудио ({dl_err}), скачиваем оригинал через поиск: '{fallback_query}'", flush=True)
+                    print(f"[MUSIC][request_id={req_id}] Прямая ссылка не отдала аудио ({dl_err}), скачиваем через поиск: '{fallback_query}'", flush=True)
                     async with DOWNLOAD_SEMAPHORE:
                         async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
                             downloaded_audio = await download_track(
@@ -281,13 +290,7 @@ async def handle_music_request(message: Message):
             print(f"[MUSIC][request_id={req_id}] ERROR at link processing: {e}\n{traceback.format_exc()}", flush=True)
             logger.exception("Ошибка при обработке ссылки %s", url)
             err_str = str(e)
-            if "Sign in to confirm you’re not a bot" in err_str or "Sign in to confirm" in err_str:
-                user_friendly = (
-                    "❌ <b>YouTube временно ограничил прямое скачивание по этой ссылке.</b>\n\n"
-                    "💡 <b>Решение:</b> просто отправьте название этой песни текстом — "
-                    "бот мгновенно найдет и пришлет её!"
-                )
-            elif "Яндекс Музык" in err_str:
+            if "Яндекс Музык" in err_str:
                 user_friendly = (
                     "⚠️ <b>Прямые ссылки Яндекс Музыки отключены.</b>\n\n"
                     "Из-за региональных ограничений хостинга загрузка по прямым ссылкам недоступна.\n\n"

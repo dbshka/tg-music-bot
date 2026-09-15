@@ -107,8 +107,23 @@ async def _unshorten_url(url: str, session: aiohttp.ClientSession) -> str:
 
 
 
+TRACK_MODIFIERS = {
+    "slowed", "slow", "reverb", "reverbed",
+    "speed up", "speedup", "sped up", "spedup", "fast version",
+    "remix", "ремикс", "bootleg", "flip", "mashup", "vip mix",
+    "cover", "кавер", "acoustic", "piano",
+    "8d", "nightcore", "daycore", "instrumental", "инструментал", "minus", "минус"
+}
+
+def has_track_modifiers(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(mod in t for mod in TRACK_MODIFIERS)
+
+
 async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-    """Поиск по Deezer API с жестким таймаутом (2.5с) во избежание зависаний."""
+    """Поиск по Deezer API с жестким таймаутом (2.5с) и валидацией совпадения исполнителя и трека."""
     try:
         encoded = urllib.parse.quote(query)
         api_url = f"https://api.deezer.com/search?q={encoded}"
@@ -116,23 +131,36 @@ async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Op
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 results = data.get("data", [])
-                if results:
-                    item = results[0]
-                    artist = item.get("artist", {}).get("name")
-                    title = item.get("title")
-                    cover = item.get("album", {}).get("cover_xl") or item.get("album", {}).get("cover_big")
-                    duration = int(item.get("duration") or 0) or None
-                    return artist, title, cover, duration
+                clean_q = re.sub(r'[\W_]+', ' ', query.lower()).strip()
+                q_words = set(clean_q.split())
+                for item in results:
+                    artist = item.get("artist", {}).get("name") or ""
+                    title = item.get("title") or ""
+                    # Если пользователь не искал модификаторы, пропускаем каверы/акустику
+                    if not has_track_modifiers(query) and has_track_modifiers(title):
+                        continue
+                    full_str = f"{artist} {title}".lower()
+                    clean_full = re.sub(r'[\W_]+', ' ', full_str).strip()
+                    item_words = set(clean_full.split())
+                    match = (
+                        (clean_q == clean_full)
+                        or (q_words and q_words.issubset(item_words))
+                        or (len(q_words & item_words) / max(1, len(q_words)) >= 0.6)
+                    )
+                    if match:
+                        cover = item.get("album", {}).get("cover_xl") or item.get("album", {}).get("cover_big")
+                        duration = int(item.get("duration") or 0) or None
+                        return artist, title, cover, duration
     except Exception:
         pass
     return None, None, None, None
 
 
 async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-    """Резервный поиск по iTunes API с валидацией совпадения названия трека (быстрый ответ < 500 мс)."""
+    """Резервный поиск по iTunes API с валидацией совпадения трека и исполнителя (быстрый ответ < 500 мс)."""
     try:
         encoded = urllib.parse.quote(query)
-        api_url = f"https://itunes.apple.com/search?term={encoded}&media=music&limit=5"
+        api_url = f"https://itunes.apple.com/search?term={encoded}&media=music&entity=song&limit=5"
         async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
@@ -141,14 +169,21 @@ async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tu
                 q_words = set(clean_q.split())
                 for item in results:
                     track_name = item.get("trackName") or ""
-                    clean_tn = re.sub(r'[\W_]+', ' ', track_name.lower()).strip()
-                    tn_words = set(clean_tn.split())
-                    match = (clean_q == clean_tn) or (len(q_words) > 1 and q_words.issubset(tn_words)) or (tn_words and len(q_words & tn_words) / len(q_words) >= 0.7)
+                    artist_name = item.get("artistName") or ""
+                    if not has_track_modifiers(query) and has_track_modifiers(track_name):
+                        continue
+                    full_str = f"{artist_name} {track_name}".lower()
+                    clean_full = re.sub(r'[\W_]+', ' ', full_str).strip()
+                    item_words = set(clean_full.split())
+                    match = (
+                        (clean_q == clean_full)
+                        or (q_words and q_words.issubset(item_words))
+                        or (len(q_words & item_words) / max(1, len(q_words)) >= 0.6)
+                    )
                     if match:
-                        artist = item.get("artistName")
                         artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
                         duration = int(item.get("trackTimeMillis", 0) / 1000) or None
-                        return artist, track_name, artwork, duration
+                        return artist_name, track_name, artwork, duration
     except Exception:
         pass
     return None, None, None, None
@@ -156,35 +191,22 @@ async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tu
 
 async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTrack]:
     """
-    Определяет канонические метаданные студийного оригинала трека через Deezer / iTunes API:
+    Определяет канонические метаданные студийного оригинала трека через iTunes / Deezer API:
     - Официальное имя исполнителя
     - Официальное название трека (без лишнего мусора)
     - Эталонная длительность трека в секундах (duration)
     - Официальная студийная обложка альбома в высоком разрешении
-    Работает за < 200 мс без необходимости в API ключах.
+    Если в запросе содержатся модификаторы (slowed, sped up, remix и др.), студийный эталон не навязывается.
     """
+    if has_track_modifiers(query):
+        return None
+
     clean_q = re.sub(r'[\W_]+', ' ', query).strip()
     if not clean_q or len(clean_q) < 2:
         return None
 
     session = get_shared_session()
-    # 1. Приоритетный поиск в Deezer API (< 200 мс)
-    try:
-        d_artist, d_title, d_cover, d_dur = await _search_deezer(session, clean_q)
-        if d_artist and d_title and d_dur:
-            return ExtractedTrack(
-                platform="Canonical/Deezer",
-                target=f"ytsearch5:{d_artist} - {d_title}",
-                is_search=True,
-                title=d_title,
-                artist=d_artist,
-                thumbnail_url=d_cover,
-                duration=d_dur
-            )
-    except Exception as ex:
-        logger.debug("Ошибка канонического поиска Deezer: %s", ex)
-
-    # 2. Резервный поиск в iTunes Search API (< 300 мс)
+    # 1. Приоритетный поиск в iTunes Search API (< 250 мс, каталог Apple Music)
     try:
         it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, clean_q)
         if it_artist and it_title and it_dur:
@@ -199,6 +221,22 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
             )
     except Exception as ex:
         logger.debug("Ошибка канонического поиска iTunes: %s", ex)
+
+    # 2. Резервный поиск в Deezer API (< 200 мс)
+    try:
+        d_artist, d_title, d_cover, d_dur = await _search_deezer(session, clean_q)
+        if d_artist and d_title and d_dur:
+            return ExtractedTrack(
+                platform="Canonical/Deezer",
+                target=f"ytsearch5:{d_artist} - {d_title}",
+                is_search=True,
+                title=d_title,
+                artist=d_artist,
+                thumbnail_url=d_cover,
+                duration=d_dur
+            )
+    except Exception as ex:
+        logger.debug("Ошибка канонического поиска Deezer: %s", ex)
 
     return None
 
@@ -234,7 +272,7 @@ async def _extract_spotify_embed_metadata(track_id: str, session: aiohttp.Client
     """
     Извлекает метаданные трека напрямую через открытый Spotify Embed API:
     https://open.spotify.com/embed/track/{track_id}
-    Возвращает точные (artist, title, cover_url, duration_seconds) без необходимости в API ключах.
+    При геоблоках (HTTP 451) или отсутствии данных автоматически обращается к Microlink.
     """
     try:
         url = f"https://open.spotify.com/embed/track/{track_id}"
@@ -261,14 +299,28 @@ async def _extract_spotify_embed_metadata(track_id: str, session: aiohttp.Client
                             return artist, title, cover, duration
     except Exception as e:
         logger.debug("Ошибка извлечения Spotify embed: %s", e)
+
+    # Fallback на Microlink при геоблокировке Embed API (HTTP 451)
+    try:
+        spotify_track_url = f"https://open.spotify.com/track/{track_id}"
+        m_artist, m_title, m_cover = await _extract_microlink_metadata(spotify_track_url, session)
+        if m_title and m_artist:
+            m_duration = None
+            if not has_track_modifiers(m_title):
+                _, _, _, m_duration = await _search_itunes_track(session, f"{m_artist} {m_title}")
+            return m_artist, m_title, m_cover, m_duration
+    except Exception as ex:
+        logger.debug("Ошибка Microlink fallback для Spotify: %s", ex)
+
     return None, None, None, None
 
 
 async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Optional[ExtractedTrack]:
     """
     Извлекает метаданные трека Spotify.
-    1. Напрямую опрашивает Spotify Embed API для получения точных исполнителя, названия и эталонной длительности.
-    2. При необходимости использует oEmbed и Deezer/iTunes для гарантированного нахождения эталонного хронометража.
+    1. Опрашивает Spotify Embed API (с fallback на Microlink).
+    2. При необходимости использует oEmbed и Microlink для точного артиста и названия.
+    3. Применяет канонический резолвер только для немагических/оригинальных студийных релизов.
     """
     track_id_match = re.search(r'track/([a-zA-Z0-9]+)', url)
     track_id = track_id_match.group(1) if track_id_match else None
@@ -279,12 +331,19 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
     thumbnail_url = None
     duration = None
 
-    # 1. Приоритетное прямое извлечение через Spotify Embed API
+    # 1. Приоритетное извлечение через Embed API (с поддержкой Microlink)
     if track_id:
         artist, title, thumbnail_url, duration = await _extract_spotify_embed_metadata(track_id, session)
 
-    # 2. Быстрый опрос oEmbed, если embed не вернул артиста или длительность
-    if not (title and artist and duration):
+    # 2. Быстрый опрос Microlink напрямую, если автор или название не найдены
+    if not (title and artist):
+        m_artist, m_title, m_cover = await _extract_microlink_metadata(clean_url, session)
+        artist = artist or m_artist
+        title = title or m_title
+        thumbnail_url = thumbnail_url or m_cover
+
+    # 3. Резервный опрос oEmbed
+    if not (title and artist):
         try:
             oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(clean_url)}"
             headers = {"User-Agent": "Mozilla/5.0"}
@@ -293,17 +352,14 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
                     data = await resp.json()
                     oe_raw = data.get("title")
                     thumbnail_url = thumbnail_url or data.get("thumbnail_url")
-                    if oe_raw and " - " in oe_raw:
-                        parts = oe_raw.split(" - ", 1)
-                        artist = artist or parts[0].strip()
-                        title = title or parts[1].strip()
-                    elif oe_raw:
-                        title = title or oe_raw
+                    if oe_raw and not title:
+                        title = oe_raw
         except Exception:
             pass
 
-    # 3. Резервный поиск канонического эталона через Deezer / iTunes
-    if title and (not artist or not duration):
+    # 4. Резервный поиск канонического эталона через Deezer / iTunes
+    # ВНИМАНИЕ: только если трек НЕ является модификацией (slowed, sped up, remix и т.д.)
+    if title and (not artist or not duration) and not has_track_modifiers(title):
         search_q = f"{artist} {title}" if artist else title
         canonical = await resolve_canonical_track_info_async(search_q)
         if canonical:
@@ -313,7 +369,7 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
             duration = duration or canonical.duration
 
     if title:
-        search_query = f"{artist} - {title}" if artist else title
+        search_query = f"{artist} - {title}" if (artist and artist.lower() not in title.lower()) else title
         return ExtractedTrack(
             platform="Spotify",
             target=f"ytsearch5:{search_query}",
@@ -472,17 +528,18 @@ async def extract_youtube_info(url: str, session: aiohttp.ClientSession) -> Opti
                     artist = parts[0].strip()
                     title = parts[1].strip()
 
+                # Очищаем видео-приписки клипов, но СОХРАНЯЕМ Remix / Sped Up / Slowed
                 title = re.sub(
-                    r'\s*[\(\[](?:Official|Music Video|Audio|Lyric|Video|Remix|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
+                    r'\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Official\s*Audio|Lyric\s*Video|Video|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
                     '',
                     title,
                     flags=re.IGNORECASE
                 ).strip()
 
                 duration = None
-                # Сверяем канонические метаданные студийного релиза (артист, длительность, студийная обложка)
+                # Сверяем канонические метаданные студийного релиза только если трек не модифицирован
                 search_seed = f"{artist} - {title}" if (artist and artist != title) else (title or artist)
-                if search_seed:
+                if search_seed and not has_track_modifiers(title):
                     canonical = await resolve_canonical_track_info_async(search_seed)
                     if canonical:
                         duration = canonical.duration

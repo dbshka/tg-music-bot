@@ -25,6 +25,7 @@ from mutagen.mp4 import MP4, MP4Cover
 
 from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
 from services.http_client import get_shared_session
+from services.extractor import TRACK_MODIFIERS, has_track_modifiers
 
 
 @dataclass
@@ -242,6 +243,9 @@ def _sync_download(
 
             def _fetch_candidates(target_q, src_name):
                 s_opts = dict(options)
+                if src_name == "soundcloud":
+                    s_opts.pop("cookiefile", None)
+                    s_opts.pop("extractor_args", None)
                 s_opts["extract_flat"] = True
                 s_opts["noplaylist"] = True
                 s_opts["ignoreerrors"] = True
@@ -249,6 +253,15 @@ def _sync_download(
                     with yt_dlp.YoutubeDL(s_opts) as ydl_s:
                         info = ydl_s.extract_info(target_q, download=False)
                         items = [e for e in info.get("entries", []) if e]
+                        # Fallback поиск в SoundCloud, если запрос с исполнителем вернул 0 результатов
+                        if not items and src_name == "soundcloud" and ":" in target_q:
+                            raw_target = target_q.split(":", 1)[1]
+                            pure_title = raw_target.split(" - ", 1)[1] if " - " in raw_target else raw_target
+                            pure_title = re.sub(r'\s*[\(\[](?:feat|ft\.)[^\)\]]*[\)\]]', '', pure_title, flags=re.IGNORECASE).strip()
+                            clean_words = re.sub(r'[/\\_]+', ' ', pure_title).strip()
+                            if len(clean_words) >= 3:
+                                info2 = ydl_s.extract_info(f"scsearch4:{clean_words}", download=False)
+                                items = [e for e in info2.get("entries", []) if e]
                         for item in items:
                             item["_source"] = src_name
                         return items
@@ -289,28 +302,12 @@ def _sync_download(
             if not entries:
                 raise ValueError("Трек не найден по данному запросу.")
 
-            # 2. Интеллектуальный скоринг и проверка подлинности кандидатов
+            # 2. Интеллектуальный Query-Aware скоринг кандидатов
             t_c0 = time.perf_counter()
 
-            unwanted_terms = [
-                ("remix", 600.0), ("ремикс", 600.0), ("bootleg", 600.0), ("flip", 600.0),
-                ("mashup", 600.0), ("vip mix", 600.0), ("mix", 400.0),
-                ("cover", 700.0), ("кавер", 700.0), ("tribute", 700.0),
-                ("acoustic cover", 700.0), ("piano cover", 700.0), ("guitar cover", 700.0),
-                ("slowed", 700.0), ("slow", 400.0), ("reverb", 700.0), ("reverbed", 700.0),
-                ("slowed + reverb", 800.0), ("slowed and reverb", 800.0), ("slowed reverb", 800.0),
-                ("speed up", 700.0), ("speedup", 700.0), ("sped up", 700.0), ("spedup", 700.0),
-                ("fast version", 700.0), ("nightcore", 700.0), ("daycore", 700.0), ("slowcore", 700.0),
-                ("8d", 900.0), ("8d audio", 900.0), ("8d music", 900.0), ("3d audio", 900.0), ("spatial audio", 900.0),
-                ("edit", 500.0), ("fan edit", 700.0), ("tiktok", 700.0), ("tik tok", 700.0), ("tiktok version", 700.0),
-                ("432hz", 700.0), ("432 hz", 700.0), ("528hz", 700.0), ("528 hz", 700.0),
-                ("bass boosted", 700.0), ("bassboosted", 700.0),
-                ("karaoke", 800.0), ("караоке", 800.0), ("instrumental", 700.0), ("инструментал", 700.0),
-                ("minus", 600.0), ("минус", 600.0), ("backing track", 700.0),
-                ("parody", 800.0), ("пародия", 800.0), ("reaction", 800.0), ("реакция", 800.0),
-                ("1 hour", 900.0), ("10 hours", 900.0), ("1 час", 900.0), ("10 часов", 900.0),
-                ("loop", 700.0), ("extended", 500.0)
-            ]
+            # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
+            req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
+            requested_modifiers = {mod for mod in TRACK_MODIFIERS if mod in req_context}
 
             def _candidate_penalty(e):
                 cand_title = (e.get("title") or "").lower()
@@ -323,37 +320,43 @@ def _sync_download(
                     return 5000.0
 
                 penalty = 0.0
+                cand_text = f"{cand_title} {cand_uploader} {cand_channel}"
+                cand_modifiers = {mod for mod in TRACK_MODIFIERS if mod in cand_text}
 
-                # Жесткий штраф за ремиксы, каверы, 8D, замедления и спидапы, если пользователь явно их не искал
-                for term, p_val in unwanted_terms:
-                    if (term in cand_title or term in cand_uploader) and term not in search_query_lower:
-                        penalty += p_val
+                if requested_modifiers:
+                    # Пользователь целенаправленно ищет модификацию (slowed, sped up, remix, cover...)
+                    matching = requested_modifiers & cand_modifiers
+                    if matching:
+                        penalty -= 150.0 * len(matching)
+                    else:
+                        penalty += 200.0  # Обычные студийные версии уступают искомой модификации
+                else:
+                    # Пользователь ищет оригинальный студийный трек без модификаций
+                    for mod in cand_modifiers:
+                        penalty += 350.0
 
-                # Строгое сравнение длительности с эталоном оригинального трека
-                if expected_duration:
+                # Оценка соответствия длительности
+                if expected_duration and not requested_modifiers:
                     diff = abs(dur - expected_duration)
                     if diff <= 4:
-                        penalty -= 60.0  # Идеальное соответствие студийному хронометражу
+                        penalty -= 60.0
                     elif diff <= 8:
-                        penalty -= 20.0  # Допуск на паузы клипа
-                    elif diff <= 14:
+                        penalty -= 20.0
+                    elif diff <= 15:
                         penalty += diff * 5.0
-                    elif diff <= 22:
-                        penalty += 300.0 + (diff * 15.0)
+                    elif diff <= 25:
+                        penalty += 150.0 + (diff * 10.0)
                     else:
-                        penalty += 1500.0 + (diff * 20.0)  # Спидап/кавер/нарезка — дисквалифицирующий штраф
-                else:
+                        penalty += 400.0 + (diff * 15.0)
+                elif dur > 0:
                     if dur >= 45:
                         penalty += 0.0
-                    elif dur > 0:
-                        penalty += 50.0 + (45 - dur)
                     else:
-                        penalty += 80.0
+                        penalty += 100.0 + (45 - dur) * 10.0
 
                 cand_src = e.get("_source") or source
                 if cand_src == "youtube":
                     is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
-                    # Релизы Topic на YouTube — это официальные студийные аудиозаписи от лейблов!
                     if is_topic and cookies_info.get("active"):
                         penalty -= 150.0
                     elif is_topic and not cookies_info.get("active"):
@@ -366,8 +369,7 @@ def _sync_download(
                         if ca in cand_uploader or ca.replace(" ", "") in cand_uploader.replace(" ", ""):
                             penalty -= 50.0
                         else:
-                            # Неофициальный любительский загрузчик на SoundCloud
-                            penalty += 250.0
+                            penalty += 100.0
 
                 return penalty
 
@@ -375,12 +377,11 @@ def _sync_download(
             t_c1 = time.perf_counter()
             perf_timings["candidate_selection"] += (t_c1 - t_c0)
 
-            # 3. Цикл скачивания лучших кандидатов с пост-валидацией длительности
-            dl_opts = dict(options)
-            dl_opts["extract_flat"] = False
-
+            # 3. Цикл скачивания лучших кандидатов с принципом гарантированной доставки (Zero False Negatives)
             last_cand_error = None
             youtube_blocked = False
+            best_fallback_info = None
+
             for cand_idx, selected_entry in enumerate(ranked_candidates):
                 cand_source = selected_entry.get("_source") or source
                 if youtube_blocked and cand_source == "youtube":
@@ -395,6 +396,12 @@ def _sync_download(
                 cand_title = selected_entry.get("title") or target_url
                 cand_dur = selected_entry.get("duration") or 0
                 print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1} ({cand_source}): '{cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
+
+                cand_dl_opts = dict(options)
+                cand_dl_opts["extract_flat"] = False
+                if cand_source == "soundcloud":
+                    cand_dl_opts.pop("cookiefile", None)
+                    cand_dl_opts.pop("extractor_args", None)
 
                 hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
                 def p_hook(d):
@@ -411,23 +418,22 @@ def _sync_download(
                     elif d.get("status") == "finished":
                         hook_times["pp_end"] = time.perf_counter()
 
-                dl_opts["progress_hooks"] = [p_hook]
-                dl_opts["postprocessor_hooks"] = [pp_hook]
+                cand_dl_opts["progress_hooks"] = [p_hook]
+                cand_dl_opts["postprocessor_hooks"] = [pp_hook]
 
                 inv_idx2 = len(invocations) + 1
                 t_d0 = time.perf_counter()
                 try:
-                    with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
+                    with yt_dlp.YoutubeDL(cand_dl_opts) as ydl_dl:
                         res_info = ydl_dl.extract_info(target_url, download=True)
                     t_d1 = time.perf_counter()
                     dur_dl_all = t_d1 - t_d0
 
                     # Проверяем появление готового аудиофайла (M4A или MP3)
-                    audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"]]
+                    audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
                     if not audio_files:
                         raise FileNotFoundError("Аудиофайл не был создан после обработки кандидата.")
 
-                    # СТРОГАЯ ПОСТ-ВАЛИДАЦИЯ ДЛИТЕЛЬНОСТИ
                     actual_dur = int(res_info.get("duration") or 0)
                     if not actual_dur and audio_files:
                         try:
@@ -438,42 +444,56 @@ def _sync_download(
                         except Exception:
                             pass
 
-                    if expected_duration and expected_duration > 35 and actual_dur > 0:
-                        real_diff = abs(actual_dur - expected_duration)
-                        if real_diff > 20:
-                            print(f"{req_tag}[AUTHENTICITY] Отклонен кандидат #{cand_idx+1} '{cand_title}': длительность {actual_dur}s отличается от оригинала {expected_duration}s на {real_diff}s (> 20s)!", flush=True)
-                            for temp_f in output_dir.iterdir():
-                                if temp_f.is_file() and not temp_f.name.startswith("cover"):
-                                    try:
-                                        temp_f.unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
-                            continue
+                    # Проверяем допустимость хронометража:
+                    # Для модифицированных треков (slowed, sped up) или без эталона принимаем сразу
+                    diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0 and not requested_modifiers) else 0
 
-                    if hook_times["dl_start"] and hook_times["dl_end"]:
-                        dur_net = hook_times["dl_end"] - hook_times["dl_start"]
-                    else:
-                        dur_net = dur_dl_all * 0.65
+                    if diff <= 25 or not expected_duration or requested_modifiers:
+                        # Идеальное попадание! Удаляем возможный бэкап и возвращаем результат
+                        for old_f in output_dir.iterdir():
+                            if old_f.name.startswith("backup_"):
+                                old_f.unlink(missing_ok=True)
 
-                    if hook_times["pp_start"] and hook_times["pp_end"]:
-                        dur_ff = hook_times["pp_end"] - hook_times["pp_start"]
-                    else:
-                        dur_ff = max(0.1, dur_dl_all - dur_net)
+                        if hook_times["dl_start"] and hook_times["dl_end"]:
+                            dur_net = hook_times["dl_end"] - hook_times["dl_start"]
+                        else:
+                            dur_net = dur_dl_all * 0.65
 
-                    perf_timings["download"] += dur_net
-                    perf_timings["ffmpeg"] += dur_ff
+                        if hook_times["pp_start"] and hook_times["pp_end"]:
+                            dur_ff = hook_times["pp_end"] - hook_times["pp_start"]
+                        else:
+                            dur_ff = max(0.1, dur_dl_all - dur_net)
 
-                    invocations.append({
-                        "invocation": inv_idx2,
-                        "purpose": f"stream_download_cand_{cand_idx+1}",
-                        "source": cand_source,
-                        "start": t_d0 - t_start_all,
-                        "end": t_d1 - t_start_all,
-                        "duration": dur_dl_all,
-                        "result": "OK"
-                    })
-                    print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
-                    return res_info
+                        perf_timings["download"] += dur_net
+                        perf_timings["ffmpeg"] += dur_ff
+
+                        invocations.append({
+                            "invocation": inv_idx2,
+                            "purpose": f"stream_download_cand_{cand_idx+1}",
+                            "source": cand_source,
+                            "start": t_d0 - t_start_all,
+                            "end": t_d1 - t_start_all,
+                            "duration": dur_dl_all,
+                            "result": "OK"
+                        })
+                        print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
+                        return res_info
+
+                    # Длительность отличается (> 25s), сохраняем как резервный вариант
+                    print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' имеет разницу длительности {diff}s (> 25s). Сохраняем как резерв.", flush=True)
+                    if best_fallback_info is None or diff < best_fallback_info.get("diff", 99999):
+                        for af in audio_files:
+                            backup_p = output_dir / f"backup_{af.name}"
+                            shutil.copy2(af, backup_p)
+                        best_fallback_info = {"res_info": res_info, "diff": diff}
+
+                    for temp_f in output_dir.iterdir():
+                        if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                            try:
+                                temp_f.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    continue
                 except Exception as cand_err:
                     if cancel_event and cancel_event.is_set():
                         shutil.rmtree(output_dir, ignore_errors=True)
@@ -481,53 +501,65 @@ def _sync_download(
                     last_cand_error = cand_err
                     cand_err_str = str(cand_err).lower()
                     print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}).", flush=True)
-                    # Очищаем неполные или временные файлы перед следующей попыткой
                     for temp_f in output_dir.iterdir():
-                        if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                        if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                             try:
                                 temp_f.unlink(missing_ok=True)
                             except Exception:
                                 pass
 
-                    # Если YouTube блокирует IP датацентра (bot-check / 429 / Sign in)
                     is_ip_blocked = any(m in cand_err_str for m in ["confirm you’re not a bot", "confirm you're not a bot", "sign in", "bot", "429", "too many requests"])
                     if is_ip_blocked and cand_source == "youtube":
                         print(f"{req_tag}[DOWNLOADER] YouTube заблокировал кандидата #{cand_idx+1}. Пропускаем YouTube и переключаемся на SoundCloud...", flush=True)
                         youtube_blocked = True
                     continue
 
-            # Если все кандидаты из списка упали, пробуем экстренный поиск в SoundCloud с валидацией длительности
-            if last_cand_error:
+            # Если идеального кандидата не нашлось, но скачался резервный — ВОССТАНАВЛИВАЕМ И ОТДАЕМ ЕГО!
+            if best_fallback_info:
+                print(f"{req_tag}[AUTHENTICITY] Восстанавливаем лучший скачанный резерв (diff={best_fallback_info['diff']}s)", flush=True)
+                for bf in list(output_dir.iterdir()):
+                    if bf.name.startswith("backup_"):
+                        orig_name = bf.name.replace("backup_", "", 1)
+                        bf.rename(output_dir / orig_name)
+                return best_fallback_info["res_info"]
+
+            # Экстренный поиск в SoundCloud
+            if last_cand_error or not entries:
                 print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{clean_search}' в SoundCloud...", flush=True)
                 try:
                     sc_opts = dict(options)
                     sc_opts.pop("cookiefile", None)
                     sc_opts.pop("extractor_args", None)
                     sc_opts["extract_flat"] = True
+                    sc_opts["noplaylist"] = True
+                    sc_opts["ignoreerrors"] = True
                     with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
                         sc_raw = ydl_sc.extract_info(f"scsearch4:{clean_search}", download=False)
                         sc_entries = [e for e in sc_raw.get("entries", []) if e]
+                        if not sc_entries:
+                            pure_sc = clean_search.split(" - ", 1)[1] if " - " in clean_search else clean_search
+                            pure_sc = re.sub(r'[/\\_]+', ' ', pure_sc).strip()
+                            if len(pure_sc) >= 3:
+                                sc_raw2 = ydl_sc.extract_info(f"scsearch4:{pure_sc}", download=False)
+                                sc_entries = [e for e in sc_raw2.get("entries", []) if e]
                         for se in sc_entries:
                             se["_source"] = "soundcloud"
                         if sc_entries:
                             sc_ranked = sorted(sc_entries, key=_candidate_penalty)
                             for s_cand in sc_ranked:
-                                s_dur = s_cand.get("duration") or 0
-                                if expected_duration and expected_duration > 35 and abs(s_dur - expected_duration) > 20:
-                                    continue
                                 s_url = s_cand.get("webpage_url") or s_cand.get("url")
                                 if s_url:
                                     sc_opts_dl = dict(options)
+                                    sc_opts_dl.pop("cookiefile", None)
+                                    sc_opts_dl.pop("extractor_args", None)
                                     sc_opts_dl["extract_flat"] = False
                                     with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
                                         res_cand = ydl_sc_dl.extract_info(s_url, download=True)
-                                        res_dur = int(res_cand.get("duration") or s_dur)
-                                        if expected_duration and expected_duration > 35 and abs(res_dur - expected_duration) > 20:
-                                            continue
                                         return res_cand
                 except Exception as sc_err:
                     print(f"{req_tag}[DOWNLOADER] Экстренный поиск SoundCloud не удался: {sc_err}", flush=True)
-                raise last_cand_error
+                if last_cand_error:
+                    raise last_cand_error
             raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
         else:
             inv_idx = len(invocations) + 1
@@ -610,7 +642,10 @@ def _sync_download(
                 except Exception:
                     pass
             if fb_title or fb_artist:
-                search_q = f"{fb_artist} - {fb_title}" if (fb_artist and fb_title) else (fb_title or fb_artist)
+                clean_fb_artist = re.sub(r'[/\\_]+', ' ', fb_artist or '').strip()
+                clean_fb_title = re.sub(r'[/\\_]+', ' ', fb_title or '').strip()
+                clean_fb_title = re.sub(r'\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Official\s*Audio|Lyric\s*Video|Video|HQ|HD|Visualizer)[^\)\]]*[\)\]]', '', clean_fb_title, flags=re.IGNORECASE).strip()
+                search_q = f"{clean_fb_artist} - {clean_fb_title}" if (clean_fb_artist and clean_fb_title and clean_fb_artist.lower() not in clean_fb_title.lower()) else (clean_fb_title or clean_fb_artist)
                 print(f"[DOWNLOADER] Прямая ссылка не отдала аудио ({last_err}), экстренный Fallback через поиск '{search_q}'...", flush=True)
                 return _sync_download(
                     query_or_url=f"ytsearch5:{search_q}",

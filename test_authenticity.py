@@ -112,6 +112,55 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(score(cands[1]), 1500.0)
         self.assertGreater(score(cands[0]), 4000.0)
 
+    async def test_spotify_extractor_super_slowed(self):
+        """Проверяет извлечение реального автора и названия для модифицированного трека (DJ ZUP RAlii - Super Slowed)"""
+        session = get_shared_session()
+        track = await extract_spotify_info("https://open.spotify.com/track/6CdMaVhtjoqjV80VwUdkX7?si=ZbltTlKZSoOShpCJlWHmNg&utm_source=copy-link", session)
+        self.assertIsNotNone(track)
+        self.assertEqual(track.artist, "DJ ZUP RAlii")
+        self.assertIn("Super Slowed", track.title)
+        self.assertIn("ytsearch5", track.target)
+        self.assertIn("DJ ZUP RAlii", track.target)
+
+    async def test_youtube_music_unpopular_track_resolver(self):
+        """Проверяет извлечение метаданных для непопулярного андеграундного трека из YouTube Music"""
+        from services.extractor import resolve_track_url
+        session = get_shared_session()
+        track = await resolve_track_url("https://music.youtube.com/watch?si=fsLDDCUT9JIzPK82&v=VqK-0ZKQj98", session)
+        self.assertIsNotNone(track)
+        self.assertEqual(track.target, "https://www.youtube.com/watch?v=VqK-0ZKQj98")
+        self.assertIn("dumb filler song", track.title.lower())
+
+    def test_query_aware_modifier_ranking(self):
+        """
+        Проверяет, что при запросе с 'slowed' трек с модификатором 'slowed'
+        получает наивысший приоритет над стандартной версией.
+        """
+        from services.extractor import TRACK_MODIFIERS
+
+        query = "DJ ZUP RAlii - не слышу - Super Slowed"
+        req_modifiers = {mod for mod in TRACK_MODIFIERS if mod in query.lower()}
+        self.assertIn("slowed", req_modifiers)
+
+        cands = [
+            {"title": "не слышу (Super Slowed)", "uploader": "Release - Topic", "duration": 98.0},
+            {"title": "не слышу (Original)", "uploader": "Release - Topic", "duration": 97.0},
+        ]
+
+        def score(c):
+            p = 0.0
+            cand_text = f"{c['title']} {c['uploader']}".lower()
+            cand_mods = {mod for mod in TRACK_MODIFIERS if mod in cand_text}
+            matching = req_modifiers & cand_mods
+            if matching:
+                p -= 150.0 * len(matching)
+            else:
+                p += 200.0
+            return p
+
+        scored = sorted(cands, key=score)
+        self.assertEqual(scored[0]["title"], "не слышу (Super Slowed)")
+
 
 if __name__ == "__main__":
     unittest.main()
