@@ -396,12 +396,14 @@ async def _execute_download_and_send(
             cached = await get_cached_track_async(f"{track_info.artist} - {track_info.title}".lower())
         t_cache = time.perf_counter() - t_c0
 
+        is_apple_music = bool(track_info and track_info.platform == "Apple Music")
+
         if cached:
             cached_dur = cached.get("duration") or 0
-            # Если официальный хронометраж известен, проверяем, не был ли старый кэшированный трек замедленным/искаженным
-            if track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 2:
+            # Инвалидация устаревшего кэша по строгому хронометражу - ТОЛЬКО ДЛЯ ССЫЛОК APPLE MUSIC!
+            if is_apple_music and track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 2:
                 print(
-                    f"[MUSIC][request_id={req_id}] cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging stale cache.",
+                    f"[MUSIC][request_id={req_id}] Apple Music cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging stale cache.",
                     flush=True
                 )
                 await delete_cached_track_async(cache_key)
@@ -446,7 +448,7 @@ async def _execute_download_and_send(
                 parse_mode="HTML"
             )
 
-        print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}'", flush=True)
+        print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}' is_apple_music={is_apple_music}", flush=True)
         try:
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
@@ -456,7 +458,8 @@ async def _execute_download_and_send(
                         custom_artist=track_info.artist,
                         thumbnail_url=track_info.thumbnail_url,
                         expected_duration=track_info.duration,
-                        request_id=req_id
+                        request_id=req_id,
+                        is_apple_music=is_apple_music
                     )
         except Exception as dl_err:
             fallback_query = None
@@ -486,7 +489,8 @@ async def _execute_download_and_send(
                             custom_artist=track_info.artist,
                             thumbnail_url=track_info.thumbnail_url,
                             expected_duration=track_info.duration,
-                            request_id=f"{req_id}_fb"
+                            request_id=f"{req_id}_fb",
+                            is_apple_music=is_apple_music
                         )
             else:
                 raise dl_err
