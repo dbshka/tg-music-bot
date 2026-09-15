@@ -152,24 +152,14 @@ async def main():
         # Регистрация меню команд Telegram и карточки «Что умеет этот бот» (до нажатия Старт)
         try:
             await bot.set_my_commands([
-                BotCommand(command="start", description="🚀 Главное меню"),
-                BotCommand(command="search", description="🔍 Найти песню (автор ➔ название)"),
-                BotCommand(command="cancel", description="❌ Отменить поиск"),
-                BotCommand(command="help", description="📖 Инструкция по боту"),
+                BotCommand(command="start", description="Старт"),
+                BotCommand(command="search", description="Поиск"),
+                BotCommand(command="cancel", description="Отмена"),
+                BotCommand(command="help", description="Помощь"),
             ])
-            # Окно «Что умеет этот бот?», отображаемое по центру чата до нажатия «Старт»
-            bot_description = (
-                "👋 Я помогу скачать музыку в MP3 и настроить её под себя!\n\n"
-                "🎵 Скачивание треков:\n"
-                "Отправь ссылку (YouTube, Spotify, Яндекс Музыка, Apple Music, SoundCloud, VK) или название песни.\n\n"
-                "✏️ Редактор тегов:\n"
-                "Меняй название, исполнителя, альбом и обложку трека в пару кликов прямо в Telegram.\n\n"
-                "📂 Поддерживается загрузка своих MP3-файлов для изменения тегов и обложки!"
-            )
-            await bot.set_my_description(description=bot_description)
-            await bot.set_my_short_description(
-                short_description="Скачивай треки из YouTube, Spotify, Я.Музыки, Apple Music и редактируй теги MP3 прямо в чате!"
-            )
+            # Очищаем описания профиля в Telegram
+            await bot.set_my_description(description="")
+            await bot.set_my_short_description(short_description="")
         except Exception as e:
             logger.debug("Не удалось обновить меню команд и описание: %s", e)
 
