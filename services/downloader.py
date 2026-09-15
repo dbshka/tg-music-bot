@@ -55,6 +55,42 @@ class DownloadedAudio:
             pass
 
 
+def _apply_audio_modifier_if_needed(audio_path: Path, requested_modifiers: set, cand_modifiers: set, req_tag: str = "") -> int:
+    """
+    Если пользователь явно запросил slowed/sped up, а скачанный трек является
+    оригинальной версией без модификаторов, программно применяем эффект через FFmpeg.
+    """
+    if not requested_modifiers or (requested_modifiers & cand_modifiers):
+        return 0
+
+    is_slowed = bool(requested_modifiers & {"super slowed", "super slow", "ultra slowed", "slowed", "slow"})
+    is_sped_up = bool(requested_modifiers & {"speed up", "speedup", "sped up", "spedup", "fast version"})
+
+    if not (is_slowed or is_sped_up):
+        return 0
+
+    temp_out = audio_path.with_name(f"mod_{audio_path.name}")
+    filter_str = "asetrate=44100*0.89,aresample=44100" if is_slowed else "asetrate=44100*1.15,aresample=44100"
+
+    print(f"{req_tag}[AUDIO_MOD] Применяем программный фильтр {filter_str} к оригинальному аудио...", flush=True)
+    import subprocess
+    cmd = [
+        "ffmpeg", "-y", "-i", str(audio_path),
+        "-filter_complex", filter_str,
+        "-c:a", "aac", "-b:a", "192k", "-threads", "0",
+        str(temp_out)
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 1000:
+        shutil.move(temp_out, audio_path)
+        from mutagen import File as MutagenFile
+        mf = MutagenFile(audio_path)
+        new_dur = int(mf.info.length) if (mf and mf.info and hasattr(mf.info, "length")) else 0
+        print(f"{req_tag}[AUDIO_MOD] Фильтр успешно применен! Новая длительность: {new_dur}s", flush=True)
+        return new_dur
+    return 0
+
+
 def _convert_thumbnail_to_jpg(thumb_path: Path) -> Optional[Path]:
     """Конвертирует обложку в формат JPEG (требование Telegram) и сжимает при необходимости."""
     if not thumb_path or not thumb_path.exists():
@@ -205,17 +241,17 @@ def _sync_download(
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "tv", "web", "mweb"],
+                "player_client": ["android", "mweb", "ios"],
             }
         }
         print(f"{req_tag}[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "tv", "web", "mweb"],
+                "player_client": ["android", "mweb", "ios"],
             }
         }
-        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты android, ios, tv, web, mweb)", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты android, mweb, ios)", flush=True)
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
@@ -499,7 +535,15 @@ def _sync_download(
                                     pass
                         continue
 
-                    # 2. Проверяем допустимость хронометража:
+                    # 2. Проверяем модификаторы и при необходимости применяем программный фильтр (slowed/sped up)
+                    cand_text = f"{cand_entry_title} {selected_entry.get('uploader') or ''}".lower()
+                    cand_modifiers = {mod for mod in TRACK_MODIFIERS if mod in cand_text}
+                    new_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, cand_modifiers, req_tag)
+                    if new_dur > 0:
+                        actual_dur = new_dur
+                        res_info["duration"] = new_dur
+
+                    # 3. Проверяем допустимость хронометража:
                     diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
                     is_duration_acceptable = False
                     if not expected_duration:
@@ -573,7 +617,7 @@ def _sync_download(
                             retry_cand_opts.pop("cookiefile", None)
                             retry_cand_opts["extractor_args"] = {
                                 "youtube": {
-                                    "player_client": ["android", "ios", "tv", "web", "mweb"]
+                                    "player_client": ["android", "mweb"]
                                 }
                             }
                             try:
@@ -752,7 +796,7 @@ def _sync_download(
             ydl_opts_retry["format"] = "ba[ext=m4a]/ba[ext=mp3]/ba/bv*+ba/b/best"
             ydl_opts_retry["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["android", "ios", "tv", "web", "mweb"],
+                    "player_client": ["android", "mweb", "ios"],
                 }
             }
             try:
