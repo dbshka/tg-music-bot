@@ -27,7 +27,7 @@ from mutagen.mp4 import MP4, MP4Cover
 from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
 from services.http_client import get_shared_session
 from services.extractor import (
-    TRACK_MODIFIERS, has_track_modifiers,
+    TRACK_MODIFIERS, has_track_modifiers, extract_modifiers,
     extract_core_title_words, compute_title_match_ratio
 )
 
@@ -311,7 +311,7 @@ def _sync_download(
 
             # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
             req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
-            requested_modifiers = {mod for mod in TRACK_MODIFIERS if mod in req_context}
+            requested_modifiers = extract_modifiers(req_context)
 
             # Ключевые слова названия трека для семантической проверки
             core_title_words = extract_core_title_words(custom_title or clean_search, custom_artist)
@@ -324,6 +324,10 @@ def _sync_download(
                 ("youtube", f"ytsearch5:{clean_search}"),
                 ("soundcloud", f"scsearch4:{clean_search}")
             ]
+            if not requested_modifiers:
+                # Добавляем поиск официальной студийной аудиодорожки (YouTube Audio/Topic)
+                search_tasks.append(("youtube", f"ytsearch5:{clean_search} Audio"))
+
             clean_core_title = " ".join(core_title_words) if core_title_words else ""
             if clean_core_title and custom_artist and requested_modifiers:
                 # Дополнительный точный поиск в SoundCloud по имени артиста и ключевым словам названия
@@ -387,7 +391,7 @@ def _sync_download(
                         penalty += 3500.0
 
                 cand_text = f"{cand_title} {cand_uploader} {cand_channel}"
-                cand_modifiers = {mod for mod in TRACK_MODIFIERS if mod in cand_text}
+                cand_modifiers = extract_modifiers(cand_text)
 
                 if requested_modifiers:
                     # Пользователь целенаправленно ищет модификацию (slowed, sped up, remix, cover...)
@@ -397,24 +401,24 @@ def _sync_download(
                     else:
                         penalty += 200.0  # Обычные студийные версии уступают искомой модификации
                 else:
-                    # Пользователь ищет оригинальный студийный трек без модификаций
-                    for mod in cand_modifiers:
-                        penalty += 350.0
+                    # Пользователь ищет оригинальный студийный трек без модификаций:
+                    # Любой сторонний модификатор (slowed, sped up, remix, reverb, cover, edit) — категорически нежелателен!
+                    if cand_modifiers:
+                        penalty += 5000.0
 
                 # Оценка соответствия длительности
                 if expected_duration:
                     diff = abs(dur - expected_duration)
                     if not requested_modifiers:
-                        if diff <= 4:
-                            penalty -= 60.0
-                        elif diff <= 8:
-                            penalty -= 20.0
-                        elif diff <= 15:
-                            penalty += diff * 5.0
-                        elif diff <= 25:
-                            penalty += 150.0 + (diff * 10.0)
+                        if diff <= 3:
+                            penalty -= 100.0
+                        elif diff <= 6:
+                            penalty -= 40.0
+                        elif diff <= 10:
+                            penalty += 200.0 + (diff * 15.0)
                         else:
-                            penalty += 400.0 + (diff * 15.0)
+                            # Разница более 10 секунд для оригинала с известным хронометражем — признак чужого трека или замедления
+                            penalty += 2500.0 + (diff * 30.0)
                     else:
                         # Запрашивалась модификация с известным хронометражем (например ссылка Spotify на Slowed)
                         if diff <= 8:
@@ -540,7 +544,20 @@ def _sync_download(
 
                     # 2. Проверяем модификаторы и при необходимости применяем программный фильтр (slowed/sped up)
                     cand_text = f"{cand_entry_title} {selected_entry.get('uploader') or ''}".lower()
-                    cand_modifiers = {mod for mod in TRACK_MODIFIERS if mod in cand_text}
+                    cand_modifiers = extract_modifiers(cand_text)
+
+                    # Если пользователь искал оригинал, а кандидат содержит сторонние модификаторы (slowed, sped up, remix, reverb...),
+                    # КАТЕГОРИЧЕСКИ отклоняем его!
+                    if not requested_modifiers and cand_modifiers:
+                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {cand_modifiers}. Отклоняем.", flush=True)
+                        for temp_f in output_dir.iterdir():
+                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                try:
+                                    temp_f.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                        continue
+
                     new_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, cand_modifiers, req_tag)
                     if new_dur > 0:
                         actual_dur = new_dur
@@ -553,7 +570,8 @@ def _sync_download(
                         is_duration_acceptable = True
                     elif requested_modifiers and diff <= 45:
                         is_duration_acceptable = True
-                    elif not requested_modifiers and diff <= 25:
+                    elif not requested_modifiers and diff <= 6:
+                        # Для оригинальных студийных треков допуск максимум 6 секунд (вводная/финальная тишина клипа)
                         is_duration_acceptable = True
 
                     if is_duration_acceptable and (not core_title_words or cand_match_ratio >= 0.5):
@@ -587,8 +605,8 @@ def _sync_download(
                         print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
                         return res_info
 
-                    # Длительность отличается, сохраняем как резервный вариант ТОЛЬКО ЕСЛИ название совпадает!
-                    if cand_match_ratio >= 0.5 or not core_title_words:
+                    # Длительность отличается, сохраняем как резервный вариант ТОЛЬКО ЕСЛИ название совпадает и нет модификаторов!
+                    if (cand_match_ratio >= 0.5 or not core_title_words) and (requested_modifiers or not cand_modifiers) and diff <= 12:
                         print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' имеет разницу длительности {diff}s. Сохраняем как резерв.", flush=True)
                         if best_fallback_info is None or diff < best_fallback_info.get("diff", 99999):
                             for af in audio_files:
@@ -628,8 +646,13 @@ def _sync_download(
                                     res_info = ydl_retry.extract_info(target_url, download=True)
                                 audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
                                 if audio_files:
-                                    print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
-                                    return res_info
+                                    actual_dur = int(res_info.get("duration") or 0)
+                                    diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
+                                    retry_title = unicodedata.normalize("NFC", res_info.get("title") or cand_title or "")
+                                    retry_mods = extract_modifiers(f"{retry_title} {selected_entry.get('uploader') or ''}")
+                                    if (requested_modifiers or not retry_mods) and (not expected_duration or diff <= 6 or (requested_modifiers and diff <= 45)):
+                                        print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
+                                        return res_info
                             except Exception as sub_retry_err:
                                 print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} также завершился ошибкой ({sub_retry_err}).", flush=True)
 
@@ -680,6 +703,14 @@ def _sync_download(
                             sc_ranked = sorted(sc_entries, key=_candidate_penalty)
                             for s_cand in sc_ranked:
                                 s_url = s_cand.get("webpage_url") or s_cand.get("url")
+                                s_title = unicodedata.normalize("NFC", s_cand.get("title") or "")
+                                s_mods = extract_modifiers(f"{s_title} {s_cand.get('uploader') or ''}")
+                                s_dur = s_cand.get("duration") or 0
+                                s_diff = abs(s_dur - expected_duration) if (expected_duration and expected_duration > 35 and s_dur > 0) else 0
+                                if not requested_modifiers and s_mods:
+                                    continue
+                                if expected_duration and not requested_modifiers and s_diff > 12:
+                                    continue
                                 if s_url:
                                     sc_opts_dl = dict(options)
                                     sc_opts_dl.pop("cookiefile", None)

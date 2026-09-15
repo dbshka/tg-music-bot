@@ -137,11 +137,22 @@ def convert_keyboard_layout(text: str) -> str:
     return text
 
 
-def has_track_modifiers(text: Optional[str]) -> bool:
+def extract_modifiers(text: Optional[str]) -> set[str]:
+    """Извлекает набор модификаторов трека с учетом границ слов и NFC-нормализации."""
     if not text:
-        return False
-    t = text.lower()
-    return any(mod in t for mod in TRACK_MODIFIERS)
+        return set()
+    norm = unicodedata.normalize("NFC", text).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+    found = set()
+    for mod in TRACK_MODIFIERS:
+        pattern = r'(?<!\w)' + re.escape(mod) + r'(?!\w)'
+        if re.search(pattern, norm):
+            found.add(mod)
+    return found
+
+
+def has_track_modifiers(text: Optional[str]) -> bool:
+    """Проверяет наличие любых модификаторов в строке."""
+    return bool(extract_modifiers(text))
 
 
 TRANSLIT_TABLE = {

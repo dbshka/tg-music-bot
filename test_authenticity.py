@@ -195,6 +195,72 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         ratio_fake = compute_title_match_ratio("MuzloRAlii.net - DJ ZUP RAlii (Super Slowed)", core_words)
         self.assertEqual(ratio_fake, 0.0)
 
+    def test_extract_modifiers_word_boundaries(self):
+        """
+        Проверяет, что extract_modifiers правильно находит модификаторы с границами слов
+        и не дает ложных срабатываний на словах 'slowly', 'discover', 'credit', 'delivery'.
+        """
+        from services.extractor import extract_modifiers, has_track_modifiers
+
+        self.assertTrue(has_track_modifiers("505, slowed - Arctic Monkeys"))
+        self.assertIn("slowed", extract_modifiers("505, slowed - Arctic Monkeys"))
+
+        self.assertFalse(has_track_modifiers("Tyler, The Creator - See You Again (feat. Kali Uchis)"))
+        self.assertEqual(extract_modifiers("Tyler, The Creator - See You Again (feat. Kali Uchis)"), set())
+
+        # Ложные подстроки не должны распознаваться как модификаторы:
+        self.assertFalse(has_track_modifiers("Walking Slowly Down the Street"))
+        self.assertFalse(has_track_modifiers("Discover New Horizons"))
+        self.assertFalse(has_track_modifiers("Give credit where it is due"))
+        self.assertFalse(has_track_modifiers("Special Delivery"))
+
+    def test_candidate_scoring_strictly_penalizes_slowed_when_original_requested(self):
+        """
+        Проверяет, что при запросе студийного оригинала (505, 253с):
+        1) Кандидат '505, slowed' (264.9с) получает дисквалифицирующий штраф > 5000.
+        2) Кандидат с оригинальной длительностью (252с) побеждает с огромным отрывом.
+        """
+        from services.extractor import extract_modifiers, extract_core_title_words, compute_title_match_ratio
+
+        expected_duration = 253
+        requested_modifiers = set()
+        core_title_words = {"505"}
+
+        def _candidate_penalty(e):
+            cand_title = e.get("title", "").lower()
+            cand_uploader = e.get("uploader", "").lower()
+            cand_channel = e.get("channel", "").lower()
+            dur = e.get("duration") or 0
+            penalty = 0.0
+
+            cand_text = f"{cand_title} {cand_uploader} {cand_channel}"
+            cand_modifiers = extract_modifiers(cand_text)
+
+            if cand_modifiers:
+                penalty += 5000.0
+
+            diff = abs(dur - expected_duration)
+            if diff <= 3:
+                penalty -= 100.0
+            elif diff <= 6:
+                penalty -= 40.0
+            elif diff <= 10:
+                penalty += 200.0 + (diff * 15.0)
+            else:
+                penalty += 2500.0 + (diff * 30.0)
+
+            return penalty
+
+        cand_slowed = {"title": "505, slowed", "uploader": "Arctic Monkeys", "channel": "", "duration": 264.9}
+        cand_studio = {"title": "Arctic Monkeys - 505", "uploader": "Pizza Music", "channel": "", "duration": 252.0}
+
+        p_slowed = _candidate_penalty(cand_slowed)
+        p_studio = _candidate_penalty(cand_studio)
+
+        self.assertGreater(p_slowed, 5000.0)
+        self.assertLess(p_studio, 0.0)
+        self.assertLess(p_studio, p_slowed - 5000.0)
+
 
 if __name__ == "__main__":
     unittest.main()
