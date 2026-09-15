@@ -152,7 +152,9 @@ async def main():
         # Регистрация меню команд Telegram и карточки «Что умеет этот бот» (до нажатия Старт)
         try:
             await bot.set_my_commands([
-                BotCommand(command="start", description="🚀 Начать / Меню"),
+                BotCommand(command="start", description="🚀 Главное меню"),
+                BotCommand(command="search", description="🔍 Найти песню (автор ➔ название)"),
+                BotCommand(command="cancel", description="❌ Отменить поиск"),
                 BotCommand(command="help", description="📖 Инструкция по боту"),
             ])
             # Окно «Что умеет этот бот?», отображаемое по центру чата до нажатия «Старт»
