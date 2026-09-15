@@ -79,10 +79,10 @@ def format_menu_text(data: dict) -> str:
     artist = html.escape(data.get("artist") or "—")
     album = html.escape(data.get("album") or "—")
 
-    if data.get("cover_path"):
+    if data.get("new_cover_uploaded"):
         cover_status = "🖼 Загружена новая обложка"
-    elif data.get("has_original_cover"):
-        cover_status = "🖼 Исходная обложка присутствует"
+    elif data.get("cover_path") or data.get("has_original_cover"):
+        cover_status = "🖼 Обложка сохранена"
     else:
         cover_status = "⚪ Без обложки"
 
@@ -162,6 +162,19 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
         initial_performer = getattr(audio_obj, "performer", None) or meta.artist
         duration = getattr(audio_obj, "duration", None) or meta.duration
 
+        initial_cover_path = None
+        if getattr(audio_obj, "thumbnail", None):
+            try:
+                tg_thumb_p = session_dir / "tg_thumb.jpg"
+                await bot.download(audio_obj.thumbnail, destination=tg_thumb_p)
+                if tg_thumb_p.exists() and tg_thumb_p.stat().st_size > 0:
+                    initial_cover_path = str(tg_thumb_p)
+            except Exception as th_err:
+                logger.debug("Не удалось скачать thumbnail из Telegram: %s", th_err)
+
+        if not initial_cover_path and meta.cover_path and meta.cover_path.exists():
+            initial_cover_path = str(meta.cover_path)
+
         await state.update_data(
             folder_path=str(session_dir),
             file_path=str(local_file_path),
@@ -169,8 +182,8 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
             artist=initial_performer,
             album=meta.album,
             duration=duration,
-            cover_path=None,
-            has_original_cover=meta.has_cover,
+            cover_path=initial_cover_path,
+            has_original_cover=bool(initial_cover_path or meta.has_cover),
             menu_message_id=status_msg.message_id
         )
 
@@ -220,6 +233,19 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
         initial_performer = audio_obj.performer or meta.artist
         duration = audio_obj.duration or meta.duration
 
+        initial_cover_path = None
+        if audio_obj.thumbnail:
+            try:
+                tg_thumb_p = session_dir / "tg_thumb.jpg"
+                await bot.download(audio_obj.thumbnail, destination=tg_thumb_p)
+                if tg_thumb_p.exists() and tg_thumb_p.stat().st_size > 0:
+                    initial_cover_path = str(tg_thumb_p)
+            except Exception as th_err:
+                logger.debug("Не удалось скачать thumbnail из Telegram: %s", th_err)
+
+        if not initial_cover_path and meta.cover_path and meta.cover_path.exists():
+            initial_cover_path = str(meta.cover_path)
+
         await state.update_data(
             folder_path=str(session_dir),
             file_path=str(local_file_path),
@@ -227,8 +253,8 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
             artist=initial_performer,
             album=meta.album,
             duration=duration,
-            cover_path=None,
-            has_original_cover=meta.has_cover,
+            cover_path=initial_cover_path,
+            has_original_cover=bool(initial_cover_path or meta.has_cover),
             menu_message_id=status_msg.message_id
         )
 
@@ -423,7 +449,7 @@ async def process_cover(message: Message, state: FSMContext, bot: Bot):
 
     cover_target = Path(folder_path) / "raw_cover.jpg"
     await bot.download(photo, destination=cover_target)
-    await state.update_data(cover_path=str(cover_target))
+    await state.update_data(cover_path=str(cover_target), new_cover_uploaded=True)
 
     try:
         await message.delete()

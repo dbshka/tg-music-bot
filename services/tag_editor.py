@@ -18,15 +18,17 @@ class AudioMetadata:
     album: str
     has_cover: bool
     duration: int
+    cover_path: Optional[Path] = None
 
 
 def read_mp3_tags(file_path: Path) -> AudioMetadata:
-    """Считывает текущие теги MP3 или M4A файла за одно чтение."""
+    """Считывает текущие теги MP3 или M4A файла и извлекает обложку, если она есть."""
     title = "Без названия"
     artist = "Неизвестный исполнитель"
     album = ""
     has_cover = False
     duration = 0
+    cover_path: Optional[Path] = None
 
     ext = file_path.suffix.lower()
     if ext in [".m4a", ".mp4"]:
@@ -41,6 +43,14 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
                 album = str(mp4_audio["\xa9alb"][0])
             if "covr" in mp4_audio and mp4_audio["covr"]:
                 has_cover = True
+                try:
+                    cover_data = bytes(mp4_audio["covr"][0])
+                    extracted = file_path.parent / "extracted_cover.jpg"
+                    with open(extracted, "wb") as f:
+                        f.write(cover_data)
+                    cover_path = extracted
+                except Exception:
+                    pass
         except Exception:
             pass
         return AudioMetadata(
@@ -48,7 +58,8 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
             artist=artist,
             album=album,
             has_cover=has_cover,
-            duration=duration
+            duration=duration,
+            cover_path=cover_path
         )
 
     try:
@@ -65,6 +76,13 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
             for tag in tags.values():
                 if isinstance(tag, APIC):
                     has_cover = True
+                    try:
+                        extracted = file_path.parent / "extracted_cover.jpg"
+                        with open(extracted, "wb") as f:
+                            f.write(tag.data)
+                        cover_path = extracted
+                    except Exception:
+                        pass
                     break
     except Exception:
         pass
@@ -74,7 +92,8 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
         artist=artist,
         album=album,
         has_cover=has_cover,
-        duration=duration
+        duration=duration,
+        cover_path=cover_path
     )
 
 

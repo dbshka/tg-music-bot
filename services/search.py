@@ -12,8 +12,26 @@ import yt_dlp
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import get_cookies_info
+from services.extractor import extract_core_title_words, compute_title_match_ratio
 
 logger = logging.getLogger(__name__)
+
+# Таблицы для конвертации раскладки клавиатуры RU <-> EN
+EN_LAYOUT = "`~qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?"
+RU_LAYOUT = "ёЁйцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,"
+EN_TO_RU = str.maketrans(EN_LAYOUT, RU_LAYOUT)
+RU_TO_EN = str.maketrans(RU_LAYOUT, EN_LAYOUT)
+
+
+def convert_keyboard_layout(text: str) -> str:
+    """Конвертирует раскладку клавиатуры между RU и EN."""
+    en_chars = sum(1 for c in text if 'a' <= c.lower() <= 'z')
+    ru_chars = sum(1 for c in text if 'а' <= c.lower() <= 'я' or c in 'ёЁ')
+    if en_chars > ru_chars:
+        return text.translate(EN_TO_RU)
+    elif ru_chars > 0:
+        return text.translate(RU_TO_EN)
+    return text
 
 
 @dataclass
@@ -67,6 +85,57 @@ class SearchCache:
 search_cache = SearchCache()
 
 
+def _score_search_item(item: SearchItem, query: str) -> float:
+    """
+    Вычисляет оценку оригинальности и соответствия трека.
+    Официальный студийный оригинал всегда получает наивысший балл и выходит на 1 место.
+    """
+    score = 0.0
+    title_lower = item.title.lower()
+    uploader_lower = (item.uploader or "").lower()
+    q_lower = query.lower()
+
+    # 1. Бонус официального Topic-канала (на YouTube все оригинальные студийные треки выходят на Topic)
+    if " - topic" in uploader_lower or uploader_lower.endswith("topic"):
+        score += 500.0
+
+    # 2. Бонус официального аудио / Vevo
+    if "official audio" in title_lower or "official release" in title_lower:
+        score += 300.0
+    if "vevo" in uploader_lower or "official" in uploader_lower:
+        score += 150.0
+
+    # 3. Штраф за неоригинальные модификации (если пользователь явно их не искал)
+    unwanted_modifiers = [
+        "remix", "rmx", "slowed", "super slowed", "sped up", "speed up",
+        "nightcore", "daycore", "reverb", "lyrics", "текст", "караоке", "karaoke",
+        "instrumental", "минус", "минусовка", "reaction", "реакция", "разбор",
+        "cover", "кавер", "live", "лайв", "концерт", "bass boosted", "8d", "16d",
+        "parody", "пародия", "family guy", "meme", "edit"
+    ]
+    user_requested = {m for m in unwanted_modifiers if m in q_lower}
+    for mod in unwanted_modifiers:
+        if mod in title_lower and mod not in user_requested:
+            score -= 400.0
+
+    # 4. Адекватный хронометраж для песни (2–5 минут)
+    if item.duration:
+        if 120 <= item.duration <= 320:
+            score += 100.0
+        elif item.duration < 60:
+            score -= 300.0  # Слишком короткий отрывок/превью
+        elif item.duration > 600:
+            score -= 500.0  # Слишком длинное видео
+
+    # 5. Семантическое соответствие ключевым словам названия
+    core_words = extract_core_title_words(query)
+    if core_words:
+        ratio = compute_title_match_ratio(item.title, core_words)
+        score += ratio * 350.0
+
+    return score
+
+
 def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
     """Синхронно получает легковесные метаданные кандидатов поиска."""
     opts = {
@@ -97,11 +166,9 @@ def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
 
                 raw_title = e.get("title") or ""
                 title = unicodedata.normalize("NFC", raw_title).strip()
-                # Унифицируем фигурные кавычки и апострофы
                 title = title.replace("’", "'").replace("‘", "'").replace("`", "'")
 
                 dur = int(e.get("duration") or 0)
-                # Фильтруем длинные видео (> 15 мин), если пользователь не искал альбом/микс
                 q_lower = query.lower()
                 if dur > 900 and not any(k in q_lower for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
                     continue
@@ -120,12 +187,11 @@ def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
     return raw_items
 
 
-def search_tracks_sync(query: str, limit: int = 30) -> List[SearchItem]:
-    """Параллельный опрос YouTube и SoundCloud с дедупликацией."""
-    q_norm = unicodedata.normalize("NFC", query).strip()
+def _search_and_rank(query: str, limit: int = 30) -> List[SearchItem]:
+    """Выполняет поиск по источникам и ранжирует так, чтобы оригинал был всегда первым."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f_yt = executor.submit(_extract_source_items, "yt", q_norm, 20)
-        f_sc = executor.submit(_extract_source_items, "sc", q_norm, 15)
+        f_yt = executor.submit(_extract_source_items, "yt", query, 20)
+        f_sc = executor.submit(_extract_source_items, "sc", query, 15)
         yt_raw = f_yt.result()
         sc_raw = f_sc.result()
 
@@ -133,18 +199,15 @@ def search_tracks_sync(query: str, limit: int = 30) -> List[SearchItem]:
     combined: List[SearchItem] = []
 
     def _sig(title: str, dur: int) -> str:
-        # Упрощенная сигнатура для исключения явных дубликатов
         clean = "".join(c for c in title.lower() if c.isalnum())
         return f"{clean}_{dur // 5}"
 
-    # Приоритет 1: результаты YouTube
-    for r in yt_raw:
+    for r in yt_raw + sc_raw:
         sig = _sig(r["title"], r["duration"])
         if sig not in seen_signatures:
             seen_signatures.add(sig)
-            idx = len(combined) + 1
             combined.append(SearchItem(
-                index=idx,
+                index=0,
                 title=r["title"],
                 uploader=r["uploader"],
                 duration=r["duration"],
@@ -153,26 +216,51 @@ def search_tracks_sync(query: str, limit: int = 30) -> List[SearchItem]:
                 thumbnail=r["thumbnail"]
             ))
 
-    # Приоритет 2: результаты SoundCloud
-    for r in sc_raw:
-        sig = _sig(r["title"], r["duration"])
-        if sig not in seen_signatures:
-            seen_signatures.add(sig)
-            idx = len(combined) + 1
-            combined.append(SearchItem(
-                index=idx,
-                title=r["title"],
-                uploader=r["uploader"],
-                duration=r["duration"],
-                url=r["url"],
-                source=r["source"],
-                thumbnail=r["thumbnail"]
-            ))
-
-    return combined[:limit]
+    # Сортируем: оригинал ВСЕГДА на 1 месте!
+    ranked = sorted(combined, key=lambda it: _score_search_item(it, query), reverse=True)
+    for i, it in enumerate(ranked):
+        it.index = i + 1
+    return ranked[:limit]
 
 
-async def search_tracks_async(query: str, limit: int = 30) -> List[SearchItem]:
+def search_tracks_sync(query: str, limit: int = 30) -> Tuple[List[SearchItem], Optional[str]]:
+    """
+    Параллельный опрос YouTube и SoundCloud с дедупликацией.
+    Всегда выводит оригинал первым.
+    В САМУЮ ПОСЛЕДНЮЮ ОЧЕРЕДЬ: при 0 результатов пробует конвертацию раскладки и нечёткий поиск.
+    Возвращает (items, corrected_query_or_none).
+    """
+    q_norm = unicodedata.normalize("NFC", query).strip()
+    # 1. Основной поиск по исходному запросу
+    items = _search_and_rank(q_norm, limit)
+    if items:
+        return items, None
+
+    # -------------------------------------------------------------
+    # ТОЛЬКО В САМУЮ ПОСЛЕДНЮЮ ОЧЕРЕДЬ: если основной поиск вернул 0 результатов
+    # -------------------------------------------------------------
+    # Попытка 1: инвертированная раскладка клавиатуры (RU <-> EN)
+    flipped = convert_keyboard_layout(q_norm)
+    if flipped.lower() != q_norm.lower():
+        logger.info("Основной поиск '%s' пуст. Пробуем раскладку: '%s'", q_norm, flipped)
+        items = _search_and_rank(flipped, limit)
+        if items:
+            return items, flipped
+
+    # Попытка 2: нечёткий / расслабленный поиск по ключевым значимым словам
+    words = q_norm.split()
+    if len(words) >= 2:
+        relaxed = " ".join(w for w in words if len(w) >= 3)
+        if relaxed and relaxed.lower() != q_norm.lower():
+            logger.info("Поиск '%s' пуст. Пробуем relaxed запрос: '%s'", q_norm, relaxed)
+            items = _search_and_rank(relaxed, limit)
+            if items:
+                return items, relaxed
+
+    return [], None
+
+
+async def search_tracks_async(query: str, limit: int = 30) -> Tuple[List[SearchItem], Optional[str]]:
     """Асинхронная обертка над поиском треков."""
     return await asyncio.to_thread(search_tracks_sync, query, limit)
 

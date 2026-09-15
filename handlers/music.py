@@ -337,7 +337,7 @@ async def handle_music_request(message: Message):
         )
         try:
             print(f"[MUSIC][request_id={req_id}] search query='{user_text}'", flush=True)
-            items = await search_tracks_async(user_text, limit=30)
+            items, corrected_query = await search_tracks_async(user_text, limit=30)
             if not items:
                 await status_msg.edit_text(
                     f"❌ <b>По запросу «{html.escape(user_text)}» ничего не найдено.</b>\n"
@@ -346,10 +346,13 @@ async def handle_music_request(message: Message):
                 )
                 return
 
-            session_id = search_cache.save(user_text, items)
-            text, keyboard = render_search_page(session_id, user_text, items, page=0)
+            display_query = corrected_query if corrected_query else user_text
+            session_id = search_cache.save(display_query, items)
+            text, keyboard = render_search_page(session_id, display_query, items, page=0)
+            if corrected_query:
+                text = f"💡 <i>Показаны результаты для:</i> <b>{html.escape(corrected_query)}</b>\n\n" + text
             await status_msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-            print(f"[MUSIC][request_id={req_id}] search SUCCESS found={len(items)} session={session_id}", flush=True)
+            print(f"[MUSIC][request_id={req_id}] search SUCCESS found={len(items)} session={session_id} corrected={corrected_query}", flush=True)
 
         except Exception as e:
             print(f"[MUSIC][request_id={req_id}] ERROR at text search: {e}\n{traceback.format_exc()}", flush=True)
