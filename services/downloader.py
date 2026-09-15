@@ -266,7 +266,8 @@ def _sync_download(
     expected_duration: Optional[int] = None,
     request_id: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
-    is_apple_music: bool = False
+    is_apple_music: bool = False,
+    is_text_input: bool = False
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
@@ -390,15 +391,15 @@ def _sync_download(
                 core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
 
             import concurrent.futures
-            if is_apple_music:
-                # Для Apple Music: ищем официальные студийные дорожки Topic и чистый аудиопоток
+            if is_apple_music or is_text_input:
+                # Для Apple Music и текстовых запросов: ищем официальные студийные дорожки Topic и чистый аудиопоток
                 search_tasks = [
                     ("youtube", f"ytsearch3:{clean_search} Topic"),
                     ("youtube", f"ytsearch3:{clean_search}"),
                     ("soundcloud", f"scsearch3:{clean_search}")
                 ]
             else:
-                # Для ВСЕХ остальных платформ (Spotify, YouTube, SoundCloud, текст) - ультрабыстрый минимальный опрос
+                # Для ссылок на другие платформы (Spotify, YouTube, SoundCloud) - ультрабыстрый минимальный опрос
                 search_tasks = [
                     ("youtube", f"ytsearch3:{clean_search}"),
                     ("soundcloud", f"scsearch3:{clean_search}")
@@ -470,7 +471,8 @@ def _sync_download(
                         penalty += 3500.0
 
                 cand_text = f"{cand_title} {cand_uploader} {cand_channel}"
-                cand_modifiers = extract_modifiers(cand_text)
+                ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
+                cand_modifiers = extract_modifiers(cand_text, ignore_words=ignore_cand_words)
 
                 if is_apple_music:
                     if requested_modifiers:
@@ -535,8 +537,62 @@ def _sync_download(
                                 penalty += 250.0
                         else:
                             penalty += 250.0
+                elif is_text_input:
+                    # Логика ИСКЛЮЧИТЕЛЬНО для текстового ввода (пользователь написал автора и название трека текстом):
+                    if requested_modifiers:
+                        matching = requested_modifiers & cand_modifiers
+                        if matching:
+                            penalty -= 150.0 * len(matching)
+                        else:
+                            penalty += 200.0
+                    else:
+                        # Пользователь искал оригинальный трек текстом:
+                        # Любые ремиксы, драмки (drum edit, drums, dnb), каверы, бутлеги, замедления категорически штрафуются (+4000.0)
+                        if cand_modifiers:
+                            penalty += 4000.0
+
+                    if expected_duration:
+                        diff = abs(dur - expected_duration)
+                        if not requested_modifiers:
+                            if diff <= 4:
+                                penalty -= 120.0
+                            elif diff <= 8:
+                                penalty -= 40.0
+                            elif diff <= 15:
+                                penalty += diff * 5.0
+                            elif diff <= 25:
+                                penalty += 150.0 + (diff * 10.0)
+                            else:
+                                penalty += 1000.0 + (diff * 15.0)
+                        else:
+                            if diff <= 8:
+                                penalty -= 60.0
+                            elif diff <= 20:
+                                penalty -= 20.0
+                            elif diff <= 45:
+                                penalty += diff * 5.0
+                            else:
+                                penalty += 300.0 + (diff * 10.0)
+                    elif dur > 0:
+                        if dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
+                            penalty += 2500.0
+                        elif dur >= 45:
+                            penalty += 0.0
+                        else:
+                            penalty += 100.0 + (45 - dur) * 10.0
+
+                    cand_src = e.get("_source") or source
+                    if cand_src == "youtube":
+                        is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
+                        if is_topic:
+                            penalty -= 350.0  # Официальный студийный релиз лейбла - абсолютный приоритет
+                        elif "vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel:
+                            penalty -= 150.0
+                    elif cand_src == "soundcloud":
+                        # Любительские аплоады SoundCloud с самодельными драмками не должны выигрывать у официального YouTube Topic
+                        penalty += 300.0
                 else:
-                    # Для ВСЕХ остальных платформ (Spotify, YouTube, SoundCloud, VK, текст) - стандартный скоринг v2.9.2
+                    # Для ссылок на другие платформы (Spotify, YouTube, SoundCloud, VK) - стандартный скоринг v2.9.2
                     if requested_modifiers:
                         matching = requested_modifiers & cand_modifiers
                         if matching:
@@ -682,12 +738,16 @@ def _sync_download(
 
                     # 2. Проверяем модификаторы и при необходимости восстанавливаем студийный темп/тональность
                     cand_text = f"{cand_entry_title} {selected_entry.get('uploader') or ''}".lower()
-                    cand_modifiers = extract_modifiers(cand_text)
+                    ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
+                    cand_modifiers = extract_modifiers(cand_text, ignore_words=ignore_cand_words)
 
-                    # Если пользователь искал оригинал Apple Music, а кандидат содержит несовместимые модификаторы (remix, cover, live, instrumental):
+                    # Если пользователь искал оригинал Apple Music или по тексту, а кандидат содержит несовместимые модификаторы (remix, drum edit, cover, live, instrumental):
                     # Отклоняем!
-                    if is_apple_music and not requested_modifiers and cand_modifiers:
-                        other_mods = cand_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                    if (is_apple_music or is_text_input) and not requested_modifiers and cand_modifiers:
+                        if is_apple_music:
+                            other_mods = cand_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                        else:
+                            other_mods = cand_modifiers
                         if other_mods:
                             print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {other_mods}. Отклоняем.", flush=True)
                             for temp_f in output_dir.iterdir():
@@ -827,10 +887,13 @@ def _sync_download(
                                             res_info["duration"] = restored_dur
                                     diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
                                     retry_title = unicodedata.normalize("NFC", res_info.get("title") or cand_title or "")
-                                    retry_mods = extract_modifiers(f"{retry_title} {selected_entry.get('uploader') or ''}")
-                                    retry_other_mods = retry_mods - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                                    retry_mods = extract_modifiers(f"{retry_title} {selected_entry.get('uploader') or ''}", ignore_words=ignore_cand_words)
+                                    if is_apple_music:
+                                        retry_other_mods = retry_mods - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                                    else:
+                                        retry_other_mods = retry_mods
                                     dur_ok = not expected_duration or (diff <= 4 if is_apple_music else diff <= 25) or (requested_modifiers and diff <= 45)
-                                    if (requested_modifiers or not is_apple_music or not retry_other_mods) and dur_ok:
+                                    if (requested_modifiers or (not is_apple_music and not is_text_input) or not retry_other_mods) and dur_ok:
                                         print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
                                         return res_info
                             except Exception as sub_retry_err:
@@ -884,11 +947,14 @@ def _sync_download(
                             for s_cand in sc_ranked:
                                 s_url = s_cand.get("webpage_url") or s_cand.get("url")
                                 s_title = unicodedata.normalize("NFC", s_cand.get("title") or "")
-                                s_mods = extract_modifiers(f"{s_title} {s_cand.get('uploader') or ''}")
+                                s_mods = extract_modifiers(f"{s_title} {s_cand.get('uploader') or ''}", ignore_words=ignore_cand_words)
                                 s_dur = s_cand.get("duration") or 0
                                 s_diff = abs(s_dur - expected_duration) if (expected_duration and expected_duration > 35 and s_dur > 0) else 0
-                                s_other_mods = s_mods - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
-                                if is_apple_music and not requested_modifiers and s_other_mods:
+                                if is_apple_music:
+                                    s_other_mods = s_mods - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                                else:
+                                    s_other_mods = s_mods
+                                if (is_apple_music or is_text_input) and not requested_modifiers and s_other_mods:
                                     continue
                                 if is_apple_music and expected_duration and not requested_modifiers and s_diff > 35:
                                     continue
@@ -1158,7 +1224,8 @@ async def download_track(
     bitrate: str = DEFAULT_AUDIO_BITRATE,
     expected_duration: Optional[int] = None,
     request_id: Optional[str] = None,
-    is_apple_music: bool = False
+    is_apple_music: bool = False,
+    is_text_input: bool = False
 ) -> DownloadedAudio:
     """
     Асинхронная функция загрузки трека в MP3.
@@ -1189,7 +1256,8 @@ async def download_track(
             expected_duration,
             request_id,
             cancel_event,
-            is_apple_music
+            is_apple_music,
+            is_text_input
         )
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
