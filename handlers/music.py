@@ -38,7 +38,8 @@ from services.database import (
     log_user_activity_async,
     increment_user_download_async,
     get_cached_track_async,
-    save_cached_track_async
+    save_cached_track_async,
+    delete_cached_track_async
 )
 from handlers.tag_editor import get_audio_edit_keyboard
 
@@ -338,39 +339,9 @@ async def _execute_download_and_send(
     else:
         cache_key = raw_query.lower()
 
-    # ⚡ Шаг 0: Мгновенная отдача из двух-уровневого кэша L1 (RAM) / L2 (SQLite)
-    t_c0 = time.perf_counter()
-    cached = await get_cached_track_async(cache_key)
-    t_cache = time.perf_counter() - t_c0
-
-    if cached:
-        print(f"[MUSIC][request_id={req_id}] cache lookup HIT in {t_cache*1000:.2f}ms", flush=True)
-        try:
-            t_u0 = time.perf_counter()
-            await message.answer_audio(
-                audio=cached["file_id"],
-                title=cached.get("title") or (custom_title or "Unknown Track"),
-                performer=cached.get("artist") or (custom_artist or "Unknown Artist"),
-                duration=cached.get("duration") or 0,
-                reply_markup=get_audio_edit_keyboard()
-            )
-            t_telegram = time.perf_counter() - t_u0
-            if message.from_user:
-                await increment_user_download_async(message.from_user.id)
-            t_total_cache = time.perf_counter() - t_req_start
-            print(
-                f"[PERF][request_id={req_id}] cache_lookup={t_cache:.3f}s telegram_upload={t_telegram:.3f}s TOTAL={t_total_cache:.3f}s (CACHE_HIT)",
-                flush=True
-            )
-            return
-        except Exception as cache_err:
-            print(f"[MUSIC][request_id={req_id}] cache send failed, falling back to live download: {cache_err}", flush=True)
-            logger.warning("Кэшированный file_id устарел или недоступен: %s", cache_err)
-    else:
-        print(f"[MUSIC][request_id={req_id}] cache lookup MISS in {t_cache*1000:.2f}ms", flush=True)
-
     downloaded_audio = None
     t_cleanup = 0.0
+    status_msg = None
     try:
         t_m0 = time.perf_counter()
         if url:
@@ -418,12 +389,62 @@ async def _execute_download_and_send(
         t_metadata = time.perf_counter() - t_m0
         print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}'", flush=True)
 
+        # ⚡ Шаг 0: Проверка в двух-уровневом кэше L1 (RAM) / L2 (SQLite) с проверкой точности хронометража
+        t_c0 = time.perf_counter()
+        cached = await get_cached_track_async(cache_key)
+        if not cached and track_info.artist and track_info.title:
+            cached = await get_cached_track_async(f"{track_info.artist} - {track_info.title}".lower())
+        t_cache = time.perf_counter() - t_c0
+
+        if cached:
+            cached_dur = cached.get("duration") or 0
+            # Если официальный хронометраж известен, проверяем, не был ли старый кэшированный трек замедленным/искаженным
+            if track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 2:
+                print(
+                    f"[MUSIC][request_id={req_id}] cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging stale cache.",
+                    flush=True
+                )
+                await delete_cached_track_async(cache_key)
+                if track_info.artist and track_info.title:
+                    await delete_cached_track_async(f"{track_info.artist} - {track_info.title}".lower())
+                    await delete_cached_track_async(f"{track_info.artist} {track_info.title}".lower())
+                cached = None
+            else:
+                print(f"[MUSIC][request_id={req_id}] cache lookup HIT in {t_cache*1000:.2f}ms (duration={cached_dur}s)", flush=True)
+                try:
+                    if status_msg:
+                        try:
+                            await status_msg.delete()
+                        except Exception:
+                            pass
+                    t_u0 = time.perf_counter()
+                    await message.answer_audio(
+                        audio=cached["file_id"],
+                        title=cached.get("title") or (track_info.title or custom_title or "Unknown Track"),
+                        performer=cached.get("artist") or (track_info.artist or custom_artist or "Unknown Artist"),
+                        duration=cached_dur,
+                        reply_markup=get_audio_edit_keyboard()
+                    )
+                    t_telegram = time.perf_counter() - t_u0
+                    if message.from_user:
+                        await increment_user_download_async(message.from_user.id)
+                    t_total_cache = time.perf_counter() - t_req_start
+                    print(
+                        f"[PERF][request_id={req_id}] cache_lookup={t_cache:.3f}s telegram_upload={t_telegram:.3f}s TOTAL={t_total_cache:.3f}s (CACHE_HIT)",
+                        flush=True
+                    )
+                    return
+                except Exception as cache_err:
+                    print(f"[MUSIC][request_id={req_id}] cache send failed, falling back to live download: {cache_err}", flush=True)
+                    logger.warning("Кэшированный file_id устарел или недоступен: %s", cache_err)
+
         platform_label = f"\nПлатформа: <b>{track_info.platform}</b>" if track_info.platform and "Search" not in track_info.platform else ""
-        await status_msg.edit_text(
-            f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>{platform_label}\n"
-            f"<i>Загрузка аудиопотока...</i>",
-            parse_mode="HTML"
-        )
+        if status_msg:
+            await status_msg.edit_text(
+                f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>{platform_label}\n"
+                f"<i>Загрузка аудиопотока...</i>",
+                parse_mode="HTML"
+            )
 
         print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}'", flush=True)
         try:

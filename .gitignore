@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 venv/
 .env
-cookies.txt
+# cookies.txt included for deployment
 *.db
 bot_database.db
 

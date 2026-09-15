@@ -92,6 +92,61 @@ def _apply_audio_modifier_if_needed(audio_path: Path, requested_modifiers: set, 
     return 0
 
 
+def _restore_studio_speed_and_pitch_if_needed(
+    audio_path: Path,
+    expected_duration: Optional[int],
+    requested_modifiers: set,
+    actual_dur: int,
+    req_tag: str = ""
+) -> int:
+    """
+    Если пользователь ищет оригинальный трек (not requested_modifiers) с известным официальным хронометражем
+    (например, ссылка Apple Music / Spotify), а скачанный трек (например, из SoundCloud для обхода Content ID)
+    был искусственно замедлен или ускорен на 2-35 секунд (0.85 <= actual/expected <= 1.15):
+    применяем обратный фильтр FFmpeg asetrate/aresample, восстанавливая оригинальную студийную скорость,
+    тональность и точный хронометраж.
+    """
+    if not expected_duration or expected_duration <= 35 or requested_modifiers or actual_dur <= 0:
+        return actual_dur
+
+    diff = abs(actual_dur - expected_duration)
+    ratio = actual_dur / expected_duration
+    if 2 < diff <= 35 and (0.85 <= ratio <= 1.15):
+        print(
+            f"{req_tag}[RESTORATION] Обнаружено отклонение скорости/тональности: {actual_dur}s vs {expected_duration}s "
+            f"(ratio={ratio:.4f}, diff={diff}s). Восстанавливаем оригинальную 1.0x студийную скорость...",
+            flush=True
+        )
+        temp_out = audio_path.with_name(f"restored_{audio_path.name}")
+        try:
+            import subprocess
+            is_m4a = audio_path.suffix.lower() == ".m4a"
+            codec_args = ["-c:a", "aac", "-b:a", "256k"] if is_m4a else ["-c:a", "libmp3lame", "-b:a", "256k"]
+            cmd = [
+                "ffmpeg", "-y", "-i", str(audio_path),
+                "-filter:a", f"asetrate=44100*{ratio:.6f},aresample=44100",
+                "-vn"
+            ] + codec_args + ["-threads", "0", str(temp_out)]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 1000:
+                shutil.move(temp_out, audio_path)
+                try:
+                    from mutagen import File as MutagenFile
+                    mf = MutagenFile(audio_path)
+                    if mf and mf.info and hasattr(mf.info, "length"):
+                        new_dur = int(round(mf.info.length))
+                        print(f"{req_tag}[RESTORATION] Успешно восстановлен студийный хронометраж: {new_dur}s (было {actual_dur}s)", flush=True)
+                        return new_dur
+                except Exception:
+                    pass
+                return expected_duration
+        except Exception as e:
+            print(f"{req_tag}[RESTORATION] Ошибка восстановления: {e}", flush=True)
+            if temp_out.exists():
+                temp_out.unlink(missing_ok=True)
+    return actual_dur
+
+
 def _convert_thumbnail_to_jpg(thumb_path: Path) -> Optional[Path]:
     """Конвертирует обложку в формат JPEG (требование Telegram) и сжимает при необходимости."""
     if not thumb_path or not thumb_path.exists():
@@ -289,6 +344,8 @@ def _sync_download(
                 s_opts["extract_flat"] = True
                 s_opts["noplaylist"] = True
                 s_opts["ignoreerrors"] = True
+                s_opts["socket_timeout"] = 5
+                s_opts["retries"] = 0
                 try:
                     with yt_dlp.YoutubeDL(s_opts) as ydl_s:
                         info = ydl_s.extract_info(target_q, download=False)
@@ -333,9 +390,10 @@ def _sync_download(
                 # Дополнительный точный поиск в SoundCloud по имени артиста и ключевым словам названия
                 search_tasks.append(("soundcloud", f"scsearch3:{custom_artist} {clean_core_title}"))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks)) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks))
+            try:
                 futures = [executor.submit(_fetch_candidates, q, src) for src, q in search_tasks]
-                done, not_done = concurrent.futures.wait(futures, timeout=6.0)
+                done, not_done = concurrent.futures.wait(futures, timeout=5.0)
                 for f in done:
                     try:
                         res = f.result()
@@ -343,6 +401,8 @@ def _sync_download(
                             entries.extend(res)
                     except Exception:
                         pass
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             t_s1 = time.perf_counter()
             dur_s = t_s1 - t_s0
@@ -402,23 +462,30 @@ def _sync_download(
                         penalty += 200.0  # Обычные студийные версии уступают искомой модификации
                 else:
                     # Пользователь ищет оригинальный студийный трек без модификаций:
-                    # Любой сторонний модификатор (slowed, sped up, remix, reverb, cover, edit) — категорически нежелателен!
+                    # Чистые студийные версии без модификаторов всегда в приоритете (-150).
+                    # Модификаторы темпа (slowed/sped up) штрафуются на +600 (уступают чистым оригиналам, но сохраняются как fallback для восстановления),
+                    # а несовместимые модификаторы (remix, cover, live, instrumental) штрафуются на +4000.
                     if cand_modifiers:
-                        penalty += 5000.0
+                        tempo_mods = cand_modifiers & {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                        other_mods = cand_modifiers - tempo_mods
+                        if other_mods:
+                            penalty += 4000.0
+                        else:
+                            penalty += 600.0
 
                 # Оценка соответствия длительности
                 if expected_duration:
                     diff = abs(dur - expected_duration)
                     if not requested_modifiers:
-                        if diff <= 3:
-                            penalty -= 100.0
-                        elif diff <= 6:
-                            penalty -= 40.0
+                        if diff <= 2:
+                            penalty -= 150.0
+                        elif diff <= 5:
+                            penalty -= 60.0
                         elif diff <= 10:
-                            penalty += 200.0 + (diff * 15.0)
+                            penalty += 150.0 + (diff * 10.0)
                         else:
-                            # Разница более 10 секунд для оригинала с известным хронометражем — признак чужого трека или замедления
-                            penalty += 2500.0 + (diff * 30.0)
+                            # Разница более 10 секунд для оригинала с известным хронометражем
+                            penalty += 1500.0 + (diff * 20.0)
                     else:
                         # Запрашивалась модификация с известным хронометражем (например ссылка Spotify на Slowed)
                         if diff <= 8:
@@ -542,36 +609,56 @@ def _sync_download(
                                     pass
                         continue
 
-                    # 2. Проверяем модификаторы и при необходимости применяем программный фильтр (slowed/sped up)
+                    # 2. Проверяем модификаторы и при необходимости восстанавливаем студийный темп/тональность
                     cand_text = f"{cand_entry_title} {selected_entry.get('uploader') or ''}".lower()
                     cand_modifiers = extract_modifiers(cand_text)
 
-                    # Если пользователь искал оригинал, а кандидат содержит сторонние модификаторы (slowed, sped up, remix, reverb...),
-                    # КАТЕГОРИЧЕСКИ отклоняем его!
+                    # Если пользователь искал оригинал, а кандидат содержит несовместимые модификаторы (remix, cover, live, instrumental):
+                    # Отклоняем!
                     if not requested_modifiers and cand_modifiers:
-                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {cand_modifiers}. Отклоняем.", flush=True)
-                        for temp_f in output_dir.iterdir():
-                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                try:
-                                    temp_f.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
-                        continue
+                        other_mods = cand_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                        if other_mods:
+                            print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {other_mods}. Отклоняем.", flush=True)
+                            for temp_f in output_dir.iterdir():
+                                if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                    try:
+                                        temp_f.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                            continue
 
                     new_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, cand_modifiers, req_tag)
                     if new_dur > 0:
                         actual_dur = new_dur
                         res_info["duration"] = new_dur
 
-                    # 3. Проверяем допустимость хронометража:
+                    # 3. Восстановление оригинальной 1.0x студийной скорости и тональности (для Apple Music / Spotify и SoundCloud Content ID bypass)
+                    if not requested_modifiers and expected_duration and expected_duration > 35:
+                        restored_dur = _restore_studio_speed_and_pitch_if_needed(
+                            audio_files[0],
+                            expected_duration=expected_duration,
+                            requested_modifiers=requested_modifiers,
+                            actual_dur=actual_dur,
+                            req_tag=req_tag
+                        )
+                        if restored_dur > 0 and restored_dur != actual_dur:
+                            actual_dur = restored_dur
+                            res_info["duration"] = restored_dur
+                            # Очищаем название от меток замедления, если они были
+                            clean_t = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', cand_entry_title, flags=re.IGNORECASE).strip()
+                            if clean_t:
+                                cand_entry_title = clean_t
+                                res_info["title"] = clean_t
+
+                    # 4. Проверяем допустимость хронометража:
                     diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
                     is_duration_acceptable = False
                     if not expected_duration:
                         is_duration_acceptable = True
                     elif requested_modifiers and diff <= 45:
                         is_duration_acceptable = True
-                    elif not requested_modifiers and diff <= 6:
-                        # Для оригинальных студийных треков допуск максимум 6 секунд (вводная/финальная тишина клипа)
+                    elif not requested_modifiers and diff <= 4:
+                        # Для оригинальных студийных треков допуск максимум 4 секунды
                         is_duration_acceptable = True
 
                     if is_duration_acceptable and (not core_title_words or cand_match_ratio >= 0.5):
@@ -647,10 +734,16 @@ def _sync_download(
                                 audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
                                 if audio_files:
                                     actual_dur = int(res_info.get("duration") or 0)
+                                    if not requested_modifiers and expected_duration and expected_duration > 35:
+                                        restored_dur = _restore_studio_speed_and_pitch_if_needed(audio_files[0], expected_duration, requested_modifiers, actual_dur, req_tag)
+                                        if restored_dur > 0 and restored_dur != actual_dur:
+                                            actual_dur = restored_dur
+                                            res_info["duration"] = restored_dur
                                     diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
                                     retry_title = unicodedata.normalize("NFC", res_info.get("title") or cand_title or "")
                                     retry_mods = extract_modifiers(f"{retry_title} {selected_entry.get('uploader') or ''}")
-                                    if (requested_modifiers or not retry_mods) and (not expected_duration or diff <= 6 or (requested_modifiers and diff <= 45)):
+                                    retry_other_mods = retry_mods - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                                    if (requested_modifiers or not retry_other_mods) and (not expected_duration or diff <= 4 or (requested_modifiers and diff <= 45)):
                                         print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
                                         return res_info
                             except Exception as sub_retry_err:
@@ -707,9 +800,10 @@ def _sync_download(
                                 s_mods = extract_modifiers(f"{s_title} {s_cand.get('uploader') or ''}")
                                 s_dur = s_cand.get("duration") or 0
                                 s_diff = abs(s_dur - expected_duration) if (expected_duration and expected_duration > 35 and s_dur > 0) else 0
-                                if not requested_modifiers and s_mods:
+                                s_other_mods = s_mods - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                                if not requested_modifiers and s_other_mods:
                                     continue
-                                if expected_duration and not requested_modifiers and s_diff > 12:
+                                if expected_duration and not requested_modifiers and s_diff > 35:
                                     continue
                                 if s_url:
                                     sc_opts_dl = dict(options)
@@ -719,6 +813,16 @@ def _sync_download(
                                     try:
                                         with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
                                             res_cand = ydl_sc_dl.extract_info(s_url, download=True)
+                                            audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
+                                            if audio_files:
+                                                sc_dur = int(res_cand.get("duration") or 0)
+                                                if not requested_modifiers and expected_duration and expected_duration > 35:
+                                                    restored_dur = _restore_studio_speed_and_pitch_if_needed(audio_files[0], expected_duration, requested_modifiers, sc_dur, req_tag)
+                                                    if restored_dur > 0 and restored_dur != sc_dur:
+                                                        res_cand["duration"] = restored_dur
+                                                        clean_st = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', s_title, flags=re.IGNORECASE).strip()
+                                                        if clean_st:
+                                                            res_cand["title"] = clean_st
                                             return res_cand
                                     except Exception as s_err:
                                         print(f"{req_tag}[DOWNLOADER] SoundCloud fallback candidate '{s_url}' не удался: {s_err}", flush=True)
