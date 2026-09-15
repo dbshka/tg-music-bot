@@ -295,7 +295,33 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         # Валидный кэш принимается мгновенно (diff = 0 <= 2)
         self.assertLessEqual(abs(fresh_cached_dur - expected_duration), 2)
 
+    def test_drum_modifier_detection(self):
+        """Проверяет распознавание драм-ремиксов и учет ignore_words"""
+        from services.extractor import extract_modifiers
+
+        # Ремиксы с драмкой
+        mods1 = extract_modifiers("Song Name (Drum Edit)")
+        self.assertIn("drum edit", mods1)
+
+        mods2 = extract_modifiers("Song Name (with drums)")
+        self.assertTrue("with drums" in mods2 or "drums" in mods2)
+
+        mods3 = extract_modifiers("Artist - Title (Drum Remix)")
+        self.assertIn("drum remix", mods3)
+
+        mods4 = extract_modifiers("Artist - Title (DNB Flip)")
+        self.assertIn("dnb", mods4)
+
+        mods5 = extract_modifiers("Artist - Title (ремикс с драмкой)")
+        self.assertTrue("ремикс" in mods5 or "с драмкой" in mods5 or "драмка" in mods5)
+
+        # Если в оригинальном названии есть слово drums (группа The Drums), оно игнорируется
+        ignore = {"the", "drums", "money"}
+        mods_legit = extract_modifiers("The Drums - Money", ignore_words=ignore)
+        self.assertEqual(len(mods_legit), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

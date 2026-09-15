@@ -397,6 +397,7 @@ async def _execute_download_and_send(
         t_cache = time.perf_counter() - t_c0
 
         is_apple_music = bool(track_info and track_info.platform == "Apple Music")
+        is_text_input = bool(not url)
 
         if cached:
             cached_dur = cached.get("duration") or 0
@@ -448,7 +449,7 @@ async def _execute_download_and_send(
                 parse_mode="HTML"
             )
 
-        print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}' is_apple_music={is_apple_music}", flush=True)
+        print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}' is_apple_music={is_apple_music} is_text_input={is_text_input}", flush=True)
         try:
             async with DOWNLOAD_SEMAPHORE:
                 async with ChatActionSender.upload_voice(bot=message.bot, chat_id=message.chat.id):
@@ -459,7 +460,8 @@ async def _execute_download_and_send(
                         thumbnail_url=track_info.thumbnail_url,
                         expected_duration=track_info.duration,
                         request_id=req_id,
-                        is_apple_music=is_apple_music
+                        is_apple_music=is_apple_music,
+                        is_text_input=is_text_input
                     )
         except Exception as dl_err:
             fallback_query = None
@@ -490,7 +492,8 @@ async def _execute_download_and_send(
                             thumbnail_url=track_info.thumbnail_url,
                             expected_duration=track_info.duration,
                             request_id=f"{req_id}_fb",
-                            is_apple_music=is_apple_music
+                            is_apple_music=is_apple_music,
+                            is_text_input=is_text_input
                         )
             else:
                 raise dl_err

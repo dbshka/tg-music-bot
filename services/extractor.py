@@ -116,7 +116,12 @@ TRACK_MODIFIERS = {
     "cover", "кавер", "acoustic", "акустика", "piano", "пианино",
     "acapella", "a cappella", "акапелла", "live", "лайв", "концерт",
     "8d", "16d", "nightcore", "daycore", "instrumental", "инструментал", "minus", "минус",
-    "edit", "fan edit", "karaoke", "караоке", "orchestral", "orchestra", "tribute"
+    "edit", "fan edit", "karaoke", "караоке", "orchestral", "orchestra", "tribute",
+    "drum edit", "drum cover", "drum version", "drum rework", "drum remix", "drum beat",
+    "with drums", "with drum", "drums version", "drum and bass", "drum & bass", "dnb",
+    "драмка", "с драмкой", "с барабанами", "днб",
+    "rework", "drill", "дрил", "дрилл", "phonk", "фонк", "jersey club",
+    "club mix", "club edit", "club version", "bass boost", "bass boosted", "808", "type beat"
 }
 
 # Таблицы для конвертации раскладки клавиатуры RU <-> EN
@@ -137,22 +142,31 @@ def convert_keyboard_layout(text: str) -> str:
     return text
 
 
-def extract_modifiers(text: Optional[str]) -> set[str]:
+def extract_modifiers(text: Optional[str], ignore_words: Optional[set[str]] = None) -> set[str]:
     """Извлекает набор модификаторов трека с учетом границ слов и NFC-нормализации."""
     if not text:
         return set()
     norm = unicodedata.normalize("NFC", text).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
     found = set()
+    norm_ignores = {w.lower() for w in ignore_words} if ignore_words else set()
     for mod in TRACK_MODIFIERS:
         pattern = r'(?<!\w)' + re.escape(mod) + r'(?!\w)'
         if re.search(pattern, norm):
+            if norm_ignores and mod in norm_ignores:
+                continue
             found.add(mod)
+
+    # Проверяем одиночные слова drum/drums/барабаны, если они не являются частью оригинального названия трека или артиста
+    if not ("drum" in norm_ignores or "drums" in norm_ignores or "барабаны" in norm_ignores):
+        if re.search(r'(?<!\w)(?:drums?|барабан[ыа]?)(?!\w)', norm):
+            found.add("drums")
+
     return found
 
 
-def has_track_modifiers(text: Optional[str]) -> bool:
+def has_track_modifiers(text: Optional[str], ignore_words: Optional[set[str]] = None) -> bool:
     """Проверяет наличие любых модификаторов в строке."""
-    return bool(extract_modifiers(text))
+    return bool(extract_modifiers(text, ignore_words=ignore_words))
 
 
 TRANSLIT_TABLE = {
