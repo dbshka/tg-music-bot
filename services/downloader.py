@@ -272,13 +272,29 @@ def _sync_download(
                     print(f"{req_tag}[SEARCH] Ошибка поиска {src_name}: {ex}", flush=True)
                     return []
 
+            # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
+            req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
+            requested_modifiers = {mod for mod in TRACK_MODIFIERS if mod in req_context}
+
+            # Ключевые слова названия трека для семантической проверки
+            core_title_words = extract_core_title_words(custom_title or clean_search, custom_artist)
+            if not core_title_words and custom_title:
+                core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
+
             import concurrent.futures
             # Запускаем YouTube и SoundCloud параллельно с расширенным пулом кандидатов
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                f_yt = executor.submit(_fetch_candidates, f"ytsearch5:{clean_search}", "youtube")
-                f_sc = executor.submit(_fetch_candidates, f"scsearch4:{clean_search}", "soundcloud")
+            search_tasks = [
+                ("youtube", f"ytsearch5:{clean_search}"),
+                ("soundcloud", f"scsearch4:{clean_search}")
+            ]
+            clean_core_title = " ".join(core_title_words) if core_title_words else ""
+            if clean_core_title and custom_artist and requested_modifiers:
+                # Дополнительный точный поиск в SoundCloud по имени артиста и ключевым словам названия
+                search_tasks.append(("soundcloud", f"scsearch3:{custom_artist} {clean_core_title}"))
 
-                done, not_done = concurrent.futures.wait([f_yt, f_sc], timeout=6.0)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks)) as executor:
+                futures = [executor.submit(_fetch_candidates, q, src) for src, q in search_tasks]
+                done, not_done = concurrent.futures.wait(futures, timeout=6.0)
                 for f in done:
                     try:
                         res = f.result()
@@ -307,15 +323,6 @@ def _sync_download(
 
             # 2. Интеллектуальный Query-Aware скоринг кандидатов
             t_c0 = time.perf_counter()
-
-            # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
-            req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
-            requested_modifiers = {mod for mod in TRACK_MODIFIERS if mod in req_context}
-
-            # Ключевые слова названия трека для семантической проверки
-            core_title_words = extract_core_title_words(custom_title or clean_search, custom_artist)
-            if not core_title_words and custom_title:
-                core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
 
             def _candidate_penalty(e):
                 cand_title = (e.get("title") or "").lower()

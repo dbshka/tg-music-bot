@@ -69,6 +69,12 @@ async def cmd_help(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
+@router.message(Command("version"))
+async def cmd_version(message: Message):
+    from config import BOT_VERSION
+    await message.answer(f"🤖 Версия бота: <b>v{BOT_VERSION}</b>", parse_mode="HTML")
+
+
 
 @router.message(F.text)
 async def handle_music_request(message: Message):
