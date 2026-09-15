@@ -589,8 +589,14 @@ def _sync_download(
                         elif "vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel:
                             penalty -= 150.0
                     elif cand_src == "soundcloud":
-                        # Любительские аплоады SoundCloud с самодельными драмками не должны выигрывать у официального YouTube Topic
-                        penalty += 300.0
+                        if custom_artist:
+                            ca = custom_artist.lower().strip()
+                            if ca in cand_uploader or ca.replace(" ", "") in cand_uploader.replace(" ", ""):
+                                penalty -= 50.0  # Профиль самого андеграунд-артиста на SoundCloud
+                            else:
+                                penalty += 300.0  # Сторонние аплоады уступают студийным релизам
+                        else:
+                            penalty += 300.0
                 else:
                     # Для ссылок на другие платформы (Spotify, YouTube, SoundCloud, VK) - стандартный скоринг v2.9.2
                     if requested_modifiers:
