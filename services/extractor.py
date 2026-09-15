@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -133,15 +134,17 @@ TRANSLIT_TABLE = {
 
 
 def transliterate_text(text: str) -> str:
-    """Универсальная транслитерация кириллицы в латиницу."""
-    return "".join(TRANSLIT_TABLE.get(c, c) for c in text.lower())
+    """Универсальная транслитерация кириллицы в латиницу с NFC-нормализацией."""
+    norm = unicodedata.normalize("NFC", text or "").lower()
+    return "".join(TRANSLIT_TABLE.get(c, c) for c in norm)
 
 
 def extract_core_title_words(title: Optional[str], artist: Optional[str] = None) -> set[str]:
-    """Извлекает ключевые слова названия трека без модификаторов и имени артиста."""
+    """Извлекает ключевые слова названия трека без модификаторов и имени артиста с NFC-нормализацией."""
     if not title:
         return set()
-    raw = title.lower()
+    raw = unicodedata.normalize("NFC", title).lower()
+    raw = raw.replace("’", "'").replace("‘", "'").replace("`", "'")
     # 1. Удаляем feat/ft/prod конструкции в скобках
     raw = re.sub(r'[\(\[][^\)\]]*(?:feat|ft\.|prod|prod\.)[^\)\]]*[\)\]]', ' ', raw)
     # 2. Удаляем известные модификаторы трека
@@ -149,26 +152,30 @@ def extract_core_title_words(title: Optional[str], artist: Optional[str] = None)
         raw = re.sub(r'\b' + re.escape(mod) + r'\b', ' ', raw)
     # 3. Удаляем слова артиста, если они присутствуют в названии
     if artist:
-        artist_words = set(re.findall(r'[\w]+', artist.lower()))
+        artist_norm = unicodedata.normalize("NFC", artist).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+        artist_words = set(re.findall(r'[\w]+', artist_norm))
         for aw in artist_words:
             if len(aw) >= 2:
                 raw = re.sub(r'\b' + re.escape(aw) + r'\b', ' ', raw)
     # 4. Извлекаем слова названия
     words = set(re.findall(r'[\w]+', raw))
-    return {w for w in words if len(w) >= 1}
+    return {unicodedata.normalize("NFC", w) for w in words if len(w) >= 1}
 
 
 def compute_title_match_ratio(cand_title: str, core_words: set[str]) -> float:
-    """Вычисляет коэффициент покрытия ключевых слов названия в заголовке кандидата."""
+    """Вычисляет коэффициент покрытия ключевых слов названия в заголовке кандидата с NFC-нормализацией."""
     if not core_words:
         return 1.0
-    cand_lower = (cand_title or "").lower()
+    cand_norm = unicodedata.normalize("NFC", cand_title or "").lower()
+    cand_lower = cand_norm.replace("’", "'").replace("‘", "'").replace("`", "'")
     cand_translit = transliterate_text(cand_lower)
     cand_tokens = set(re.findall(r'[\w]+', cand_lower))
     cand_tokens_translit = set(re.findall(r'[\w]+', cand_translit))
 
+    core_words_norm = {unicodedata.normalize("NFC", w).lower().replace("’", "'").replace("‘", "'").replace("`", "'") for w in core_words}
+
     matched = 0
-    for w in core_words:
+    for w in core_words_norm:
         w_translit = transliterate_text(w)
         # 1. Точное совпадение токена
         if w in cand_tokens or w_translit in cand_tokens_translit or w_translit in cand_tokens:
@@ -187,7 +194,7 @@ def compute_title_match_ratio(cand_title: str, core_words: set[str]) -> float:
                 matched += 1
                 continue
 
-    return matched / len(core_words)
+    return matched / len(core_words_norm)
 
 
 async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:

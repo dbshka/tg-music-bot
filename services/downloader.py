@@ -4,6 +4,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 import urllib.parse
 import uuid
 from dataclasses import dataclass
@@ -361,9 +362,9 @@ def _sync_download(
             t_c0 = time.perf_counter()
 
             def _candidate_penalty(e):
-                cand_title = (e.get("title") or "").lower()
-                cand_uploader = (e.get("uploader") or "").lower()
-                cand_channel = (e.get("channel") or "").lower()
+                cand_title = unicodedata.normalize("NFC", e.get("title") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+                cand_uploader = unicodedata.normalize("NFC", e.get("uploader") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+                cand_channel = unicodedata.normalize("NFC", e.get("channel") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
                 dur = e.get("duration") or 0
                 fmt_str = (str(e.get("formats", "")) + str(e.get("format_id", ""))).lower()
                 is_prev = "preview" in fmt_str or (expected_duration and expected_duration > 50 and 0 < dur <= 35)
@@ -425,7 +426,9 @@ def _sync_download(
                         else:
                             penalty += 300.0 + (diff * 10.0)
                 elif dur > 0:
-                    if dur >= 45:
+                    if dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
+                        penalty += 2500.0
+                    elif dur >= 45:
                         penalty += 0.0
                     else:
                         penalty += 100.0 + (45 - dur) * 10.0
@@ -520,7 +523,7 @@ def _sync_download(
                         except Exception:
                             pass
 
-                    cand_entry_title = res_info.get("title") or cand_title or ""
+                    cand_entry_title = unicodedata.normalize("NFC", res_info.get("title") or cand_title or "")
                     cand_match_ratio = compute_title_match_ratio(cand_entry_title, core_title_words)
 
                     # 1. Жесткая защита от неаутентичных треков: если ключевые слова названия известны,
@@ -682,9 +685,13 @@ def _sync_download(
                                     sc_opts_dl.pop("cookiefile", None)
                                     sc_opts_dl.pop("extractor_args", None)
                                     sc_opts_dl["extract_flat"] = False
-                                    with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
-                                        res_cand = ydl_sc_dl.extract_info(s_url, download=True)
-                                        return res_cand
+                                    try:
+                                        with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
+                                            res_cand = ydl_sc_dl.extract_info(s_url, download=True)
+                                            return res_cand
+                                    except Exception as s_err:
+                                        print(f"{req_tag}[DOWNLOADER] SoundCloud fallback candidate '{s_url}' не удался: {s_err}", flush=True)
+                                        continue
                 except Exception as sc_err:
                     print(f"{req_tag}[DOWNLOADER] Экстренный поиск SoundCloud не удался: {sc_err}", flush=True)
                 if last_cand_error:
