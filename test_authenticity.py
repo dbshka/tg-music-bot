@@ -161,6 +161,40 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         scored = sorted(cands, key=score)
         self.assertEqual(scored[0]["title"], "не слышу (Super Slowed)")
 
+    def test_core_title_word_extraction(self):
+        """Проверяет извлечение ключевых слов названия без модификаторов и исполнителя."""
+        from services.extractor import extract_core_title_words, compute_title_match_ratio
+
+        words_slowed = extract_core_title_words("не слышу - Super Slowed", "DJ ZUP RAlii")
+        self.assertTrue({"не", "слышу"}.issubset(words_slowed))
+        self.assertNotIn("slowed", words_slowed)
+        self.assertNotIn("super", words_slowed)
+
+        words_505 = extract_core_title_words("505", "Arctic Monkeys")
+        self.assertEqual(words_505, {"505"})
+
+        words_karma = extract_core_title_words("Karma Police", "Radiohead")
+        self.assertEqual(words_karma, {"karma", "police"})
+
+    def test_title_match_ratio_and_fake_disqualification(self):
+        """
+        Проверяет, что подлинный трек получает 1.0 совпадения,
+        транслитерация также дает 1.0,
+        а чужой трек (MuzloRAlii) получает 0.0 и отсеивается.
+        """
+        from services.extractor import extract_core_title_words, compute_title_match_ratio
+
+        core_words = extract_core_title_words("не слышу - Super Slowed", "DJ ZUP RAlii")
+
+        ratio_real = compute_title_match_ratio("не слышу (Super Slowed)", core_words)
+        self.assertEqual(ratio_real, 1.0)
+
+        ratio_translit = compute_title_match_ratio("DJ ZUP RAlii - ne slyshu (Super Slowed)", core_words)
+        self.assertEqual(ratio_translit, 1.0)
+
+        ratio_fake = compute_title_match_ratio("MuzloRAlii.net - DJ ZUP RAlii (Super Slowed)", core_words)
+        self.assertEqual(ratio_fake, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

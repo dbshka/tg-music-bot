@@ -25,7 +25,10 @@ from mutagen.mp4 import MP4, MP4Cover
 
 from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
 from services.http_client import get_shared_session
-from services.extractor import TRACK_MODIFIERS, has_track_modifiers
+from services.extractor import (
+    TRACK_MODIFIERS, has_track_modifiers,
+    extract_core_title_words, compute_title_match_ratio
+)
 
 
 @dataclass
@@ -202,17 +205,17 @@ def _sync_download(
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["tv", "web", "mweb", "android", "ios"],
+                "player_client": ["android", "ios", "tv", "web", "mweb"],
             }
         }
         print(f"{req_tag}[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["tv", "web", "mweb", "android"],
+                "player_client": ["android", "ios", "tv", "web", "mweb"],
             }
         }
-        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты tv, web, mweb, android)", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты android, ios, tv, web, mweb)", flush=True)
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
@@ -309,6 +312,11 @@ def _sync_download(
             req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
             requested_modifiers = {mod for mod in TRACK_MODIFIERS if mod in req_context}
 
+            # Ключевые слова названия трека для семантической проверки
+            core_title_words = extract_core_title_words(custom_title or clean_search, custom_artist)
+            if not core_title_words and custom_title:
+                core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
+
             def _candidate_penalty(e):
                 cand_title = (e.get("title") or "").lower()
                 cand_uploader = (e.get("uploader") or "").lower()
@@ -320,6 +328,20 @@ def _sync_download(
                     return 5000.0
 
                 penalty = 0.0
+
+                # 1. Семантическое соответствие названия трека (Core Title Matching)
+                if core_title_words:
+                    match_ratio = compute_title_match_ratio(cand_title, core_title_words)
+                    if match_ratio >= 0.8:
+                        penalty -= 120.0
+                    elif match_ratio >= 0.5:
+                        penalty -= 30.0
+                    elif match_ratio > 0.0:
+                        penalty += 400.0
+                    else:
+                        # В названии кандидата НЕТ ни одного ключевого слова трека!
+                        penalty += 3500.0
+
                 cand_text = f"{cand_title} {cand_uploader} {cand_channel}"
                 cand_modifiers = {mod for mod in TRACK_MODIFIERS if mod in cand_text}
 
@@ -336,18 +358,29 @@ def _sync_download(
                         penalty += 350.0
 
                 # Оценка соответствия длительности
-                if expected_duration and not requested_modifiers:
+                if expected_duration:
                     diff = abs(dur - expected_duration)
-                    if diff <= 4:
-                        penalty -= 60.0
-                    elif diff <= 8:
-                        penalty -= 20.0
-                    elif diff <= 15:
-                        penalty += diff * 5.0
-                    elif diff <= 25:
-                        penalty += 150.0 + (diff * 10.0)
+                    if not requested_modifiers:
+                        if diff <= 4:
+                            penalty -= 60.0
+                        elif diff <= 8:
+                            penalty -= 20.0
+                        elif diff <= 15:
+                            penalty += diff * 5.0
+                        elif diff <= 25:
+                            penalty += 150.0 + (diff * 10.0)
+                        else:
+                            penalty += 400.0 + (diff * 15.0)
                     else:
-                        penalty += 400.0 + (diff * 15.0)
+                        # Запрашивалась модификация с известным хронометражем (например ссылка Spotify на Slowed)
+                        if diff <= 8:
+                            penalty -= 60.0
+                        elif diff <= 20:
+                            penalty -= 20.0
+                        elif diff <= 45:
+                            penalty += diff * 5.0
+                        else:
+                            penalty += 300.0 + (diff * 10.0)
                 elif dur > 0:
                     if dur >= 45:
                         penalty += 0.0
@@ -444,11 +477,32 @@ def _sync_download(
                         except Exception:
                             pass
 
-                    # Проверяем допустимость хронометража:
-                    # Для модифицированных треков (slowed, sped up) или без эталона принимаем сразу
-                    diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0 and not requested_modifiers) else 0
+                    cand_entry_title = res_info.get("title") or cand_title or ""
+                    cand_match_ratio = compute_title_match_ratio(cand_entry_title, core_title_words)
 
-                    if diff <= 25 or not expected_duration or requested_modifiers:
+                    # 1. Жесткая защита от неаутентичных треков: если ключевые слова названия известны,
+                    # а кандидат имеет 0% совпадения, ЭТО ЧУЖАЯ ПЕСНЯ! Немедленно отклоняем.
+                    if core_title_words and cand_match_ratio == 0.0:
+                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не содержит ключевых слов названия ({core_title_words}). Отклоняем как неаутентичный.", flush=True)
+                        for temp_f in output_dir.iterdir():
+                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                try:
+                                    temp_f.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                        continue
+
+                    # 2. Проверяем допустимость хронометража:
+                    diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
+                    is_duration_acceptable = False
+                    if not expected_duration:
+                        is_duration_acceptable = True
+                    elif requested_modifiers and diff <= 45:
+                        is_duration_acceptable = True
+                    elif not requested_modifiers and diff <= 25:
+                        is_duration_acceptable = True
+
+                    if is_duration_acceptable and (not core_title_words or cand_match_ratio >= 0.5):
                         # Идеальное попадание! Удаляем возможный бэкап и возвращаем результат
                         for old_f in output_dir.iterdir():
                             if old_f.name.startswith("backup_"):
@@ -479,13 +533,14 @@ def _sync_download(
                         print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
                         return res_info
 
-                    # Длительность отличается (> 25s), сохраняем как резервный вариант
-                    print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' имеет разницу длительности {diff}s (> 25s). Сохраняем как резерв.", flush=True)
-                    if best_fallback_info is None or diff < best_fallback_info.get("diff", 99999):
-                        for af in audio_files:
-                            backup_p = output_dir / f"backup_{af.name}"
-                            shutil.copy2(af, backup_p)
-                        best_fallback_info = {"res_info": res_info, "diff": diff}
+                    # Длительность отличается, сохраняем как резервный вариант ТОЛЬКО ЕСЛИ название совпадает!
+                    if cand_match_ratio >= 0.5 or not core_title_words:
+                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' имеет разницу длительности {diff}s. Сохраняем как резерв.", flush=True)
+                        if best_fallback_info is None or diff < best_fallback_info.get("diff", 99999):
+                            for af in audio_files:
+                                backup_p = output_dir / f"backup_{af.name}"
+                                shutil.copy2(af, backup_p)
+                            best_fallback_info = {"res_info": res_info, "diff": diff}
 
                     for temp_f in output_dir.iterdir():
                         if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
@@ -501,6 +556,29 @@ def _sync_download(
                     last_cand_error = cand_err
                     cand_err_str = str(cand_err).lower()
                     print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}).", flush=True)
+
+                    # Если кандидат YouTube завершился ошибкой формата/клиента/бота, пробуем резервный вызов без cookies
+                    if cand_source == "youtube" and not getattr(selected_entry, "_retried", False):
+                        if any(k in cand_err_str for k in ["reload", "format", "sign in", "bot", "403", "429"]):
+                            print(f"{req_tag}[DOWNLOADER] Пробуем резервный запуск для кандидата #{cand_idx+1} без cookies...", flush=True)
+                            selected_entry["_retried"] = True
+                            retry_cand_opts = dict(cand_dl_opts)
+                            retry_cand_opts.pop("cookiefile", None)
+                            retry_cand_opts["extractor_args"] = {
+                                "youtube": {
+                                    "player_client": ["android", "ios", "tv", "web", "mweb"]
+                                }
+                            }
+                            try:
+                                with yt_dlp.YoutubeDL(retry_cand_opts) as ydl_retry:
+                                    res_info = ydl_retry.extract_info(target_url, download=True)
+                                audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
+                                if audio_files:
+                                    print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
+                                    return res_info
+                            except Exception as sub_retry_err:
+                                print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} также завершился ошибкой ({sub_retry_err}).", flush=True)
+
                     for temp_f in output_dir.iterdir():
                         if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                             try:
@@ -661,13 +739,13 @@ def _sync_download(
             raise last_err
 
         if should_retry_no_cookies:
-            print(f"[DOWNLOADER] Сессия cookies вызвала ошибку ({extract_err}). Пробуем чистый запуск без cookies с TV клиентом...", flush=True)
+            print(f"[DOWNLOADER] Сессия cookies вызвала ошибку ({extract_err}). Пробуем чистый запуск без cookies с клиентами android/ios...", flush=True)
             ydl_opts_retry = dict(ydl_opts)
             ydl_opts_retry.pop("cookiefile", None)
             ydl_opts_retry["format"] = "ba[ext=m4a]/ba[ext=mp3]/ba/bv*+ba/b/best"
             ydl_opts_retry["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["tv", "web", "android"],
+                    "player_client": ["android", "ios", "tv", "web", "mweb"],
                 }
             }
             try:
