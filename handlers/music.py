@@ -202,6 +202,11 @@ async def process_search_artist(message: Message, state: FSMContext):
     dash_match = re.split(r'\s+[-—–]\s+', artist_text, maxsplit=1)
     if len(dash_match) == 2 and dash_match[0].strip() and dash_match[1].strip():
         await state.clear()
+        await message.answer(
+            f"⏳ Начинаю поиск: <b>{html.escape(dash_match[0].strip())} — {html.escape(dash_match[1].strip())}</b>",
+            parse_mode="HTML",
+            reply_markup=get_main_reply_keyboard()
+        )
         await _execute_download_and_send(
             message=message,
             raw_query=artist_text,
@@ -233,6 +238,7 @@ async def process_search_title(message: Message, state: FSMContext):
     url = find_first_url(title_text)
     if url:
         await state.clear()
+        await message.answer("⏳ <i>Ссылка принята!</i>", reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
         await _execute_download_and_send(message=message, raw_query=title_text, url=url)
         return
 
@@ -240,6 +246,11 @@ async def process_search_title(message: Message, state: FSMContext):
     artist = (data.get("artist") or "").strip()
     await state.clear()
 
+    await message.answer(
+        f"⏳ Начинаю поиск: <b>{html.escape(artist)} — {html.escape(title_text)}</b>",
+        parse_mode="HTML",
+        reply_markup=get_main_reply_keyboard()
+    )
     await _execute_download_and_send(
         message=message,
         raw_query=f"{artist} {title_text}".strip(),
@@ -363,14 +374,13 @@ async def _execute_download_and_send(
     try:
         t_m0 = time.perf_counter()
         if url:
-            status_msg = await message.reply("🔎 <i>Анализирую ссылку...</i>", parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+            status_msg = await message.reply("🔎 <i>Анализирую ссылку...</i>", parse_mode="HTML")
             print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
             track_info = await resolve_track_url(url)
         elif custom_artist and custom_title:
             status_msg = await message.reply(
                 f"🔎 <i>Ищу трек:</i> <b>{html.escape(custom_artist)} — {html.escape(custom_title)}</b>...",
-                parse_mode="HTML",
-                reply_markup=get_main_reply_keyboard()
+                parse_mode="HTML"
             )
             combined_q = f"{custom_artist} {custom_title}"
             canonical = None
@@ -400,8 +410,7 @@ async def _execute_download_and_send(
         else:
             status_msg = await message.reply(
                 f"🔎 <i>Ищу трек:</i> <b>{html.escape(raw_query)}</b>...",
-                parse_mode="HTML",
-                reply_markup=get_main_reply_keyboard()
+                parse_mode="HTML"
             )
             print(f"[MUSIC][request_id={req_id}] resolve_text_to_track_info START query='{raw_query}'", flush=True)
             track_info = await resolve_text_to_track_info(raw_query)
@@ -585,9 +594,15 @@ async def _execute_download_and_send(
         else:
             user_friendly = f"❌ <b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
         try:
-            await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            if status_msg:
+                await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            else:
+                await message.reply(user_friendly, parse_mode="HTML")
         except Exception:
-            pass
+            try:
+                await message.reply(user_friendly, parse_mode="HTML")
+            except Exception:
+                pass
     finally:
         if downloaded_audio:
             t_cl0 = time.perf_counter()
