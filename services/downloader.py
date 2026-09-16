@@ -655,7 +655,12 @@ def _sync_download(
 
             # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
             req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
-            requested_modifiers = extract_modifiers(req_context)
+            requested_modifiers = extract_modifiers(req_context) or set()
+            dsp_supported_modifiers = {
+                "slowed", "slow", "super slowed", "super slow", "ultra slowed",
+                "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"
+            }
+            semantic_requested = requested_modifiers - dsp_supported_modifiers
 
             # Ключевые слова названия трека для семантической проверки
             core_title_words = extract_core_title_words(custom_title or clean_search, custom_artist)
@@ -871,7 +876,6 @@ def _sync_download(
 
                             # Если запрошен семантический модификатор (acoustic, live, remix, cover, instrumental, reverb),
                             # а кандидат его НЕ содержит — отклоняем, чтобы не отдать обычный студийный трек!
-                            semantic_requested = requested_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"}
                             if semantic_requested and not (semantic_requested & cand_modifiers):
                                 print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не содержит запрошенный модификатор {semantic_requested}. Отклоняем.", flush=True)
                                 for temp_f in output_dir.iterdir():
@@ -1033,8 +1037,7 @@ def _sync_download(
                                         continue
 
                                     if requested_modifiers:
-                                        semantic_req = requested_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "sped up", "spedup", "speed up", "speedup", "fast version", "reverb", "speed_multiplier"}
-                                        if semantic_req and not (semantic_req & retry_mods):
+                                        if semantic_requested and not (semantic_requested & retry_mods):
                                             for temp_f in output_dir.iterdir():
                                                 if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                                                     try:
@@ -1130,7 +1133,6 @@ def _sync_download(
                                     }
                                     if s_conflicting:
                                         continue
-                                    semantic_requested = requested_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"}
                                     if semantic_requested and not (semantic_requested & s_mods):
                                         continue
 

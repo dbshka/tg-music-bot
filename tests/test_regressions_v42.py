@@ -210,3 +210,118 @@ def test_direct_media_duration_exemption():
     yt_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     is_direct_media = bool(yt_url and any(d in yt_url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "vk.com", "tiktok.com")))
     assert is_direct_media is True
+
+
+# =====================================================================
+# 6. BUG-REG-05: The Weeknd — Blinding Lights (semantic_requested scope)
+# =====================================================================
+
+def test_the_weeknd_blinding_lights_semantic_requested_backup_evaluation(tmp_path):
+    """
+    Regression test for production blocker:
+    'The Weeknd — Blinding Lights' caused UnboundLocalError: cannot access local variable
+    'semantic_requested' where it is not associated with a value when a candidate
+    duration did not perfectly match and fell through to backup candidate evaluation.
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                if "cand1" in url:
+                    # Video version with intro (220s != 200s, diff 20s > 4s) -> triggers backup evaluation
+                    return {
+                        "title": "The Weeknd - Blinding Lights (Official Music Video)",
+                        "uploader": "The Weeknd",
+                        "channel": "The Weeknd",
+                        "duration": 220
+                    }
+                # Official studio audio track on Topic channel (200s == 200s) -> accepted
+                return {
+                    "title": "The Weeknd - Blinding Lights",
+                    "uploader": "The Weeknd - Topic",
+                    "channel": "The Weeknd - Topic",
+                    "duration": 200
+                }
+            else:
+                return {
+                    "entries": [
+                        {
+                            "id": "cand1",
+                            "title": "The Weeknd - Blinding Lights (Official Music Video)",
+                            "uploader": "The Weeknd",
+                            "channel": "The Weeknd",
+                            "duration": 220,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand1",
+                            "_source": "youtube"
+                        },
+                        {
+                            "id": "cand2",
+                            "title": "The Weeknd - Blinding Lights",
+                            "uploader": "The Weeknd - Topic",
+                            "channel": "The Weeknd - Topic",
+                            "duration": 200,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand2",
+                            "_source": "youtube"
+                        }
+                    ]
+                }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=FakeYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        # Must execute without raising UnboundLocalError
+        res = _sync_download(
+            query_or_url="ytsearch5:The Weeknd - Blinding Lights",
+            output_dir=tmp_path,
+            custom_title="Blinding Lights",
+            custom_artist="The Weeknd",
+            expected_duration=200,
+            is_text_input=True
+        )
+        assert res is not None
+        assert res.title == "Blinding Lights"
+        assert res.artist == "The Weeknd"
+        assert res.duration == 200
+
+
+def test_semantic_requested_modifier_partitioning():
+    """Verify semantic vs DSP tempo modifiers partitioning for all query types."""
+    dsp_modifiers = {
+        "slowed", "slow", "super slowed", "super slow", "ultra slowed",
+        "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"
+    }
+
+    # 1. Clean query (The Weeknd — Blinding Lights)
+    mods_clean = extract_modifiers("the weeknd blinding lights")
+    assert mods_clean == set()
+    semantic_clean = mods_clean - dsp_modifiers
+    assert semantic_clean == set()
+
+    # 2. Query with DSP modifier (slowed)
+    mods_slow = extract_modifiers("the weeknd blinding lights slowed")
+    assert "slowed" in mods_slow
+    semantic_slow = mods_slow - dsp_modifiers
+    assert semantic_slow == set()
+
+    # 3. Query with semantic modifier (acoustic)
+    mods_acoustic = extract_modifiers("the weeknd blinding lights acoustic")
+    assert "acoustic" in mods_acoustic
+    semantic_acoustic = mods_acoustic - dsp_modifiers
+    assert "acoustic" in semantic_acoustic
+
+    # 4. Query with both DSP and semantic (remix slowed)
+    mods_mixed = extract_modifiers("the weeknd blinding lights remix slowed")
+    assert "slowed" in mods_mixed
+    assert "remix" in mods_mixed
+    semantic_mixed = mods_mixed - dsp_modifiers
+    assert "remix" in semantic_mixed
+    assert "slowed" not in semantic_mixed
