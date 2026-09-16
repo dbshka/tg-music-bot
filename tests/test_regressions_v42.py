@@ -325,3 +325,192 @@ def test_semantic_requested_modifier_partitioning():
     semantic_mixed = mods_mixed - dsp_modifiers
     assert "remix" in semantic_mixed
     assert "slowed" not in semantic_mixed
+
+
+# =====================================================================
+# 7. BUG-REG-06: YouTube 0-candidates recovery & SoundCloud DRM Skip
+# =====================================================================
+
+def test_youtube_search_zero_candidates_standalone_fallback(tmp_path):
+    """
+    When parallel search returns 0 candidates for YouTube, the standalone
+    YouTube fallback recovers valid candidates without failing or returning unauthentic tracks.
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    call_count = {"parallel_yt": 0, "fallback_yt": 0}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {
+                    "title": "The Weeknd - Blinding Lights",
+                    "uploader": "The Weeknd - Topic",
+                    "duration": 200
+                }
+            # Parallel search initially yields 0 candidates for YouTube
+            if "Topic" in url:
+                call_count["parallel_yt"] += 1
+                return {"entries": []}
+            if "ytsearch" in url:
+                call_count["fallback_yt"] += 1
+                # Standalone fallback returns the official track
+                return {
+                    "entries": [
+                        {
+                            "id": "cand_topic",
+                            "title": "The Weeknd - Blinding Lights",
+                            "uploader": "The Weeknd - Topic",
+                            "duration": 200,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_topic"
+                        }
+                    ]
+                }
+            return {"entries": []}
+
+    with patch("yt_dlp.YoutubeDL", side_effect=FakeYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = _sync_download(
+            query_or_url="ytsearch5:The Weeknd Blinding Lights",
+            output_dir=tmp_path,
+            custom_title="Blinding Lights",
+            custom_artist="The Weeknd",
+            expected_duration=200,
+            is_text_input=True
+        )
+        assert res is not None
+        assert res.title == "Blinding Lights"
+        assert res.duration == 200
+        assert call_count["fallback_yt"] >= 1
+
+
+def test_soundcloud_drm_candidate_skipped_and_youtube_used(tmp_path):
+    """
+    When a SoundCloud candidate is DRM-protected, it must be skipped and
+    must NOT become the final result or crash the download when a valid YouTube
+    candidate exists.
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                if "soundcloud" in url:
+                    raise RuntimeError("ERROR: This video is DRM protected")
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {
+                    "title": "The Weeknd - Blinding Lights",
+                    "uploader": "The Weeknd - Topic",
+                    "duration": 200
+                }
+            return {
+                "entries": [
+                    {
+                        "id": "sc_drm",
+                        "title": "Blinding Lights",
+                        "uploader": "The Weeknd",
+                        "duration": 200,
+                        "webpage_url": "https://soundcloud.com/theweeknd/blinding-lights",
+                        "_source": "soundcloud"
+                    },
+                    {
+                        "id": "yt_ok",
+                        "title": "The Weeknd - Blinding Lights",
+                        "uploader": "The Weeknd - Topic",
+                        "duration": 200,
+                        "webpage_url": "https://www.youtube.com/watch?v=yt_ok",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=FakeYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = _sync_download(
+            query_or_url="ytsearch5:The Weeknd Blinding Lights",
+            output_dir=tmp_path,
+            custom_title="Blinding Lights",
+            custom_artist="The Weeknd",
+            expected_duration=200,
+            is_text_input=True
+        )
+        assert res is not None
+        assert res.title == "Blinding Lights"
+        assert res.duration == 200
+
+
+def test_all_drm_candidates_rejected_and_no_remix_substitution(tmp_path):
+    """
+    When SoundCloud official track has DRM and all other tracks are unrequested remixes,
+    the system must reject the remixes and raise ValueError without substituting the remix.
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                if "sc_drm" in url:
+                    raise RuntimeError("ERROR: This video is DRM protected")
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {
+                    "title": "The Weeknd - Blinding Lights (Remix)",
+                    "uploader": "Random DJ",
+                    "duration": 200
+                }
+            return {
+                "entries": [
+                    {
+                        "id": "sc_drm",
+                        "title": "Blinding Lights",
+                        "uploader": "The Weeknd",
+                        "duration": 200,
+                        "webpage_url": "https://soundcloud.com/theweeknd/blinding-lights",
+                        "_source": "soundcloud"
+                    },
+                    {
+                        "id": "sc_remix",
+                        "title": "The Weeknd - Blinding Lights (Remix)",
+                        "uploader": "Random DJ",
+                        "duration": 200,
+                        "webpage_url": "https://soundcloud.com/random/blinding-lights-remix",
+                        "_source": "soundcloud"
+                    }
+                ]
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=FakeYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        with pytest.raises(ValueError, match="(DRM|Ни один кандидат)"):
+            _sync_download(
+                query_or_url="ytsearch5:The Weeknd Blinding Lights",
+                output_dir=tmp_path,
+                custom_title="Blinding Lights",
+                custom_artist="The Weeknd",
+                expected_duration=200,
+                is_text_input=True
+            )

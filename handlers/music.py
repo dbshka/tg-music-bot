@@ -494,10 +494,10 @@ async def _execute_download_and_send(
                     )
         except Exception as dl_err:
             is_direct_url = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com")))
-            if is_direct_url:
+            if is_direct_url or is_text_input or not url or (track_info and track_info.is_search):
                 # Invariant: EXACT MEDIA FAILURE != SEARCH FAILURE
-                # Если прямая ссылка на YouTube/SoundCloud недоступна, не заменяем её случайным поисковым кандидатом!
-                logger.error("Direct media URL download failed for %s: %s", url, dl_err)
+                # Если прямая ссылка или поисковый запрос уже завершились ошибкой, не делаем вторичный дублирующий поиск
+                logger.error("Download failed for %s: %s", (url or (track_info.target if track_info else raw_query)), dl_err)
                 raise dl_err
 
             fallback_query = None

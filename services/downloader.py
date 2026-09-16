@@ -625,18 +625,18 @@ def _sync_download(
 
             def _fetch_candidates(target_q, src_name):
                 s_opts = dict(options)
+                s_opts.pop("extractor_args", None)  # Поисковые эндпоинты не должны использовать player_client!
                 if src_name == "soundcloud":
                     s_opts.pop("cookiefile", None)
-                    s_opts.pop("extractor_args", None)
                 s_opts["extract_flat"] = True
                 s_opts["noplaylist"] = True
                 s_opts["ignoreerrors"] = True
-                s_opts["socket_timeout"] = 5
-                s_opts["retries"] = 0
+                s_opts["socket_timeout"] = 7
+                s_opts["retries"] = 1
                 try:
                     with yt_dlp.YoutubeDL(s_opts) as ydl_s:
                         info = ydl_s.extract_info(target_q, download=False)
-                        items = [e for e in info.get("entries", []) if e]
+                        items = [e for e in (info.get("entries") or []) if e]
                         # Fallback поиск в SoundCloud, если запрос с исполнителем вернул 0 результатов
                         if not items and src_name == "soundcloud" and ":" in target_q:
                             raw_target = target_q.split(":", 1)[1]
@@ -645,7 +645,7 @@ def _sync_download(
                             clean_words = re.sub(r'[/\\_]+', ' ', pure_title).strip()
                             if len(clean_words) >= 3:
                                 info2 = ydl_s.extract_info(f"scsearch4:{clean_words}", download=False)
-                                items = [e for e in info2.get("entries", []) if e]
+                                items = [e for e in (info2.get("entries") or []) if e]
                         for item in items:
                             item["_source"] = src_name
                         return items
@@ -667,32 +667,37 @@ def _sync_download(
             if not core_title_words and custom_title:
                 core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
 
+            clean_artist_str = (custom_artist or "").strip()
+            clean_title_str = (custom_title or "").strip()
+            clean_q_simple = f"{clean_artist_str} {clean_title_str}".strip() if (clean_artist_str and clean_title_str) else clean_search
+
             import concurrent.futures
             if is_apple_music or is_text_input:
                 # Для Apple Music и текстовых запросов: ищем официальные студийные дорожки Topic и чистый аудиопоток
                 if requested_modifiers:
                     clean_core_title = " ".join(core_title_words) if core_title_words else ""
-                    clean_artist_str = custom_artist or ""
                     clean_core_query = f"{clean_artist_str} {clean_core_title}".strip()
                     search_tasks = [
-                        ("youtube", f"ytsearch6:{clean_search}"),
-                        ("soundcloud", f"scsearch5:{clean_search}")
+                        ("youtube", f"ytsearch6:{clean_q_simple}"),
+                        ("soundcloud", f"scsearch5:{clean_q_simple}")
                     ]
                     # Если пользователь запросил темповую модификацию (1.1x, slowed и др.),
                     # параллельно опрашиваем чистый студийный трек, чтобы применить эффект через FFmpeg при отсутствии готового релиза
-                    if clean_core_query and clean_core_query.lower() != clean_search.lower():
+                    if clean_core_query and clean_core_query.lower() != clean_q_simple.lower():
                         search_tasks.append(("youtube", f"ytsearch3:{clean_core_query}"))
                 else:
                     search_tasks = [
-                        ("youtube", f"ytsearch3:{clean_search} Topic"),
-                        ("youtube", f"ytsearch3:{clean_search}"),
-                        ("soundcloud", f"scsearch3:{clean_search}")
+                        ("youtube", f"ytsearch5:{clean_q_simple} Topic"),
+                        ("youtube", f"ytsearch5:{clean_q_simple}"),
+                        ("soundcloud", f"scsearch5:{clean_q_simple}")
                     ]
+                    if clean_search and clean_search != clean_q_simple:
+                        search_tasks.append(("youtube", f"ytsearch3:{clean_search}"))
             else:
                 # Для ссылок на другие платформы (Spotify, YouTube, SoundCloud) - ультрабыстрый минимальный опрос
                 search_tasks = [
-                    ("youtube", f"ytsearch3:{clean_search}"),
-                    ("soundcloud", f"scsearch3:{clean_search}")
+                    ("youtube", f"ytsearch5:{clean_q_simple}"),
+                    ("soundcloud", f"scsearch5:{clean_q_simple}")
                 ]
 
             clean_core_title = " ".join(core_title_words) if core_title_words else ""
@@ -703,7 +708,7 @@ def _sync_download(
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks))
             try:
                 futures = [executor.submit(_fetch_candidates, q, src) for src, q in search_tasks]
-                done, not_done = concurrent.futures.wait(futures, timeout=3.5)
+                done, not_done = concurrent.futures.wait(futures, timeout=7.0)
                 for f in done:
                     try:
                         res = f.result()
@@ -713,6 +718,30 @@ def _sync_download(
                         pass
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
+
+            # Если параллельный опрос не вернул ни одного YouTube-кандидата,
+            # выполняем чистый fallback-запрос к YouTube без cookies
+            has_youtube = any(e.get("_source") == "youtube" for e in entries)
+            if not has_youtube:
+                try:
+                    fb_opts = dict(options)
+                    fb_opts.pop("extractor_args", None)
+                    fb_opts.pop("cookiefile", None)
+                    fb_opts["extract_flat"] = True
+                    fb_opts["noplaylist"] = True
+                    fb_opts["ignoreerrors"] = True
+                    fb_opts["socket_timeout"] = 7
+                    fb_opts["retries"] = 1
+                    with yt_dlp.YoutubeDL(fb_opts) as ydl_yt_fb:
+                        info_yt = ydl_yt_fb.extract_info(f"ytsearch5:{clean_q_simple}", download=False)
+                        fb_items = [e for e in (info_yt.get("entries") or []) if e]
+                        for fe in fb_items:
+                            fe["_source"] = "youtube"
+                        entries.extend(fb_items)
+                        if fb_items:
+                            print(f"{req_tag}[SEARCH] YouTube standalone fallback вернул {len(fb_items)} кандидатов.", flush=True)
+                except Exception as fb_err:
+                    print(f"{req_tag}[SEARCH] YouTube standalone fallback search failed: {fb_err}", flush=True)
 
             t_s1 = time.perf_counter()
             dur_s = t_s1 - t_s0
@@ -995,7 +1024,11 @@ def _sync_download(
                         raise
                     last_cand_error = cand_err
                     cand_err_str = str(cand_err).lower()
-                    print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}).", flush=True)
+                    is_drm = any(k in cand_err_str for k in ["drm protected", "drm", "copyright", "georestricted"])
+                    if is_drm:
+                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' ({cand_source}) защищён DRM. Пропускаем.", flush=True)
+                    else:
+                        print(f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} не удался ({cand_err}).", flush=True)
 
                     # Если кандидат YouTube завершился ошибкой формата/клиента/бота, пробуем резервный вызов без cookies
                     if cand_source == "youtube" and not getattr(selected_entry, "_retried", False):
@@ -1167,6 +1200,8 @@ def _sync_download(
                 except Exception as sc_err:
                     print(f"{req_tag}[DOWNLOADER] Экстренный поиск SoundCloud не удался: {sc_err}", flush=True)
                 if last_cand_error:
+                    if any(k in str(last_cand_error).lower() for k in ["drm protected", "drm"]):
+                        raise ValueError("Трек защищён DRM на найденных источниках. Попробуйте другой запрос или ссылку.")
                     raise last_cand_error
             raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
         else:
@@ -1519,7 +1554,8 @@ async def download_track(
             print(f"{req_tag}[DOWNLOADER] Обнаружена блокировка YouTube IP (bot-check / 429). Пропускаем YouTube Search и сразу переходим к SoundCloud Fallback.", flush=True)
 
         # 2. Fallback в SoundCloud (выбирает полный трек среди лучших вариантов запроса)
-        if not query_or_url.startswith("scsearch"):
+        # Применяется только если исходный запрос был ссылкой, а не уже выполненным поиском (ytsearch/scsearch)
+        if not query_or_url.startswith(("ytsearch", "scsearch")):
             for fb_q in fallback_queries[:2]:
                 try:
                     print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fb_q}", flush=True)

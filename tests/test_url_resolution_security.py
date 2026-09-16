@@ -28,10 +28,22 @@ def test_is_safe_url():
     assert safe2 is False
     safe3, _ = is_safe_url("http://localhost:8080")
     assert safe3 is False
-    safe4, _ = is_safe_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-    assert safe4 is True
-    safe5, _ = is_safe_url("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT")
-    assert safe5 is True
+
+    from unittest.mock import patch
+    import socket
+    real_gai = socket.getaddrinfo
+    def mock_gai(host, port, *args, **kwargs):
+        if "youtube" in host:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('142.250.180.14', 443))]
+        if "spotify" in host:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('35.186.224.25', 443))]
+        return real_gai(host, port, *args, **kwargs)
+
+    with patch("socket.getaddrinfo", side_effect=mock_gai):
+        safe4, _ = is_safe_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert safe4 is True
+        safe5, _ = is_safe_url("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT")
+        assert safe5 is True
 
 
 @pytest.mark.asyncio
