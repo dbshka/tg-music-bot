@@ -60,7 +60,7 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
     """Постоянная клавиатура с кнопкой поиска по автору и названию."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔍 Найти песню (автор ➔ название)")],
+            [KeyboardButton(text="Найти песню")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -71,7 +71,7 @@ def get_cancel_reply_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура с кнопкой отмены в режиме поиска."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="❌ Отмена")],
+            [KeyboardButton(text="Отмена")],
         ],
         resize_keyboard=True,
     )
@@ -82,28 +82,43 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     if message.from_user:
         await log_user_activity_async(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    await message.answer("👋", reply_markup=get_main_reply_keyboard())
+    start_text = (
+        "Отправьте ссылку на трек или напишите автора и название песни.\n\n"
+        "Также вы можете отправить свой аудиофайл для редактирования тегов."
+    )
+    await message.answer(start_text, reply_markup=get_main_reply_keyboard())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("📖", reply_markup=get_main_reply_keyboard())
+    help_text = (
+        "Инструкция по использованию:\n\n"
+        "1. Скачивание по ссылке\n"
+        "Отправьте ссылку на трек из Spotify, Apple Music, YouTube или SoundCloud.\n\n"
+        "2. Поиск по тексту\n"
+        "Отправьте сообщение в формате: Автор — Название. Или используйте команду /search.\n\n"
+        "3. Редактор тегов\n"
+        "Нажмите кнопку редактирования под отправленным треком или пришлите свой аудиофайл в чат.\n\n"
+        "Поддерживаемые платформы: Spotify, Apple Music, YouTube, SoundCloud.\n"
+        "Другие сервисы (включая Яндекс Музыку и VK) не поддерживаются из-за региональных ограничений."
+    )
+    await message.answer(help_text, reply_markup=get_main_reply_keyboard())
 
 
 @router.message(Command("version"))
 async def cmd_version(message: Message):
     from config import BOT_VERSION
-    await message.answer(f"🤖 Версия бота: <b>v{BOT_VERSION}</b>", parse_mode="HTML")
+    await message.answer(f"Версия бота: <b>v{BOT_VERSION}</b>", parse_mode="HTML")
 
 
 @router.message(Command("cancel"))
-@router.message(F.text == "❌ Отмена")
+@router.message(F.text.in_({"Отмена", "❌ Отмена"}))
 async def cancel_handler(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state:
         await state.clear()
-        await message.answer("❌ <i>Поиск отменен.</i>", parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+        await message.answer("Поиск отменен.", reply_markup=get_main_reply_keyboard())
     else:
         await message.answer("Нет активного поиска.", reply_markup=get_main_reply_keyboard())
 
@@ -113,21 +128,19 @@ async def cb_search_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer("Поиск отменен")
     try:
-        await callback.message.edit_text("❌ <i>Поиск отменен.</i>", parse_mode="HTML")
+        await callback.message.edit_text("Поиск отменен.")
     except Exception:
         pass
 
 
-@router.message(F.text == "🔍 Найти песню (автор ➔ название)")
+@router.message(F.text.in_({"Найти песню", "🔍 Найти песню (автор ➔ название)"}))
 @router.message(Command("search"))
 async def cmd_search_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(SearchFSM.waiting_for_artist)
     await message.answer(
-        "👤 <b>Шаг 1 из 2:</b> Введите имя <b>исполнителя (автора)</b>:\n"
-        "<i>Например: <code>The Weeknd</code> или <code>MiyaGi</code></i>\n\n"
-        "💡 <i>Либо можете сразу отправить в формате: <code>Исполнитель — Название</code></i>",
-        parse_mode="HTML",
+        "Шаг 1 из 2: Введите имя исполнителя:\n\n"
+        "Или отправьте сообщение в формате: Исполнитель — Название",
         reply_markup=get_cancel_reply_keyboard()
     )
 
@@ -143,9 +156,8 @@ async def cb_use_quick_artist(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SearchFSM.waiting_for_title)
     await callback.answer()
     prompt_text = (
-        f"👤 Исполнитель: <b>{html.escape(artist)}</b>\n\n"
-        f"🎵 <b>Шаг 2 из 2:</b> Теперь введите <b>название трека</b>:\n"
-        f"<i>Например: <code>Blinding Lights</code> или <code>Captain</code></i>"
+        f"Исполнитель: <b>{html.escape(artist)}</b>\n\n"
+        "Шаг 2 из 2: Введите название трека:"
     )
     try:
         await callback.message.edit_text(prompt_text, parse_mode="HTML")
@@ -173,7 +185,7 @@ async def process_search_artist(message: Message, state: FSMContext):
     if len(dash_match) == 2 and dash_match[0].strip() and dash_match[1].strip():
         await state.clear()
         await message.answer(
-            f"⏳ Начинаю поиск: <b>{html.escape(dash_match[0].strip())} — {html.escape(dash_match[1].strip())}</b>",
+            f"Ищу трек: <b>{html.escape(dash_match[0].strip())} — {html.escape(dash_match[1].strip())}</b>...",
             parse_mode="HTML",
             reply_markup=get_main_reply_keyboard()
         )
@@ -188,9 +200,8 @@ async def process_search_artist(message: Message, state: FSMContext):
     await state.update_data(artist=artist_text)
     await state.set_state(SearchFSM.waiting_for_title)
     await message.answer(
-        f"👤 Исполнитель: <b>{html.escape(artist_text)}</b>\n\n"
-        f"🎵 <b>Шаг 2 из 2:</b> Теперь введите <b>название трека</b>:\n"
-        f"<i>Например: <code>Blinding Lights</code> или <code>Captain</code></i>",
+        f"Исполнитель: <b>{html.escape(artist_text)}</b>\n\n"
+        "Шаг 2 из 2: Введите название трека:",
         parse_mode="HTML",
         reply_markup=get_cancel_reply_keyboard()
     )
@@ -208,7 +219,7 @@ async def process_search_title(message: Message, state: FSMContext):
     url = find_first_url(title_text)
     if url:
         await state.clear()
-        await message.answer("⏳ <i>Ссылка принята!</i>", reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
+        await message.answer("Ссылка принята.", reply_markup=get_main_reply_keyboard())
         await _execute_download_and_send(message=message, raw_query=title_text, url=url)
         return
 
@@ -217,7 +228,7 @@ async def process_search_title(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        f"⏳ Начинаю поиск: <b>{html.escape(artist)} — {html.escape(title_text)}</b>",
+        f"Ищу трек: <b>{html.escape(artist)} — {html.escape(title_text)}</b>...",
         parse_mode="HTML",
         reply_markup=get_main_reply_keyboard()
     )
@@ -256,7 +267,7 @@ async def handle_music_request(message: Message, state: FSMContext):
         )
         return
 
-    # 3. Текст без тире и не ссылка: запускаем пошаговый поиск (автор ➔ название)
+    # 3. Текст без тире и не ссылка: запускаем пошаговый поиск (автор -> название)
     await state.clear()
     await state.set_state(SearchFSM.waiting_for_artist)
     await state.update_data(quick_artist=user_text)
@@ -265,18 +276,16 @@ async def handle_music_request(message: Message, state: FSMContext):
     if len(user_text) <= 40:
         quick_markup = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=f"👤 Использовать «{user_text}» как автора", callback_data="search:use_quick_artist")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="search:cancel")]
+                [InlineKeyboardButton(text=f"Использовать «{user_text}» как автора", callback_data="search:use_quick_artist")],
+                [InlineKeyboardButton(text="Отмена", callback_data="search:cancel")]
             ]
         )
 
     await message.answer(
-        "🎵 <b>Поиск музыки</b>\n\n"
-        "Чтобы в аудиофайле был указан точный исполнитель (а не никнейм автора на YouTube):\n\n"
-        "👤 <b>Шаг 1 из 2:</b> Введите имя <b>исполнителя (автора)</b>:\n"
-        "<i>Например: <code>The Weeknd</code> или <code>MiyaGi</code></i>\n\n"
-        "💡 <i>Совет: вы также можете отправлять треки одной строкой с тире:\n"
-        "<code>Исполнитель — Название</code></i>",
+        "Поиск музыки\n\n"
+        "Шаг 1 из 2: Введите имя исполнителя:\n\n"
+        "Или отправьте сообщение в формате:\n"
+        "Исполнитель — Название",
         parse_mode="HTML",
         reply_markup=quick_markup or get_cancel_reply_keyboard()
     )
@@ -314,12 +323,12 @@ async def _execute_download_and_send(
     try:
         t_m0 = time.perf_counter()
         if url:
-            status_msg = await message.reply("🔎 <i>Анализирую ссылку...</i>", parse_mode="HTML")
+            status_msg = await message.reply("Анализирую ссылку...")
             print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
             track_info = await resolve_track_url(url)
         elif custom_artist and custom_title:
             status_msg = await message.reply(
-                f"🔎 <i>Ищу трек:</i> <b>{html.escape(custom_artist)} — {html.escape(custom_title)}</b>...",
+                f"Ищу трек: <b>{html.escape(custom_artist)} — {html.escape(custom_title)}</b>...",
                 parse_mode="HTML"
             )
             combined_q = f"{custom_artist} {custom_title}"
@@ -349,14 +358,14 @@ async def _execute_download_and_send(
                 )
         else:
             status_msg = await message.reply(
-                f"🔎 <i>Ищу трек:</i> <b>{html.escape(raw_query)}</b>...",
+                f"Ищу трек: <b>{html.escape(raw_query)}</b>...",
                 parse_mode="HTML"
             )
             print(f"[MUSIC][request_id={req_id}] resolve_text_to_track_info START query='{raw_query}'", flush=True)
             track_info = await resolve_text_to_track_info(raw_query)
 
         t_metadata = time.perf_counter() - t_m0
-        print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}'", flush=True)
+        print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}' duration={track_info.duration}s", flush=True)
 
         # ⚡ Шаг 0: Проверка в двух-уровневом кэше L1 (RAM) / L2 (SQLite) с проверкой точности хронометража
         t_c0 = time.perf_counter()
@@ -430,8 +439,8 @@ async def _execute_download_and_send(
         platform_label = f"\nПлатформа: <b>{track_info.platform}</b>" if track_info.platform and "Search" not in track_info.platform else ""
         if status_msg:
             await status_msg.edit_text(
-                f"⏳ Скачиваю: <b>{html.escape(track_info.display_name)}</b>{platform_label}\n"
-                f"<i>Загрузка аудиопотока...</i>",
+                f"Скачиваю: <b>{html.escape(track_info.display_name)}</b>{platform_label}\n"
+                f"Загрузка аудиопотока...",
                 parse_mode="HTML"
             )
 
@@ -489,13 +498,12 @@ async def _execute_download_and_send(
         if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
             size_mb = downloaded_audio.filesize / (1024 * 1024)
             await status_msg.edit_text(
-                f"❌ <b>Файл слишком большой ({size_mb:.1f} МБ)</b>.\n"
-                f"Telegram разрешает ботам отправлять файлы размером до 50 МБ.",
-                parse_mode="HTML"
+                f"Файл слишком большой ({size_mb:.1f} МБ).\n"
+                f"Telegram разрешает ботам отправлять файлы размером до 50 МБ."
             )
             return
 
-        await status_msg.edit_text("📤 <i>Отправка трека в Telegram...</i>", parse_mode="HTML")
+        await status_msg.edit_text("Отправка трека в Telegram...")
 
         audio_file = FSInputFile(downloaded_audio.file_path)
         thumb_path = downloaded_audio.thumbnail_path
@@ -590,23 +598,22 @@ async def _execute_download_and_send(
         err_str = str(e)
         if "Яндекс Музык" in err_str:
             user_friendly = (
-                "⚠️ <b>Прямые ссылки Яндекс Музыки отключены.</b>\n\n"
+                "<b>Прямые ссылки Яндекс Музыки не поддерживаются.</b>\n\n"
                 "Из-за региональных ограничений хостинга загрузка по прямым ссылкам недоступна.\n\n"
-                "💡 <b>Решение:</b> отправьте название трека или исполнителя текстом (например: <code>Gazan — 67</code>). Бот моментально найдёт и скачает трек!"
+                "Отправьте автора и название трека текстом."
             )
         elif "ВК Музык" in err_str or "vk.com" in err_str:
             user_friendly = (
-                "⚠️ <b>Прямые ссылки ВК Музыки не поддерживаются.</b>\n\n"
-                "ВКонтакте полностью закрыл аудиозаписи для внешних серверов без авторизации.\n\n"
-                "💡 <b>Решение:</b> отправьте название трека текстом (например: <code>MiyaGi — Captain</code>). Бот моментально найдёт и скачает трек!"
+                "<b>Прямые ссылки ВКонтакте не поддерживаются.</b>\n\n"
+                "Отправьте автора и название трека текстом."
             )
         elif "drm protected" in err_str.lower() or "is drm protected" in err_str.lower():
             user_friendly = (
-                "⚠️ <b>Этот трек защищен DRM (SoundCloud Go+ / платная подписка).</b>\n\n"
-                "💡 <b>Решение:</b> попробуйте отправить прямую ссылку на трек из YouTube Music или ссылку из Spotify / Apple Music."
+                "<b>Этот трек защищен DRM (SoundCloud Go+).</b>\n\n"
+                "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
             )
         else:
-            user_friendly = f"❌ <b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
+            user_friendly = f"<b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
         try:
             if status_msg:
                 await status_msg.edit_text(user_friendly, parse_mode="HTML")

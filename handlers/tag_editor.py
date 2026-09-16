@@ -37,18 +37,18 @@ def get_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="👤 Артист", callback_data="tag:edit:artist"),
-                InlineKeyboardButton(text="🎶 Название", callback_data="tag:edit:title"),
+                InlineKeyboardButton(text="Артист", callback_data="tag:edit:artist"),
+                InlineKeyboardButton(text="Название", callback_data="tag:edit:title"),
             ],
             [
-                InlineKeyboardButton(text="💿 Альбом", callback_data="tag:edit:album"),
-                InlineKeyboardButton(text="🖼 Обложка", callback_data="tag:edit:cover"),
+                InlineKeyboardButton(text="Альбом", callback_data="tag:edit:album"),
+                InlineKeyboardButton(text="Обложка", callback_data="tag:edit:cover"),
             ],
             [
-                InlineKeyboardButton(text="🚀 Применить и отправить", callback_data="tag:save"),
+                InlineKeyboardButton(text="Применить и отправить", callback_data="tag:save"),
             ],
             [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="tag:cancel"),
+                InlineKeyboardButton(text="Отмена", callback_data="tag:cancel"),
             ]
         ]
     )
@@ -58,7 +58,7 @@ def get_audio_edit_keyboard() -> InlineKeyboardMarkup:
     """Кнопка 'Изменить теги' под отправленным аудиофайлом."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Изменить теги", callback_data="audio:edit")]
+            [InlineKeyboardButton(text="Изменить теги", callback_data="audio:edit")]
         ]
     )
 
@@ -68,7 +68,7 @@ def get_back_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура кнопки «Назад» при вводе данных."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="tag:back")]
+            [InlineKeyboardButton(text="Назад в меню", callback_data="tag:back")]
         ]
     )
 
@@ -80,19 +80,19 @@ def format_menu_text(data: dict) -> str:
     album = html.escape(data.get("album") or "—")
 
     if data.get("new_cover_uploaded"):
-        cover_status = "🖼 Загружена новая обложка"
+        cover_status = "Загружена новая обложка"
     elif data.get("cover_path") or data.get("has_original_cover"):
-        cover_status = "🖼 Обложка сохранена"
+        cover_status = "Обложка сохранена"
     else:
-        cover_status = "⚪ Без обложки"
+        cover_status = "Без обложки"
 
     return (
-        "🎵 <b>Редактор тегов аудио</b>\n\n"
-        f"👤 <b>Исполнитель:</b> {artist}\n"
-        f"🎶 <b>Название:</b> {title}\n"
-        f"💿 <b>Альбом:</b> {album}\n"
-        f"Обложка: <i>{cover_status}</i>\n\n"
-        "<i>Нажмите на нужную кнопку ниже, чтобы изменить поле, или «Применить и отправить»:</i>"
+        "<b>Редактор тегов аудио</b>\n\n"
+        f"<b>Исполнитель:</b> {artist}\n"
+        f"<b>Название:</b> {title}\n"
+        f"<b>Альбом:</b> {album}\n"
+        f"<b>Обложка:</b> {cover_status}\n\n"
+        "Нажмите на нужную кнопку ниже, чтобы изменить поле, или «Применить и отправить»:"
     )
 
 
@@ -132,7 +132,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
     audio_obj = message.audio or message.document
     if audio_obj.file_size and audio_obj.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply(
-            "❌ <b>Файл слишком большой!</b>\n"
+            "<b>Файл слишком большой.</b>\n"
             "Telegram разрешает ботам обрабатывать файлы размером до 50 МБ.",
             parse_mode="HTML"
         )
@@ -144,7 +144,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
         shutil.rmtree(prev_data["folder_path"], ignore_errors=True)
     await state.clear()
 
-    status_msg = await message.reply("📥 <i>Загружаю аудиофайл для редактирования...</i>", parse_mode="HTML")
+    status_msg = await message.reply("Загружаю аудиофайл для редактирования...")
 
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
@@ -193,7 +193,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
         logger.exception("Ошибка при обработке аудиофайла")
         shutil.rmtree(session_dir, ignore_errors=True)
         await status_msg.edit_text(
-            f"❌ <b>Не удалось обработать аудиофайл:</b>\n<i>{html.escape(str(e))}</i>",
+            f"<b>Не удалось обработать аудиофайл:</b>\n<i>{html.escape(str(e))}</i>",
             parse_mode="HTML"
         )
 
@@ -205,7 +205,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
 async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, bot: Bot):
     audio_obj = callback.message.audio
     if not audio_obj:
-        await callback.answer("❌ Аудиофайл не найден.", show_alert=True)
+        await callback.answer("Аудиофайл не найден.", show_alert=True)
         return
 
     await callback.answer()
@@ -216,7 +216,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
         shutil.rmtree(prev_data["folder_path"], ignore_errors=True)
     await state.clear()
 
-    status_msg = await callback.message.reply("📥 <i>Загружаю аудиофайл для редактирования...</i>", parse_mode="HTML")
+    status_msg = await callback.message.reply("Загружаю аудиофайл для редактирования...")
 
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
@@ -264,7 +264,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
         logger.exception("Ошибка при обработке аудиофайла по кнопке 'Изменить'")
         shutil.rmtree(session_dir, ignore_errors=True)
         await status_msg.edit_text(
-            f"❌ <b>Не удалось загрузить аудио:</b>\n<i>{html.escape(str(e))}</i>",
+            f"<b>Не удалось загрузить аудио:</b>\n<i>{html.escape(str(e))}</i>",
             parse_mode="HTML"
         )
 
@@ -277,9 +277,8 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
 async def cb_edit_artist(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TagEditorStates.waiting_for_artist)
     await callback.message.edit_text(
-        "👤 <b>Введите нового исполнителя (артиста):</b>\n\n"
-        "<i>Например: Queen, Michael Jackson, Miyagi</i>\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
+        "<b>Введите имя исполнителя (артиста):</b>\n\n"
+        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -290,9 +289,8 @@ async def cb_edit_artist(callback: CallbackQuery, state: FSMContext):
 async def cb_edit_title(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TagEditorStates.waiting_for_title)
     await callback.message.edit_text(
-        "🎶 <b>Введите новое название песни:</b>\n\n"
-        "<i>Например: Bohemian Rhapsody, Billie Jean</i>\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
+        "<b>Введите новое название песни:</b>\n\n"
+        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -303,8 +301,8 @@ async def cb_edit_title(callback: CallbackQuery, state: FSMContext):
 async def cb_edit_album(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TagEditorStates.waiting_for_album)
     await callback.message.edit_text(
-        "💿 <b>Введите название альбома:</b>\n\n"
-        "<i>Либо нажмите «Назад», чтобы оставить текущее значение.</i>",
+        "<b>Введите название альбома:</b>\n\n"
+        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -315,9 +313,9 @@ async def cb_edit_album(callback: CallbackQuery, state: FSMContext):
 async def cb_edit_cover(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TagEditorStates.waiting_for_cover)
     await callback.message.edit_text(
-        "🖼 <b>Отправьте изображение (фотографию) для обложки трека:</b>\n\n"
-        "<i>Изображение будет автоматически обрезано и вшито в MP3-файл.</i>\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
+        "<b>Отправьте изображение (фотографию) для обложки трека:</b>\n\n"
+        "Изображение будет автоматически обрезано и вшито в аудиофайл.\n\n"
+        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -337,7 +335,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
     if folder:
         shutil.rmtree(folder, ignore_errors=True)
     await state.clear()
-    await callback.message.edit_text("❌ <i>Редактирование тегов отменено.</i>", parse_mode="HTML")
+    await callback.message.edit_text("Редактирование тегов отменено.")
     await callback.answer()
 
 
@@ -348,11 +346,11 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
     folder_path = data.get("folder_path")
 
     if not file_path or not Path(file_path).exists():
-        await callback.message.edit_text("❌ <i>Файл устарел или был удален. Отправьте аудио заново.</i>", parse_mode="HTML")
+        await callback.message.edit_text("Файл устарел или был удален. Отправьте аудио заново.")
         await state.clear()
         return
 
-    await callback.message.edit_text("⏳ <i>Применяю теги и отправляю MP3...</i>", parse_mode="HTML")
+    await callback.message.edit_text("Применяю теги и отправляю MP3...")
     await callback.answer()
 
     try:
@@ -387,7 +385,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
     except Exception as e:
         logger.exception("Ошибка при сохранении тегов")
         await callback.message.edit_text(
-            f"❌ <b>Ошибка при сохранении тегов:</b>\n<i>{html.escape(str(e))}</i>",
+            f"<b>Ошибка при сохранении тегов:</b>\n<i>{html.escape(str(e))}</i>",
             parse_mode="HTML"
         )
     finally:
