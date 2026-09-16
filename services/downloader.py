@@ -540,10 +540,16 @@ def _sync_download(
                     # Логика ИСКЛЮЧИТЕЛЬНО для текстового ввода (пользователь написал автора и название трека текстом):
                     if requested_modifiers:
                         matching = requested_modifiers & cand_modifiers
+                        unrequested = cand_modifiers - requested_modifiers
                         if matching:
                             penalty -= 500.0 * len(matching)  # Решительное предпочтение запрошенной пользователем модификации (remix, sped up...)
+                            if unrequested:
+                                penalty += 300.0 * len(unrequested)
                         else:
-                            penalty += 600.0  # Обычные студийные треки без запрошенного эффекта решительно уступают
+                            if unrequested:
+                                penalty += 4000.0  # Несовместимый модификатор (например remix при запросе live)
+                            else:
+                                penalty += 600.0  # Обычные студийные треки без запрошенного эффекта уступают
                     else:
                         # Пользователь искал оригинальный трек текстом:
                         # Любые ремиксы, драмки (drum edit, drums, dnb), каверы, бутлеги, замедления категорически штрафуются (+4000.0)
@@ -752,20 +758,41 @@ def _sync_download(
 
                     # Если пользователь искал оригинал Apple Music или по тексту, а кандидат содержит несовместимые модификаторы (remix, drum edit, cover, live, instrumental):
                     # Отклоняем!
-                    if (is_apple_music or is_text_input) and not requested_modifiers and cand_modifiers:
-                        if is_apple_music:
-                            other_mods = cand_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                    if is_apple_music or is_text_input:
+                        unrequested_cand_mods = cand_modifiers - requested_modifiers
+                        if not requested_modifiers:
+                            if is_apple_music:
+                                other_mods = cand_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "speed up", "speedup", "sped up", "spedup", "fast version", "reverb"}
+                            else:
+                                other_mods = cand_modifiers
+                            if other_mods:
+                                print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {other_mods}. Отклоняем.", flush=True)
+                                for temp_f in output_dir.iterdir():
+                                    if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                        try:
+                                            temp_f.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+                                continue
                         else:
-                            other_mods = cand_modifiers
-                        if other_mods:
-                            print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {other_mods}. Отклоняем.", flush=True)
-                            for temp_f in output_dir.iterdir():
-                                if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                    try:
-                                        temp_f.unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
-                            continue
+                            # Пользователь явно запросил модификацию (например live или remix):
+                            # Если кандидат содержит несовместимые чужие модификаторы (например remix при запросе live):
+                            conflicting_mods = unrequested_cand_mods & {
+                                "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix", "club mix", "dance mix",
+                                "live", "лайв", "концерт", "cover", "кавер",
+                                "drum edit", "drums", "dnb", "драмка", "с драмкой",
+                                "slowed", "slow", "sped up", "speed up", "nightcore",
+                                "instrumental", "инструментал", "minus", "минус", "karaoke"
+                            }
+                            if conflicting_mods:
+                                print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит несовместимые модификаторы {conflicting_mods} (запрошено: {requested_modifiers}). Отклоняем.", flush=True)
+                                for temp_f in output_dir.iterdir():
+                                    if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                        try:
+                                            temp_f.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+                                continue
 
                     new_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, cand_modifiers, req_tag)
                     if new_dur > 0:
@@ -777,7 +804,7 @@ def _sync_download(
                     is_duration_acceptable = False
                     if not expected_duration:
                         is_duration_acceptable = True
-                    elif requested_modifiers and diff <= 45:
+                    elif requested_modifiers and (requested_modifiers & cand_modifiers) and diff <= 45:
                         is_duration_acceptable = True
                     elif is_apple_music or is_text_input:
                         # Строгий допуск для студийного оригинала: максимум 4 секунды (например 3:56-3:58 при эталоне 3:58)
@@ -957,8 +984,8 @@ def _sync_download(
                                             audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
                                             if audio_files:
                                                 sc_dur = int(res_cand.get("duration") or 0)
-                                                if (is_apple_music or is_text_input) and not requested_modifiers and expected_duration and expected_duration > 35:
-                                                    restored_dur = _restore_studio_speed_and_pitch_if_needed(audio_files[0], expected_duration, requested_modifiers, sc_dur, req_tag, is_apple_music=(is_apple_music or is_text_input))
+                                                if is_apple_music and not requested_modifiers and expected_duration and expected_duration > 35:
+                                                    restored_dur = _restore_studio_speed_and_pitch_if_needed(audio_files[0], expected_duration, requested_modifiers, sc_dur, req_tag, is_apple_music=is_apple_music)
                                                     if restored_dur > 0 and restored_dur != sc_dur:
                                                         res_cand["duration"] = restored_dur
                                                         clean_st = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', s_title, flags=re.IGNORECASE).strip()

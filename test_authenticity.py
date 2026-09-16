@@ -428,6 +428,50 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         mods_sped = extract_modifiers(cand_sped["title"])
         self.assertTrue(bool(req_sped & mods_sped))
 
+    def test_requested_vs_unrequested_modifiers_distinction(self):
+        """
+        Проверяет строгое разделение:
+        - Запрос 'Radiohead — Creep Live' -> Live принимается, Remix бракуется как несовместимый
+        - Запрос 'Radiohead — Creep Remix' -> Remix принимается, Live бракуется как несовместимый
+        - Запрос 'Radiohead — Creep' -> студия принимается, Live и Remix бракуются как посторонние
+        """
+        from services.extractor import extract_modifiers
+
+        # 1. Запрос 'Radiohead — Creep Live'
+        req_live = extract_modifiers("Radiohead — Creep Live")
+        self.assertEqual(req_live, {"live"})
+
+        cand_live_mods = extract_modifiers("Radiohead - Creep (Live at Reading)")
+        cand_remix_mods = extract_modifiers("Radiohead - Creep (Club Remix)")
+        cand_studio_mods = extract_modifiers("Radiohead - Creep")
+
+        # Live кандидат: совпадает с запрошенным
+        self.assertTrue(bool(req_live & cand_live_mods))
+        self.assertEqual(cand_live_mods - req_live, set())
+
+        # Remix кандидат: содержит чужой несовместимый модификатор
+        self.assertFalse(bool(req_live & cand_remix_mods))
+        unrequested_in_remix = cand_remix_mods - req_live
+        self.assertIn("remix", unrequested_in_remix)
+
+        # 2. Запрос 'Radiohead — Creep Remix'
+        req_remix = extract_modifiers("Radiohead — Creep Remix")
+        self.assertEqual(req_remix, {"remix"})
+
+        # Remix совпадает
+        self.assertTrue(bool(req_remix & cand_remix_mods))
+        # Live содержит чужой несовместимый
+        self.assertIn("live", cand_live_mods - req_remix)
+
+        # 3. Запрос оригинала 'Radiohead — Creep'
+        req_orig = extract_modifiers("Radiohead — Creep")
+        self.assertEqual(req_orig, set())
+
+        # Для оригинала любые модификаторы являются посторонними
+        self.assertIn("live", cand_live_mods - req_orig)
+        self.assertIn("remix", cand_remix_mods - req_orig)
+        self.assertEqual(cand_studio_mods - req_orig, set())
+
 
 if __name__ == "__main__":
     unittest.main()
