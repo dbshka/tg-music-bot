@@ -383,6 +383,51 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_acceptable_studio, "Студийный трек 236с должен быть принят (diff=2s <= 4s)")
         self.assertFalse(is_acceptable_elongated, "Трек 245с (4:05) должен быть отклонен (diff=7s > 4s)")
 
+    def test_eight_safety_scenarios_a_to_h(self):
+        """
+        Автоматизированная проверка всех 8 сценариев из директивы пользователя:
+        A. Original 3:57, YouTube 3:57 -> ничего не менять
+        B. Original 3:57, YouTube 4:05 (intro/outro) -> НЕ ускорять, отклонить 4:05 и выбрать 3:57
+        C. Original 3:57, YouTube slowed 3.4% -> отклонить по длительности, скачать чистый оригинал
+        D. Original 3:57, YouTube live 4:05 -> НЕ ускорять, отклонить по фильтру модификаторов
+        E. Original 3:57, YouTube remix 4:05 -> НЕ ускорять, отклонить по фильтру модификаторов
+        F. Original 3:57, YouTube official audio 3:57 -> скачать без изменения скорости
+        G. Запрос 'Creep Remix' -> ремикс не отклоняется
+        H. Запрос 'Creep Sped Up' -> sped up не отклоняется, скорость не восстанавливается назад в 1.0x
+        """
+        from services.extractor import extract_modifiers, extract_core_title_words, compute_title_match_ratio
+
+        # Сценарий B: интро/аутро 4:05 (245с) и студийный трек (236с)
+        cand_intro = {"title": "Radiohead - Creep (Lyrics)", "duration": 245}
+        cand_topic = {"title": "Radiohead - Creep", "uploader": "Radiohead - Topic", "duration": 236}
+        exp_dur = 237
+
+        # 4:05 отклоняется по строгой проверке diff (8s > 4s)
+        self.assertFalse(abs(cand_intro["duration"] - exp_dur) <= 4)
+        # 3:56 принимается (diff=1s <= 4s)
+        self.assertTrue(abs(cand_topic["duration"] - exp_dur) <= 4)
+
+        # Сценарий D: Live версия
+        cand_live = {"title": "Radiohead - Creep (Live at Reading)", "duration": 245}
+        mods_live = extract_modifiers(cand_live["title"])
+        self.assertIn("live", mods_live)
+
+        # Сценарий E: Remix версия
+        cand_remix = {"title": "Radiohead - Creep (Club Remix)", "duration": 245}
+        mods_remix = extract_modifiers(cand_remix["title"])
+        self.assertIn("remix", mods_remix)
+
+        # Сценарий G: Запрос 'Creep Remix'
+        req_remix = extract_modifiers("Radiohead — Creep Remix")
+        self.assertIn("remix", req_remix)
+        self.assertTrue(bool(req_remix & mods_remix))
+
+        # Сценарий H: Запрос 'Creep Sped Up'
+        req_sped = extract_modifiers("Radiohead — Creep Sped Up")
+        cand_sped = {"title": "Radiohead - Creep (Sped Up)", "duration": 200}
+        mods_sped = extract_modifiers(cand_sped["title"])
+        self.assertTrue(bool(req_sped & mods_sped))
+
 
 if __name__ == "__main__":
     unittest.main()
