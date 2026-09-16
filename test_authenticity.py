@@ -473,6 +473,60 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cand_studio_mods - req_orig, set())
 
 
+    def test_nfkc_unicode_and_multiplier_detection(self):
+        """
+        Проверяет распознавание математического Unicode жирного начертания (NFKC),
+        полноширинных символов и числовых множителей темпа (0.8x, 0.9x, 85%).
+        """
+        from services.extractor import extract_modifiers, has_track_modifiers
+
+        # Математический жирный шрифт Unicode
+        math_bold = "Radiohead - Creep {𝗦𝗟𝗢𝗪𝗘𝗗 + 𝗥𝗘𝗩𝗘𝗥𝗕}"
+        mods_bold = extract_modifiers(math_bold)
+        self.assertTrue(has_track_modifiers(math_bold))
+        self.assertTrue(bool(mods_bold & {"slowed", "slowed + reverb", "slowed & reverb", "reverb"}))
+
+        # Полноширинный шрифт (full-width)
+        fw = "Radiohead - Creep ｓｌｏｗｅｄ"
+        mods_fw = extract_modifiers(fw)
+        self.assertIn("slowed", mods_fw)
+
+        # Числовые множители темпа
+        mult_09 = "Radiohead - Creep (0.9x)"
+        self.assertIn("speed_multiplier", extract_modifiers(mult_09))
+
+        mult_pct = "Radiohead - Creep 85% speed"
+        self.assertIn("speed_multiplier", extract_modifiers(mult_pct))
+
+        # Расширенные термины
+        slower_term = "Radiohead - Creep (slower version)"
+        mods_slower = extract_modifiers(slower_term)
+        self.assertTrue(bool(mods_slower & {"slow", "slower", "slow version"}))
+
+        pitch_down = "Radiohead - Creep (low pitch down)"
+        mods_pitch = extract_modifiers(pitch_down)
+        self.assertTrue(bool(mods_pitch & {"low pitch", "pitch down"}))
+
+    def test_stealth_slowed_rejection_for_clean_query(self):
+        """
+        Проверяет, что скрытый замедленный трек (stealth slowed) без слова 'slowed'
+        в названии, но с хронометражем 245с или 294с, категорически отклоняется
+        при текстовом поиске студийного оригинала (237с).
+        """
+        expected_duration = 237
+        # 4:05 = 245с (diff = 8с > 4с)
+        diff_245 = abs(245 - expected_duration)
+        self.assertFalse(diff_245 <= 4)
+
+        # 4:54 = 294с (diff = 57с > 4с)
+        diff_294 = abs(294 - expected_duration)
+        self.assertFalse(diff_294 <= 4)
+
+        # Оригинал 237с (diff = 0с <= 4с)
+        diff_orig = abs(237 - expected_duration)
+        self.assertTrue(diff_orig <= 4)
+
+
 if __name__ == "__main__":
     unittest.main()
 

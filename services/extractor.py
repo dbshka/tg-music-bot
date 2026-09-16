@@ -110,7 +110,11 @@ async def _unshorten_url(url: str, session: aiohttp.ClientSession) -> str:
 
 TRACK_MODIFIERS = {
     "super slowed down", "super slowed", "super slow", "ultra slowed",
-    "slowed down", "slowed", "slow", "reverb", "reverbed", "slowed + reverb",
+    "slowed down", "slowed", "slow", "slower", "slow version", "reverb", "reverbed", "slowed + reverb",
+    "slowed & reverb", "slowed and reverb", "slowed+reverb", "slowed reverb", "slowedreverb",
+    "chopped and screwed", "chopped & screwed", "chopped + screwed", "chopped screwed",
+    "low pitch", "pitch down", "pitched down", "down pitch",
+    "high pitch", "pitch up", "pitched up",
     "speed up", "speedup", "sped up", "spedup", "fast version", "sped up + reverb",
     "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix",
     "cover", "кавер", "acoustic", "акустика", "piano", "пианино",
@@ -144,10 +148,10 @@ def convert_keyboard_layout(text: str) -> str:
 
 
 def extract_modifiers(text: Optional[str], ignore_words: Optional[set[str]] = None) -> set[str]:
-    """Извлекает набор модификаторов трека с учетом границ слов и NFC-нормализации."""
+    """Извлекает набор модификаторов трека с учетом границ слов и NFKC-нормализации."""
     if not text:
         return set()
-    norm = unicodedata.normalize("NFC", text).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+    norm = unicodedata.normalize("NFKC", text).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
     found = set()
     norm_ignores = {w.lower() for w in ignore_words} if ignore_words else set()
     for mod in TRACK_MODIFIERS:
@@ -156,6 +160,13 @@ def extract_modifiers(text: Optional[str], ignore_words: Optional[set[str]] = No
             if norm_ignores and mod in norm_ignores:
                 continue
             found.add(mod)
+
+    # Числовые множители темпа/скорости (например 0.7x, 0.8x, 0.85x, 0.9x, 1.1x, 1.25x, 1.5x)
+    if re.search(r'(?<!\w)(?:0\.[5-9]\d?|1\.[1-9]\d?)\s*x(?!\w)', norm):
+        found.add("speed_multiplier")
+    # Процентное изменение скорости (например 80% speed, 85%, 90% и т.д.)
+    if re.search(r'(?<!\w)(?:[5-9]\d|1[1-9]\d)\s*%\s*(?:speed|скорость)?(?!\w)', norm):
+        found.add("speed_multiplier")
 
     # Проверяем одиночные слова drum/drums/барабаны, если они не являются частью оригинального названия трека или артиста
     if not ("drum" in norm_ignores or "drums" in norm_ignores or "барабаны" in norm_ignores):

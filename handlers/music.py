@@ -392,8 +392,8 @@ async def _execute_download_and_send(
             elif is_text_input and not user_mods and cached_mods:
                 print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached track '{cached_title}' has unwanted modifiers {cached_mods}. Purging.", flush=True)
                 should_invalidate = True
-            # 3. Для текстового поиска с известным хронометражем: если кэш отличается более чем на 5 сек
-            elif is_text_input and not user_mods and track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 5:
+            # 3. Для текстового поиска с известным хронометражем: если кэш отличается более чем на 4 сек
+            elif is_text_input and not user_mods and track_info.duration and track_info.duration > 35 and cached_dur > 0 and abs(cached_dur - track_info.duration) > 4:
                 print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging.", flush=True)
                 should_invalidate = True
 
