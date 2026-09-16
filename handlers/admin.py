@@ -97,8 +97,13 @@ async def cmd_broadcast(message: Message, bot: Bot):
             # Пользователь заблокировал бота
             blocked_count += 1
         except TelegramAPIError as e:
-            logger.warning("Ошибка отправки рассылки пользователю %s: %s", uid, e)
-            failed_count += 1
+            # Если HTML-разметка оказалась невалидной, пробуем отправить обычным текстом без parse_mode
+            try:
+                await bot.send_message(chat_id=uid, text=broadcast_text, parse_mode=None)
+                sent_count += 1
+            except Exception as inner_err:
+                logger.warning("Ошибка отправки рассылки пользователю %s: %s", uid, inner_err)
+                failed_count += 1
         except Exception as e:
             logger.error("Непредвиденная ошибка рассылки %s: %s", uid, e)
             failed_count += 1

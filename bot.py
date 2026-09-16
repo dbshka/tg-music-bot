@@ -2,6 +2,7 @@ import asyncio
 import logging
 import socket
 import sys
+import time
 import shutil
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -130,13 +131,18 @@ async def main():
             "Рекомендуется добавить Secret File 'cookies.txt' в панели Render (Environment -> Secret Files)."
         )
 
-    # Очистка папки downloads от старых временных файлов
+    # Очистка папки downloads от старых временных файлов (старше 30 минут)
     try:
+        now_ts = time.time()
         for item in DOWNLOADS_DIR.iterdir():
-            if item.is_dir():
-                shutil.rmtree(item, ignore_errors=True)
-            else:
-                item.unlink(missing_ok=True)
+            try:
+                if now_ts - item.stat().st_mtime > 1800:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+            except Exception:
+                pass
     except Exception:
         pass
 

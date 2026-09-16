@@ -1,14 +1,17 @@
 import os
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
-from PIL import Image
+from PIL import Image, ImageOps
 
 import mutagen
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, ID3NoHeaderError
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,8 +54,8 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
                     cover_path = extracted
                 except Exception:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Ошибка чтения тегов MP4/M4A %s: %s", file_path.name, e)
         return AudioMetadata(
             title=title,
             artist=artist,
@@ -84,8 +87,8 @@ def read_mp3_tags(file_path: Path) -> AudioMetadata:
                     except Exception:
                         pass
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Ошибка чтения тегов MP3 %s: %s", file_path.name, e)
 
     return AudioMetadata(
         title=title,
@@ -103,12 +106,16 @@ async def read_mp3_tags_async(file_path: Path) -> AudioMetadata:
 
 
 def prepare_cover_image(image_path: Path, output_path: Path) -> Path:
-    """Приводит изображение к квадратному формату JPEG до 640x640 для Telegram и ID3/MP4."""
+    """Приводит изображение к строго квадратному формату JPEG 1:1 (до 640x640) для Telegram и ID3/MP4."""
     with Image.open(image_path) as img:
         rgb_img = img.convert("RGB")
-        rgb_img.thumbnail((640, 640))
+        w, h = rgb_img.size
+        # Ограничиваем максимальную сторону 640px, сохраняя квадратность
+        target_side = min(max(w, h), 640)
+        # Центрированная обрезка 1:1
+        square_img = ImageOps.fit(rgb_img, (target_side, target_side), Image.Resampling.LANCZOS)
         target = output_path.with_suffix(".jpg")
-        rgb_img.save(target, "JPEG", quality=88)
+        square_img.save(target, "JPEG", quality=88)
         return target
 
 
@@ -121,6 +128,7 @@ def apply_mp3_tags(
 ) -> Tuple[Path, Optional[Path]]:
     """
     Записывает обновленные теги и обложку в MP3 или M4A.
+    Для M4A ни в коем случае не вызывает ID3 (защита от повреждения MP4-контейнера).
     Возвращает (file_path, cover_jpg_path).
     """
     final_cover_jpg = None
@@ -142,9 +150,11 @@ def apply_mp3_tags(
                     mp4["covr"] = [MP4Cover(f.read(), imageformat=MP4Cover.FORMAT_JPEG)]
             mp4.save()
             return file_path, final_cover_jpg
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Ошибка при сохранении тегов MP4/M4A %s: %s", file_path.name, e)
+            raise RuntimeError(f"Не удалось записать теги в {file_path.name}: {e}")
 
+    # MP3 ID3 теги (только для non-MP4 файлов)
     try:
         id3 = ID3(file_path)
     except ID3NoHeaderError:
@@ -183,4 +193,3 @@ async def apply_mp3_tags_async(
 ) -> Tuple[Path, Optional[Path]]:
     """Асинхронная запись тегов и обложки без блокировки event loop."""
     return await asyncio.to_thread(apply_mp3_tags, file_path, title, artist, album, cover_path)
-

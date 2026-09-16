@@ -54,14 +54,14 @@ def get_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def get_audio_edit_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка 'Изменить теги' под отправленным аудиофайлом."""
+def get_audio_edit_keyboard(owner_user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    """Кнопка 'Изменить теги' под отправленным аудиофайлом, привязанная к владельцу."""
+    cb_data = f"audio:edit:{owner_user_id}" if owner_user_id else "audio:edit"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Изменить теги", callback_data="audio:edit")]
+            [InlineKeyboardButton(text="Изменить теги", callback_data=cb_data)]
         ]
     )
-
 
 
 def get_back_keyboard() -> InlineKeyboardMarkup:
@@ -121,6 +121,16 @@ async def render_menu(bot: Bot, chat_id: int, state: FSMContext):
     await state.update_data(menu_message_id=new_msg.message_id)
 
 
+async def _check_owner(callback: CallbackQuery, state: FSMContext) -> bool:
+    """Проверяет, что действие выполняет владелец сессии редактирования."""
+    data = await state.get_data()
+    owner_id = data.get("owner_user_id")
+    if owner_id and callback.from_user and callback.from_user.id != owner_id:
+        await callback.answer("Вы не являетесь владельцем этой сессии редактирования.", show_alert=True)
+        return False
+    return True
+
+
 # -------------------------------------------------------------
 # 1. Приём входящего MP3-файла (аудио или документ)
 # -------------------------------------------------------------
@@ -176,6 +186,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
             initial_cover_path = str(meta.cover_path)
 
         await state.update_data(
+            owner_user_id=message.from_user.id if message.from_user else None,
             folder_path=str(session_dir),
             file_path=str(local_file_path),
             title=initial_title,
@@ -201,8 +212,16 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
 # -------------------------------------------------------------
 # 2. Нажатие кнопки «Изменить теги» под аудиофайлом в чате
 # -------------------------------------------------------------
-@router.callback_query(F.data == "audio:edit")
+@router.callback_query(F.data.startswith("audio:edit"))
 async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    # Авторизация владельца трека
+    parts = callback.data.split(":")
+    if len(parts) >= 3 and parts[2].isdigit():
+        expected_owner = int(parts[2])
+        if callback.from_user and callback.from_user.id != expected_owner:
+            await callback.answer("Редактировать теги может только пользователь, запросивший трек.", show_alert=True)
+            return
+
     audio_obj = callback.message.audio
     if not audio_obj:
         await callback.answer("Аудиофайл не найден.", show_alert=True)
@@ -247,6 +266,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
             initial_cover_path = str(meta.cover_path)
 
         await state.update_data(
+            owner_user_id=callback.from_user.id if callback.from_user else None,
             folder_path=str(session_dir),
             file_path=str(local_file_path),
             title=initial_title,
@@ -275,6 +295,8 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
 
 @router.callback_query(F.data == "tag:edit:artist")
 async def cb_edit_artist(callback: CallbackQuery, state: FSMContext):
+    if not await _check_owner(callback, state):
+        return
     await state.set_state(TagEditorStates.waiting_for_artist)
     await callback.message.edit_text(
         "<b>Введите имя исполнителя (артиста):</b>\n\n"
@@ -287,6 +309,8 @@ async def cb_edit_artist(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "tag:edit:title")
 async def cb_edit_title(callback: CallbackQuery, state: FSMContext):
+    if not await _check_owner(callback, state):
+        return
     await state.set_state(TagEditorStates.waiting_for_title)
     await callback.message.edit_text(
         "<b>Введите новое название песни:</b>\n\n"
@@ -299,6 +323,8 @@ async def cb_edit_title(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "tag:edit:album")
 async def cb_edit_album(callback: CallbackQuery, state: FSMContext):
+    if not await _check_owner(callback, state):
+        return
     await state.set_state(TagEditorStates.waiting_for_album)
     await callback.message.edit_text(
         "<b>Введите название альбома:</b>\n\n"
@@ -311,10 +337,12 @@ async def cb_edit_album(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "tag:edit:cover")
 async def cb_edit_cover(callback: CallbackQuery, state: FSMContext):
+    if not await _check_owner(callback, state):
+        return
     await state.set_state(TagEditorStates.waiting_for_cover)
     await callback.message.edit_text(
         "<b>Отправьте изображение (фотографию) для обложки трека:</b>\n\n"
-        "Изображение будет автоматически обрезано и вшито в аудиофайл.\n\n"
+        "Изображение будет автоматически обрезано 1:1 и вшито в аудиофайл.\n\n"
         "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
@@ -324,12 +352,16 @@ async def cb_edit_cover(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "tag:back")
 async def cb_back(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await _check_owner(callback, state):
+        return
     await render_menu(bot, callback.message.chat.id, state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "tag:cancel")
 async def cb_cancel(callback: CallbackQuery, state: FSMContext):
+    if not await _check_owner(callback, state):
+        return
     data = await state.get_data()
     folder = data.get("folder_path")
     if folder:
@@ -341,6 +373,8 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "tag:save")
 async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await _check_owner(callback, state):
+        return
     data = await state.get_data()
     file_path = data.get("file_path")
     folder_path = data.get("folder_path")
@@ -350,23 +384,24 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
-    await callback.message.edit_text("Применяю теги и отправляю MP3...")
+    await callback.message.edit_text("Применяю теги и отправляю аудио...")
     await callback.answer()
 
     try:
-        mp3_path = Path(file_path)
+        audio_path = Path(file_path)
         cover_path = Path(data["cover_path"]) if data.get("cover_path") else None
 
-        updated_mp3, final_cover = await apply_mp3_tags_async(
-            file_path=mp3_path,
+        updated_audio, final_cover = await apply_mp3_tags_async(
+            file_path=audio_path,
             title=data.get("title"),
             artist=data.get("artist"),
             album=data.get("album"),
             cover_path=cover_path
         )
 
-        audio_file = FSInputFile(updated_mp3)
+        audio_file = FSInputFile(updated_audio)
         thumb_file = FSInputFile(final_cover) if final_cover and final_cover.exists() else None
+        owner_id = data.get("owner_user_id") or (callback.from_user.id if callback.from_user else None)
 
         await callback.message.answer_audio(
             audio=audio_file,
@@ -374,7 +409,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
             performer=data.get("artist"),
             duration=data.get("duration") or 0,
             thumbnail=thumb_file,
-            reply_markup=get_audio_edit_keyboard()
+            reply_markup=get_audio_edit_keyboard(owner_id)
         )
 
         if callback.from_user:
@@ -395,7 +430,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 # -------------------------------------------------------------
-# 3. Приём новых значений (текст / фото) в состояниях FSM
+# 4. Приём новых значений (текст / фото) в состояниях FSM
 # -------------------------------------------------------------
 @router.message(TagEditorStates.waiting_for_artist, F.text)
 async def process_artist(message: Message, state: FSMContext, bot: Bot):

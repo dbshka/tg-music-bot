@@ -9,6 +9,27 @@ import aiohttp
 
 from config import CUSTOM_API_SERVER
 from services.http_client import get_shared_session
+from services.identity import (
+    TRACK_MODIFIERS,
+    PERFORMANCE_MODIFIERS,
+    DSP_SUPPORTED_MODIFIERS,
+    SEMANTIC_MODIFIERS,
+    clean_unicode_text,
+    parse_speed_multiplier,
+    extract_modifiers,
+    has_track_modifiers,
+    extract_track_modifiers,
+    TRANSLIT_TABLE,
+    transliterate_text,
+    split_artist_names,
+    validate_artist_match,
+    extract_core_title_words,
+    compute_title_match_ratio,
+    parse_query_artist_title,
+    TrackIdentity,
+    VariantIdentity
+)
+from services.security import is_safe_url, safe_unshorten_url
 
 logger = logging.getLogger(__name__)
 
@@ -83,51 +104,28 @@ def find_first_url(text: str) -> Optional[str]:
     return None
 
 
+def parse_url_and_modifiers(text: str) -> Tuple[Optional[str], set, Optional[float]]:
+    """
+    Извлекает URL и запрошенные модификаторы/множители из текста (например '<url> slowed', '<url> 1.1x').
+    """
+    if not text:
+        return None, set(), None
+    cleaned = clean_unicode_text(text)
+    url = find_first_url(cleaned)
+    if not url:
+        return None, set(), None
+    remainder = cleaned.replace(url, " ")
+    mods = extract_modifiers(remainder)
+    mult = parse_speed_multiplier(remainder)
+    return url, mods, mult
+
 async def _unshorten_url(url: str, session: aiohttp.ClientSession) -> str:
-    """
-    Раскрывает редиректы для коротких ссылок (ya.cc, clck.ru, vk.cc, t.co, bit.ly, spotify.link, band.link).
-    """
-    short_domains = ("ya.cc", "clck.ru", "vk.cc", "t.co", "goo.gl", "bit.ly", "spotify.link", "band.link", "tinyurl.com")
-    parsed = urllib.parse.urlparse(url)
-    if any(sd in parsed.netloc.lower() for sd in short_domains):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-        try:
-            async with session.head(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-                return str(resp.url)
-        except Exception:
-            try:
-                async with session.get(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-                    return str(resp.url)
-            except Exception:
-                pass
-    return url
+    """Безопасное раскрытие ссылок через safe_unshorten_url с защитой от SSRF."""
+    return await safe_unshorten_url(url, session)
 
 
 
 
-
-TRACK_MODIFIERS = {
-    "super slowed down", "super slowed", "super slow", "ultra slowed",
-    "slowed down", "slowed", "slow", "slower", "slow version", "reverb", "reverbed", "slowed + reverb",
-    "slowed & reverb", "slowed and reverb", "slowed+reverb", "slowed reverb", "slowedreverb",
-    "chopped and screwed", "chopped & screwed", "chopped + screwed", "chopped screwed",
-    "low pitch", "pitch down", "pitched down", "down pitch",
-    "high pitch", "pitch up", "pitched up",
-    "speed up", "speedup", "sped up", "spedup", "fast version", "sped up + reverb",
-    "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix",
-    "cover", "кавер", "acoustic", "акустика", "piano", "пианино",
-    "acapella", "a cappella", "акапелла", "live", "лайв", "концерт",
-    "8d", "16d", "nightcore", "daycore", "instrumental", "инструментал", "minus", "минус",
-    "edit", "fan edit", "karaoke", "караоке", "orchestral", "orchestra", "tribute",
-    "drum edit", "drum cover", "drum version", "drum rework", "drum remix", "drum beat",
-    "with drums", "with drum", "drums version", "drum and bass", "drum & bass", "dnb",
-    "драмка", "с драмкой", "с барабанами", "днб",
-    "rework", "drill", "дрил", "дрилл", "phonk", "фонк", "jersey club",
-    "club mix", "club edit", "club version", "bass boost", "bass boosted", "808", "type beat",
-    "mix", "микс", "dj mix", "radio edit", "extended mix", "extended version", "dance mix"
-}
 
 # Таблицы для конвертации раскладки клавиатуры RU <-> EN
 EN_LAYOUT = "`~qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?"
@@ -146,111 +144,104 @@ def convert_keyboard_layout(text: str) -> str:
         return text.translate(RU_TO_EN)
     return text
 
+def _score_catalog_candidate(query: str, cand_artist: str, cand_title: str, cand_album: str = "") -> float:
+    """
+    Интеллектуальная оценка кандидата из каталога (Deezer / iTunes).
+    Отсеивает бутлеги, каверы, 8-bit эмуляции и несовпадающих артистов/названия.
+    Возвращает скор (от 0.0 до 100.0). Отрицательный скор означает категорический отказ.
+    """
+    if not cand_artist or not cand_title:
+        return -1000.0
 
-def extract_modifiers(text: Optional[str], ignore_words: Optional[set[str]] = None) -> set[str]:
-    """Извлекает набор модификаторов трека с учетом границ слов и NFKC-нормализации."""
-    if not text:
-        return set()
-    norm = unicodedata.normalize("NFKC", text).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
-    found = set()
-    norm_ignores = {w.lower() for w in ignore_words} if ignore_words else set()
-    for mod in TRACK_MODIFIERS:
-        pattern = r'(?<!\w)' + re.escape(mod) + r'(?!\w)'
-        if re.search(pattern, norm):
-            if norm_ignores and mod in norm_ignores:
-                continue
-            found.add(mod)
+    q_artist, q_title = None, query
+    for sep in [" — ", " - ", " – "]:
+        if sep in query:
+            parts = query.split(sep, 1)
+            if parts[0].strip() and parts[1].strip():
+                q_artist, q_title = parts[0].strip(), parts[1].strip()
+                break
 
-    # Числовые множители темпа/скорости (например 0.7x, 0.8x, 0.85x, 0.9x, 1.1x, 1.25x, 1.5x)
-    if re.search(r'(?<!\w)(?:0\.[5-9]\d?|1\.[1-9]\d?)\s*x(?!\w)', norm):
-        found.add("speed_multiplier")
-    # Процентное изменение скорости (например 80% speed, 85%, 90% и т.д.)
-    if re.search(r'(?<!\w)(?:[5-9]\d|1[1-9]\d)\s*%\s*(?:speed|скорость)?(?!\w)', norm):
-        found.add("speed_multiplier")
+    c_art = cand_artist.lower()
+    c_tit = cand_title.lower()
+    c_alb = (cand_album or "").lower()
+    full_c = f"{c_art} {c_tit} {c_alb}"
 
-    # Проверяем одиночные слова drum/drums/барабаны, если они не являются частью оригинального названия трека или артиста
-    if not ("drum" in norm_ignores or "drums" in norm_ignores or "барабаны" in norm_ignores):
-        if re.search(r'(?<!\w)(?:drums?|барабан[ыа]?)(?!\w)', norm):
-            found.add("drums")
+    # 1. Негативные маркеры (бутлеги, каверы, трибьюты, 8-bit караоке)
+    if not has_track_modifiers(query):
+        negatives = [
+            "bootleg", "bootleeg", "tribute", "8-bit", "8 bit", "emulation",
+            "karaoke", "караоке", "instrumental", "инструментал", "кавер", "cover",
+            "in the style of", "originally performed by"
+        ]
+        for neg in negatives:
+            if neg in full_c:
+                return -1000.0
 
-    return found
+    # 2. Оценка совпадения исполнителя
+    art_score = 1.0
+    clean_ca = re.sub(r'[\W_]+', ' ', c_art).strip()
+    ca_words = set(clean_ca.split()) - {"the", "a", "an"}
+    if not ca_words:
+        ca_words = set(clean_ca.split())
 
+    clean_ct = re.sub(r'[\W_]+', ' ', c_tit).strip()
+    clean_qt = re.sub(r'[\W_]+', ' ', q_title.lower()).strip() if q_title else ""
 
-def has_track_modifiers(text: Optional[str], ignore_words: Optional[set[str]] = None) -> bool:
-    """Проверяет наличие любых модификаторов в строке."""
-    return bool(extract_modifiers(text, ignore_words=ignore_words))
+    if q_artist:
+        clean_qa = re.sub(r'[\W_]+', ' ', q_artist.lower()).strip()
+        # Проверка перевернутого запроса (Название — Исполнитель)
+        if clean_qa and clean_qt and (clean_qa == clean_ct or clean_qa in clean_ct or clean_ct in clean_qa) and \
+           (clean_qt == clean_ca or clean_qt in clean_ca or clean_ca in clean_qt):
+            return 98.0
+        clean_qa = re.sub(r'[\W_]+', ' ', q_artist.lower()).strip()
+        qa_core = re.sub(r'^the\s+', '', clean_qa)
+        ca_core = re.sub(r'^the\s+', '', clean_ca)
+        if clean_qa == clean_ca or qa_core == ca_core:
+            art_score = 1.0
+        elif clean_qa in clean_ca or clean_ca in clean_qa:
+            w_qa = clean_qa.split()
+            w_ca = clean_ca.split()
+            if len(w_qa) == len(w_ca) and w_qa != w_ca:
+                return -500.0  # Искаженное имя артиста (например 'Arctic Monkey' вместо 'Arctic Monkeys')
+            art_score = 0.85
+        else:
+            w_qa = set(clean_qa.split())
+            w_ca = set(clean_ca.split())
+            overlap = len(w_qa & w_ca) / max(1, len(w_qa))
+            if overlap >= 0.7:
+                art_score = 0.7
+            else:
+                return -500.0  # Чужой артист! (например DJ Pedro Dance вместо Dua Lipa, Alejandro MG вместо Kavinsky)
+    else:
+        # В запросе нет разделителя ' - ' (например 'Radiohead Creep', 'idioteque radiohead', '505 arctic monkeys')
+        clean_q_all = re.sub(r'[\W_]+', ' ', query.lower()).strip()
+        w_query = set(clean_q_all.split())
+        art_overlap = len(ca_words & w_query) / max(1, len(ca_words))
+        if clean_ca in clean_q_all or art_overlap >= 0.8:
+            art_score = 1.0
+        elif art_overlap >= 0.5:
+            art_score = 0.7
+        else:
+            return -500.0  # Имя артиста вообще не упоминается в запросе! (отсекает каверы/бутлеги вроде Mirko Barbesino)
 
+    # 3. Оценка совпадения названия трека
+    clean_qt = re.sub(r'[\W_]+', ' ', q_title.lower()).strip()
+    clean_ct = re.sub(r'[\W_]+', ' ', c_tit).strip()
+    w_qt = set(clean_qt.split())
+    w_ct = set(clean_ct.split())
 
-TRANSLIT_TABLE = {
-    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
-    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
-    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
-    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
-}
+    filler = {"the", "a", "an", "in", "on", "at", "of", "and", "or", "feat", "ft"}
+    w_qt_core = w_qt - filler
+    if not q_artist and art_score >= 0.7:
+        w_qt_core = w_qt_core - ca_words
+    if not w_qt_core:
+        w_qt_core = w_qt
 
+    overlap_tit = len(w_qt_core & w_ct) / max(1, len(w_qt_core))
+    if overlap_tit < 0.5:
+        return -500.0  # Не то название! (например 'a lot' вместо 'redrum')
 
-def transliterate_text(text: str) -> str:
-    """Универсальная транслитерация кириллицы в латиницу с NFC-нормализацией."""
-    norm = unicodedata.normalize("NFC", text or "").lower()
-    return "".join(TRANSLIT_TABLE.get(c, c) for c in norm)
-
-
-def extract_core_title_words(title: Optional[str], artist: Optional[str] = None) -> set[str]:
-    """Извлекает ключевые слова названия трека без модификаторов и имени артиста с NFC-нормализацией."""
-    if not title:
-        return set()
-    raw = unicodedata.normalize("NFC", title).lower()
-    raw = raw.replace("’", "'").replace("‘", "'").replace("`", "'")
-    # 1. Удаляем feat/ft/prod конструкции в скобках
-    raw = re.sub(r'[\(\[][^\)\]]*(?:feat|ft\.|prod|prod\.)[^\)\]]*[\)\]]', ' ', raw)
-    # 2. Удаляем известные модификаторы трека
-    for mod in sorted(TRACK_MODIFIERS, key=len, reverse=True):
-        raw = re.sub(r'\b' + re.escape(mod) + r'\b', ' ', raw)
-    # 3. Удаляем слова артиста, если они присутствуют в названии
-    if artist:
-        artist_norm = unicodedata.normalize("NFC", artist).lower().replace("’", "'").replace("‘", "'").replace("`", "'")
-        artist_words = set(re.findall(r'[\w]+', artist_norm))
-        for aw in artist_words:
-            if len(aw) >= 2:
-                raw = re.sub(r'\b' + re.escape(aw) + r'\b', ' ', raw)
-    # 4. Извлекаем слова названия
-    words = set(re.findall(r'[\w]+', raw))
-    return {unicodedata.normalize("NFC", w) for w in words if len(w) >= 1}
-
-
-def compute_title_match_ratio(cand_title: str, core_words: set[str]) -> float:
-    """Вычисляет коэффициент покрытия ключевых слов названия в заголовке кандидата с NFC-нормализацией."""
-    if not core_words:
-        return 1.0
-    cand_norm = unicodedata.normalize("NFC", cand_title or "").lower()
-    cand_lower = cand_norm.replace("’", "'").replace("‘", "'").replace("`", "'")
-    cand_translit = transliterate_text(cand_lower)
-    cand_tokens = set(re.findall(r'[\w]+', cand_lower))
-    cand_tokens_translit = set(re.findall(r'[\w]+', cand_translit))
-
-    core_words_norm = {unicodedata.normalize("NFC", w).lower().replace("’", "'").replace("‘", "'").replace("`", "'") for w in core_words}
-
-    matched = 0
-    for w in core_words_norm:
-        w_translit = transliterate_text(w)
-        # 1. Точное совпадение токена
-        if w in cand_tokens or w_translit in cand_tokens_translit or w_translit in cand_tokens:
-            matched += 1
-            continue
-        # 2. Подстрока для слов от 3 символов
-        if len(w) >= 3 and (w in cand_lower or w_translit in cand_translit):
-            matched += 1
-            continue
-        # 3. Стемминг для длинных слов (от 4 символов)
-        if len(w) >= 4:
-            stem = w[:-1] if len(w) > 4 else w
-            stem_tr = w_translit[:-1] if len(w_translit) > 4 else w_translit
-            if any(stem in tok for tok in cand_tokens if len(tok) >= 4) or \
-               any(stem_tr in tok for tok in cand_tokens_translit if len(tok) >= 4):
-                matched += 1
-                continue
-
-    return matched / len(core_words_norm)
+    return art_score * 50.0 + overlap_tit * 50.0
 
 
 async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
@@ -262,26 +253,24 @@ async def _search_deezer(session: aiohttp.ClientSession, query: str) -> Tuple[Op
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 results = data.get("data", [])
-                clean_q = re.sub(r'[\W_]+', ' ', query.lower()).strip()
-                q_words = set(clean_q.split())
+                best_cand = None
+                best_score = -1.0
                 for item in results:
                     artist = item.get("artist", {}).get("name") or ""
                     title = item.get("title") or ""
-                    # Если пользователь не искал модификаторы, пропускаем каверы/акустику
+                    album_title = item.get("album", {}).get("title") or ""
+                    duration = int(item.get("duration") or 0)
+                    if not artist or not title or duration <= 0:
+                        continue
                     if not has_track_modifiers(query) and has_track_modifiers(title):
                         continue
-                    full_str = f"{artist} {title}".lower()
-                    clean_full = re.sub(r'[\W_]+', ' ', full_str).strip()
-                    item_words = set(clean_full.split())
-                    match = (
-                        (clean_q == clean_full)
-                        or (q_words and q_words.issubset(item_words))
-                        or (len(q_words & item_words) / max(1, len(q_words)) >= 0.6)
-                    )
-                    if match:
+                    score = _score_catalog_candidate(query, artist, title, album_title)
+                    if score > best_score and score >= 70.0:
+                        best_score = score
                         cover = item.get("album", {}).get("cover_xl") or item.get("album", {}).get("cover_big")
-                        duration = int(item.get("duration") or 0) or None
-                        return artist, title, cover, duration
+                        best_cand = (artist, title, cover, duration)
+                if best_cand:
+                    return best_cand
     except Exception:
         pass
     return None, None, None, None
@@ -296,25 +285,24 @@ async def _search_itunes_track(session: aiohttp.ClientSession, query: str) -> Tu
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 results = data.get("results", [])
-                clean_q = re.sub(r'[\W_]+', ' ', query.lower()).strip()
-                q_words = set(clean_q.split())
+                best_cand = None
+                best_score = -1.0
                 for item in results:
                     track_name = item.get("trackName") or ""
                     artist_name = item.get("artistName") or ""
+                    collection_name = item.get("collectionName") or ""
+                    duration = int(item.get("trackTimeMillis", 0) / 1000)
+                    if not artist_name or not track_name or duration <= 0:
+                        continue
                     if not has_track_modifiers(query) and has_track_modifiers(track_name):
                         continue
-                    full_str = f"{artist_name} {track_name}".lower()
-                    clean_full = re.sub(r'[\W_]+', ' ', full_str).strip()
-                    item_words = set(clean_full.split())
-                    match = (
-                        (clean_q == clean_full)
-                        or (q_words and q_words.issubset(item_words))
-                        or (len(q_words & item_words) / max(1, len(q_words)) >= 0.6)
-                    )
-                    if match:
+                    score = _score_catalog_candidate(query, artist_name, track_name, collection_name)
+                    if score > best_score and score >= 70.0:
+                        best_score = score
                         artwork = item.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-                        duration = int(item.get("trackTimeMillis", 0) / 1000) or None
-                        return artist_name, track_name, artwork, duration
+                        best_cand = (artist_name, track_name, artwork, duration)
+                if best_cand:
+                    return best_cand
     except Exception:
         pass
     return None, None, None, None
@@ -332,7 +320,8 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
     if has_track_modifiers(query):
         return None
 
-    clean_q = re.sub(r'[\W_]+', ' ', query).strip()
+    norm_q = re.sub(r'\s*[-—–]\s*', ' - ', query).strip()
+    clean_q = re.sub(r'[^\w\s\-]+', ' ', norm_q).strip()
     if not clean_q or len(clean_q) < 2:
         return None
 
@@ -375,25 +364,33 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
 
 async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
     """
-    Превращает произвольный текстовый запрос пользователя в виртуальную ссылку / ExtractedTrack,
-    как если бы пользователь отправил ссылку из Spotify:
+    Превращает произвольный текстовый запрос пользователя в виртуальную ссылку / ExtractedTrack:
     1. Если в запросе есть специфические модификаторы (slowed, remix, reverb и т.д.),
        канонический оригинал не навязывается, чтобы пользователь получил желаемый звук.
     2. По обычным запросам опрашивает студийные каталоги (Deezer / iTunes), получая
        чистые имя исполнителя, название, эталонный хронометраж и официальную студийную обложку.
-    3. При 0 результатах в самую последнюю очередь пробует конвертацию раскладки (RU <-> EN).
-    4. Если метаданных в каталогах нет, формирует безопасный поисковый ExtractedTrack.
+    3. При 0 результатах пробует конвертацию раскладки (RU <-> EN) только для обращения к каталогу.
+    4. Если метаданных в каталогах нет, формирует безопасный поисковый ExtractedTrack,
+       сохраняя оригинальный текст пользователя (кириллицу).
     """
     clean_q = unicodedata.normalize("NFC", query).strip()
 
-    # 1. Запрос с явными модификаторами (например 'radiohead creep slowed')
+    parsed_artist, parsed_title = None, clean_q
+    for sep in [" — ", " - ", " – "]:
+        if sep in clean_q:
+            parts = clean_q.split(sep, 1)
+            if parts[0].strip() and parts[1].strip():
+                parsed_artist, parsed_title = parts[0].strip(), parts[1].strip()
+                break
+
+    # 1. Запрос с явными модификаторами (например 'Billie Eilish — bad guy 1.1x')
     if has_track_modifiers(clean_q):
         return ExtractedTrack(
             platform="TextSearch",
             target=f"ytsearch5:{clean_q}",
             is_search=True,
-            title=clean_q,
-            artist=None,
+            title=parsed_title,
+            artist=parsed_artist,
             thumbnail_url=None,
             duration=None
         )
@@ -403,24 +400,29 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
     if canonical:
         return canonical
 
-    # -------------------------------------------------------------
-    # 3. ТОЛЬКО В САМУЮ ПОСЛЕДНЮЮ ОЧЕРЕДЬ: пробуем смену раскладки (RU <-> EN)
-    # -------------------------------------------------------------
+    # 3. Резервная проверка каталога со сменой раскладки (только для запроса в каталог!)
     flipped = convert_keyboard_layout(clean_q)
     if flipped.lower() != clean_q.lower():
         canonical_flipped = await resolve_canonical_track_info_async(flipped)
         if canonical_flipped:
             return canonical_flipped
-        # Если в каталогах нет, пробуем искать в YouTube по исправленной раскладке
-        clean_q = flipped
 
-    # 4. Резервный поиск по тексту (редкий звук, SoundCloud и др.)
+    # 4. Резервный поиск по оригинальному тексту (редкий звук, инди, кириллица, SoundCloud)
+    # ВСЕГДА сохраняем оригинальный запрос пользователя (не подменяя его на qwerty)
+    parsed_artist, parsed_title = None, clean_q
+    for sep in [" — ", " - ", " – "]:
+        if sep in clean_q:
+            parts = clean_q.split(sep, 1)
+            if parts[0].strip() and parts[1].strip():
+                parsed_artist, parsed_title = parts[0].strip(), parts[1].strip()
+                break
+
     return ExtractedTrack(
         platform="TextSearch",
         target=f"ytsearch5:{clean_q}",
         is_search=True,
-        title=clean_q,
-        artist=None,
+        title=parsed_title,
+        artist=parsed_artist,
         thumbnail_url=None,
         duration=None
     )
@@ -808,11 +810,48 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     if session is None:
         session = get_shared_session()
 
-    # 0. Автоматическое раскрытие коротких ссылок (ya.cc, clck.ru, spotify.link, band.link и др.)
+    # 0. Проверка безопасности URL (SSRF)
+    is_safe, reason = is_safe_url(url)
+    if not is_safe:
+        raise ValueError(f"Недопустимая или небезопасная ссылка ({reason})")
+
+    # Автоматическое безопасное раскрытие коротких ссылок
     url = await _unshorten_url(url, session)
+    is_safe_after, reason_after = is_safe_url(url)
+    if not is_safe_after:
+        raise ValueError(f"Недопустимая ссылка после редиректа ({reason_after})")
 
     parsed = urllib.parse.urlparse(url)
     domain = parsed.netloc.lower()
+    path = parsed.path.lower()
+
+    # Явный отказ от альбомов и плейлистов (Section 14)
+    if "spotify.com" in domain:
+        if "/album/" in path or "/playlist/" in path or "/collection/" in path:
+            raise ValueError(
+                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
+                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+            )
+    elif "apple.com" in domain:
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "/album/" in path and "i" not in qs and not re.search(r'/album/[^/\s?]+/\d+/\d+', path):
+            raise ValueError(
+                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
+                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+            )
+    elif "youtube.com" in domain or "youtu.be" in domain:
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "/playlist" in path or ("list=" in url and "v" not in qs):
+            raise ValueError(
+                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
+                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+            )
+    elif "soundcloud.com" in domain:
+        if "/sets/" in path:
+            raise ValueError(
+                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
+                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+            )
 
     # 1. Яндекс Музыка (прямые ссылки отключены из-за геоблока хостинга)
     if "music.yandex." in domain or "ya.cc" in domain or ("yandex." in domain and ("/album" in url or "/track" in url or "/artist" in url or "/playlists" in url)):

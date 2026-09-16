@@ -8,6 +8,7 @@ import asyncio
 from collections import OrderedDict
 from typing import Optional, List, Dict, Any
 from config import DB_PATH
+from services.identity import clean_unicode_text
 
 
 class LRUMemoryCache:
@@ -40,9 +41,27 @@ class LRUMemoryCache:
             if len(self._cache) > self.maxsize:
                 self._cache.popitem(last=False)
 
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            return self._cache.pop(key, None) is not None
+
+    def pop(self, key: str, default=None) -> Any:
+        with self._lock:
+            val = self._cache.pop(key, None)
+            return dict(val[0]) if val else default
+
     def size(self) -> int:
         with self._lock:
             return len(self._cache)
+
+    def evict_file_id(self, file_id: str) -> int:
+        count = 0
+        with self._lock:
+            keys_to_del = [k for k, v in self._cache.items() if v[0].get("file_id") == file_id]
+            for k in keys_to_del:
+                del self._cache[k]
+                count += 1
+        return count
 
 
 # Глобальный L1 RAM кэш (потребляет < 1 МБ RAM на 1000 записей)
@@ -61,7 +80,7 @@ def get_db_connection() -> sqlite3.Connection:
 
 
 def init_db():
-    """Инициализирует таблицы базы данных SQLite, индексы и прогревает L1 RAM кэш."""
+    """Инициализирует таблицы базы данных SQLite, индексы, миграции и прогревает L1 RAM кэш."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -82,17 +101,28 @@ def init_db():
                 title TEXT,
                 artist TEXT,
                 duration INTEGER,
-                created_at TIMESTAMP
+                created_at TIMESTAMP,
+                variant TEXT DEFAULT 'original'
             )
         """)
-        # Создаем индексы для ускорения отчетов /stats и фильтрации пользователей
+        # Миграция: проверяем наличие колонки variant
+        try:
+            cursor.execute("PRAGMA table_info(tracks_cache)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "variant" not in columns:
+                cursor.execute("ALTER TABLE tracks_cache ADD COLUMN variant TEXT DEFAULT 'original'")
+        except Exception:
+            pass
+
+        # Создаем индексы для ускорения
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_downloads ON users(downloads_count DESC, tags_edited_count DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_file_id ON tracks_cache(file_id)")
         conn.commit()
 
         # Прогрев L1 RAM кэша последними 200 записями
         try:
-            cursor.execute("SELECT query_key, file_id, title, artist, duration FROM tracks_cache ORDER BY created_at DESC LIMIT 200")
+            cursor.execute("SELECT query_key, file_id, title, artist, duration, variant FROM tracks_cache ORDER BY created_at DESC LIMIT 200")
             for row in cursor.fetchall():
                 _L1_CACHE.set(row["query_key"], dict(row))
         except Exception:
@@ -102,20 +132,20 @@ def init_db():
 def normalize_cache_key(query: str) -> str:
     """
     Нормализует поисковый запрос или URL для точного кэширования:
-    - Извлекает уникальные идентификаторы треков (YouTube v=..., Spotify track ID, Apple Music ID, Yandex Music ID)
+    - Извлекает уникальные идентификаторы треков с сохранением регистра (Base62 Spotify ID, YouTube ID)
     - Очищает лишние GET-параметры отслеживания
-    - Нормализует дефисы и пробелы в текстовых запросах
+    - Для текстовых запросов: удаляет zero-width символы, нормализует дефисы и пробелы
     """
-    q = query.strip().lower()
+    q = clean_unicode_text(query.strip())
     if q.startswith("http://") or q.startswith("https://"):
         try:
             parsed = urllib.parse.urlparse(q)
-            netloc = parsed.netloc
+            netloc = parsed.netloc.lower()
 
-            # YouTube ID
+            # YouTube ID (сохраняем регистр 11-символьного ID!)
             if "youtube.com" in netloc:
                 qs = urllib.parse.parse_qs(parsed.query)
-                if "v" in qs:
+                if "v" in qs and qs["v"]:
                     return f"youtube:{qs['v'][0]}"
                 if parsed.path.startswith("/shorts/"):
                     parts = [p for p in parsed.path.split('/') if p]
@@ -130,7 +160,7 @@ def normalize_cache_key(query: str) -> str:
                 if vid:
                     return f"youtube:{vid}"
 
-            # Spotify track ID
+            # Spotify track ID (регистрозависимый Base62!)
             elif "spotify.com" in netloc:
                 sp_match = re.search(r'track/([a-zA-Z0-9]+)', parsed.path)
                 if sp_match:
@@ -139,7 +169,7 @@ def normalize_cache_key(query: str) -> str:
             # Apple Music track ID
             elif "apple.com" in netloc:
                 qs = urllib.parse.parse_qs(parsed.query)
-                if "i" in qs:
+                if "i" in qs and qs["i"]:
                     return f"applemusic:{qs['i'][0]}"
                 m_path = re.search(r'/(?:id|song|album)(?:/[^/\s?]+)*/(\d+)', parsed.path)
                 if m_path:
@@ -151,26 +181,36 @@ def normalize_cache_key(query: str) -> str:
                 if m_digits:
                     return f"applemusic:{m_digits.group(1)}"
 
-
-            # Общий случай для URL: отсекаем query параметры и конечный слеш
-            clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+            # Общий случай для URL: scheme и host в lowercase, путь с сохранением регистра
+            clean_url = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}".rstrip("/")
             return clean_url
         except Exception:
             return q.split("?")[0].rstrip("/")
 
     # Для текстовых запросов: нормализация символов, длинных тире и пробелов
     q = q.replace("—", "-").replace("–", "-").replace("−", "-").replace("_", " ")
-    q = " ".join(q.split())
+    q = " ".join(q.split()).lower()
     return q
 
 
-def get_cached_track(query: str) -> Optional[Dict[str, Any]]:
+def build_variant_cache_key(base_key: str, variant: str = "original") -> str:
+    """Формирует ключ кэша с изолированным суффиксом варианта/модификатора."""
+    if "#var=" in base_key:
+        return base_key
+    norm_var = variant.strip().lower() if variant else "original"
+    if norm_var and norm_var != "original":
+        return f"{base_key}#var={norm_var}"
+    return base_key
+
+
+def get_cached_track(query: str, variant: str = "original") -> Optional[Dict[str, Any]]:
     """
     Проверяет наличие аудиофайла в двухуровневом кэше:
     L1 (RAM) -> мгновенный возврат (< 0.05 мс)
     L2 (SQLite WAL) -> быстрый поиск по первичному ключу.
     """
-    key = normalize_cache_key(query)
+    norm = normalize_cache_key(query)
+    key = build_variant_cache_key(norm, variant)
 
     # L1: Проверка в оперативной памяти
     mem_cached = _L1_CACHE.get(key)
@@ -182,7 +222,7 @@ def get_cached_track(query: str) -> Optional[Dict[str, Any]]:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT file_id, title, artist, duration FROM tracks_cache WHERE query_key = ?",
+                "SELECT file_id, title, artist, duration, variant FROM tracks_cache WHERE query_key = ?",
                 (key,)
             )
             row = cursor.fetchone()
@@ -195,24 +235,40 @@ def get_cached_track(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def get_cached_track_async(query: str) -> Optional[Dict[str, Any]]:
+async def get_cached_track_async(query: str, variant: str = "original") -> Optional[Dict[str, Any]]:
     """Асинхронная версия проверки кэша: L1 в RAM (синхронно), L2 в отдельном потоке."""
-    key = normalize_cache_key(query)
+    norm = normalize_cache_key(query)
+    key = build_variant_cache_key(norm, variant)
     mem_cached = _L1_CACHE.get(key)
     if mem_cached:
         return mem_cached
-    return await asyncio.to_thread(get_cached_track, query)
+    return await asyncio.to_thread(get_cached_track, query, variant)
 
 
-def save_cached_track(query: str, file_id: str, title: str, artist: str, duration: int):
-    """Сохраняет Telegram file_id скачанного трека в L1 RAM и L2 SQLite."""
-    key = normalize_cache_key(query)
+def save_cached_track(query: str, file_id: str, title: str, artist: str, duration: int, variant: str = "original"):
+    """
+    Сохраняет Telegram file_id скачанного трека в L1 RAM и L2 SQLite.
+    Защита от кэширования single-word non-authoritative запросов (например 'creep').
+    """
+    norm_key = normalize_cache_key(query)
+    is_url = norm_key.startswith(("http://", "https://", "youtube:", "spotify:", "applemusic:"))
+
+    # Запрет загрязнения кэша неоднозначными однословными запросами без артиста
+    if not is_url and "-" not in norm_key and len(norm_key.split()) <= 1:
+        if artist and title:
+            canonical_q = f"{artist} - {title}"
+            norm_key = normalize_cache_key(canonical_q)
+        else:
+            return
+
+    key = build_variant_cache_key(norm_key, variant)
     now = datetime.datetime.now()
     item = {
         "file_id": file_id,
         "title": title,
         "artist": artist,
-        "duration": duration
+        "duration": duration,
+        "variant": variant
     }
     _L1_CACHE.set(key, item)
 
@@ -220,22 +276,23 @@ def save_cached_track(query: str, file_id: str, title: str, artist: str, duratio
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO tracks_cache (query_key, file_id, title, artist, duration, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (key, file_id, title, artist, duration, now))
+                INSERT OR REPLACE INTO tracks_cache (query_key, file_id, title, artist, duration, created_at, variant)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (key, file_id, title, artist, duration, now, variant))
             conn.commit()
     except Exception:
         pass
 
 
-async def save_cached_track_async(query: str, file_id: str, title: str, artist: str, duration: int):
+async def save_cached_track_async(query: str, file_id: str, title: str, artist: str, duration: int, variant: str = "original"):
     """Асинхронное сохранение трека в кэш без блокировки event loop."""
-    await asyncio.to_thread(save_cached_track, query, file_id, title, artist, duration)
+    await asyncio.to_thread(save_cached_track, query, file_id, title, artist, duration, variant)
 
 
-def delete_cached_track(query: str):
-    """Удаляет трек из L1 (RAM) и L2 (SQLite) кэша при обнаружении несоответствия длительности/качества."""
-    key = normalize_cache_key(query)
+def delete_cached_track(query: str, variant: str = "original"):
+    """Удаляет трек из L1 (RAM) и L2 (SQLite) кэша при обнаружении несоответствия."""
+    norm_key = normalize_cache_key(query)
+    key = build_variant_cache_key(norm_key, variant)
     _L1_CACHE.pop(key, None)
     try:
         with get_db_connection() as conn:
@@ -246,9 +303,29 @@ def delete_cached_track(query: str):
         pass
 
 
-async def delete_cached_track_async(query: str):
+async def delete_cached_track_async(query: str, variant: str = "original"):
     """Асинхронное удаление трека из кэша без блокировки event loop."""
-    await asyncio.to_thread(delete_cached_track, query)
+    await asyncio.to_thread(delete_cached_track, query, variant)
+
+
+def invalidate_cached_file_id(file_id: str) -> int:
+    """Удаляет из L1 и L2 кэша все записи с данным file_id при ошибке Telegram (expired/invalid file_id)."""
+    _L1_CACHE.evict_file_id(file_id)
+    count = 0
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM tracks_cache WHERE file_id = ?", (file_id,))
+            count = cursor.rowcount
+            conn.commit()
+    except Exception:
+        pass
+    return count
+
+
+async def invalidate_cached_file_id_async(file_id: str) -> int:
+    """Асинхронная инвалидация file_id."""
+    return await asyncio.to_thread(invalidate_cached_file_id, file_id)
 
 
 def search_cached_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -423,5 +500,3 @@ def get_all_user_ids() -> List[int]:
 async def get_all_user_ids_async() -> List[int]:
     """Асинхронное получение ID пользователей."""
     return await asyncio.to_thread(get_all_user_ids)
-
-
