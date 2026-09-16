@@ -541,9 +541,9 @@ def _sync_download(
                     if requested_modifiers:
                         matching = requested_modifiers & cand_modifiers
                         if matching:
-                            penalty -= 150.0 * len(matching)
+                            penalty -= 500.0 * len(matching)  # Решительное предпочтение запрошенной пользователем модификации (remix, sped up...)
                         else:
-                            penalty += 200.0
+                            penalty += 600.0  # Обычные студийные треки без запрошенного эффекта решительно уступают
                     else:
                         # Пользователь искал оригинальный трек текстом:
                         # Любые ремиксы, драмки (drum edit, drums, dnb), каверы, бутлеги, замедления категорически штрафуются (+4000.0)
@@ -564,14 +564,16 @@ def _sync_download(
                             else:
                                 penalty += 1500.0 + (diff * 25.0)
                         else:
-                            if diff <= 8:
+                            # Пользователь явно запросил модификацию (sped up, slowed, remix...)
+                            is_tempo_req = bool(requested_modifiers & {"sped up", "spedup", "speed up", "speedup", "fast version", "slowed", "slow", "super slowed", "super slow", "ultra slowed"})
+                            if is_tempo_req:
+                                penalty += 0.0  # Естественное изменение длительности ускоренного/замедленного трека не штрафуется
+                            elif diff <= 15:
                                 penalty -= 60.0
-                            elif diff <= 20:
-                                penalty -= 20.0
                             elif diff <= 45:
-                                penalty += diff * 5.0
+                                penalty += diff * 2.0
                             else:
-                                penalty += 300.0 + (diff * 10.0)
+                                penalty += 200.0 + (diff * 5.0)
                     elif dur > 0:
                         if dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
                             penalty += 2500.0
@@ -583,9 +585,11 @@ def _sync_download(
                     cand_src = e.get("_source") or source
                     if cand_src == "youtube":
                         is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
-                        if is_topic:
-                            penalty -= 350.0  # Официальный студийный релиз лейбла - абсолютный приоритет
-                        elif "vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel:
+                        if is_topic and not requested_modifiers:
+                            penalty -= 350.0  # Официальный студийный релиз лейбла - абсолютный приоритет при поиске оригинала
+                        elif is_topic and requested_modifiers:
+                            penalty += 0.0   # При поиске ремикса/sped up обычный студийный Topic не должен вытеснять запрошенный трек
+                        elif ("vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel) and not requested_modifiers:
                             penalty -= 150.0
                     elif cand_src == "soundcloud":
                         if custom_artist:
@@ -768,47 +772,15 @@ def _sync_download(
                         actual_dur = new_dur
                         res_info["duration"] = new_dur
 
-                    # 3. Восстановление оригинальной 1.0x студийной скорости и тональности
-                    # Применяется при известном эталонном хронометраже (Apple Music и текстовый поиск)
-                    if (is_apple_music or is_text_input) and not requested_modifiers and expected_duration and expected_duration > 35:
-                        is_official_topic = cand_source == "youtube" and (
-                            "topic" in str(selected_entry.get("uploader") or "").lower() or
-                            "topic" in str(selected_entry.get("channel") or "").lower() or
-                            "topic" in str(res_info.get("uploader") or "").lower() or
-                            "topic" in str(res_info.get("channel") or "").lower()
-                        )
-                        cand_diff_raw = abs(actual_dur - expected_duration)
-                        if not (is_official_topic and cand_diff_raw <= 6):
-                            restored_dur = _restore_studio_speed_and_pitch_if_needed(
-                                audio_files[0],
-                                expected_duration=expected_duration,
-                                requested_modifiers=requested_modifiers,
-                                actual_dur=actual_dur,
-                                req_tag=req_tag,
-                                is_apple_music=(is_apple_music or is_text_input)
-                            )
-                            if restored_dur > 0 and restored_dur != actual_dur:
-                                actual_dur = restored_dur
-                                res_info["duration"] = restored_dur
-                                # Очищаем название от меток замедления, если они были
-                                clean_t = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', cand_entry_title, flags=re.IGNORECASE).strip()
-                                if clean_t:
-                                    cand_entry_title = clean_t
-                                    res_info["title"] = clean_t
-
-                    # 4. Проверяем допустимость хронометража:
+                    # 3. Проверяем допустимость хронометража НА ОРИГИНАЛЬНОМ НЕИЗМЕНЕННОМ АУДИОПОТОКЕ:
                     diff = abs(actual_dur - expected_duration) if (expected_duration and expected_duration > 35 and actual_dur > 0) else 0
                     is_duration_acceptable = False
                     if not expected_duration:
                         is_duration_acceptable = True
                     elif requested_modifiers and diff <= 45:
                         is_duration_acceptable = True
-                    elif is_apple_music:
-                        # Для Apple Music: строгий допуск максимум 4 секунды
-                        if diff <= 4:
-                            is_duration_acceptable = True
-                    elif is_text_input:
-                        # Для текстового поиска с известным эталоном: строгий допуск максимум 4 секунды
+                    elif is_apple_music or is_text_input:
+                        # Строгий допуск для студийного оригинала: максимум 4 секунды (например 3:56-3:58 при эталоне 3:58)
                         if diff <= 4:
                             is_duration_acceptable = True
                     else:
