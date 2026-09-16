@@ -149,17 +149,28 @@ async def main():
         bot_user = await bot.get_me()
         logger.info("✅ Бот успешно подключен к Telegram как @%s!", bot_user.username)
 
-        # Регистрация меню команд Telegram и карточки «Что умеет этот бот» (до нажатия Старт)
         try:
             await bot.set_my_commands([
-                BotCommand(command="start", description="Старт"),
-                BotCommand(command="search", description="Поиск"),
-                BotCommand(command="cancel", description="Отмена"),
-                BotCommand(command="help", description="Помощь"),
+                BotCommand(command="start", description="Перезапуск бота"),
+                BotCommand(command="search", description="Поиск по автору и названию"),
+                BotCommand(command="cancel", description="Отмена текущего действия"),
+                BotCommand(command="help", description="Справка и поддерживаемые сервисы"),
             ])
-            # Очищаем описания профиля в Telegram
-            await bot.set_my_description(description="")
-            await bot.set_my_short_description(short_description="")
+            # Окно «Что умеет этот бот?», отображаемое по центру чата до нажатия «Старт»
+            bot_description = (
+                "Бот скачивает музыку по ссылке или названию и отправляет аудио в формате MP3 / M4A. "
+                "Доступен встроенный редактор тегов (название, артист, альбом, обложка).\n\n"
+                "Поддерживаемые платформы:\n"
+                "• Spotify\n"
+                "• Apple Music\n"
+                "• YouTube / YouTube Music\n"
+                "• SoundCloud\n\n"
+                "Другие платформы не поддерживаются (Яндекс Музыка и VK недоступны из-за региональных ограничений хостинга)."
+            )
+            await bot.set_my_description(description=bot_description)
+            await bot.set_my_short_description(
+                short_description="Скачивание музыки из Spotify, Apple Music, YouTube и SoundCloud в формате MP3/M4A с редактором тегов."
+            )
         except Exception as e:
             logger.debug("Не удалось обновить меню команд и описание: %s", e)
 

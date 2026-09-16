@@ -101,11 +101,10 @@ def _restore_studio_speed_and_pitch_if_needed(
     is_apple_music: bool = False
 ) -> int:
     """
-    Восстановление студийной скорости и тональности применяется ИСКЛЮЧИТЕЛЬНО
-    для треков по ссылкам Apple Music (где известен официальный хронометраж,
-    а сторонние аплоады могут быть искусственно замедлены).
-    Для ВСЕХ остальных платформ и запросов (Spotify, YouTube, SoundCloud, текст)
-    фильтр НИКОГДА не применяется!
+    Восстановление студийной скорости и тональности применяется для треков
+    Apple Music и текстового поиска (где известен официальный канонический
+    хронометраж, а сторонние аплоады на YouTube/SoundCloud могут быть искусственно замедлены).
+    Для ссылок на другие платформы (Spotify, SoundCloud, прямые ссылки) фильтр не применяется.
     """
     if not is_apple_music or not expected_duration or expected_duration <= 35 or requested_modifiers or actual_dur <= 0:
         return actual_dur
@@ -555,15 +554,15 @@ def _sync_download(
                         diff = abs(dur - expected_duration)
                         if not requested_modifiers:
                             if diff <= 4:
-                                penalty -= 120.0
-                            elif diff <= 8:
+                                penalty -= 160.0  # Идеальное попадание в канонический студийный хронометраж
+                            elif diff <= 6:
                                 penalty -= 40.0
-                            elif diff <= 15:
-                                penalty += diff * 5.0
+                            elif diff <= 12:
+                                penalty += 200.0 + (diff * 15.0)  # Отклонения (клипы с интро/аутро, замедленные версии) сильно штрафуются
                             elif diff <= 25:
-                                penalty += 150.0 + (diff * 10.0)
+                                penalty += 500.0 + (diff * 20.0)
                             else:
-                                penalty += 1000.0 + (diff * 15.0)
+                                penalty += 1500.0 + (diff * 25.0)
                         else:
                             if diff <= 8:
                                 penalty -= 60.0
@@ -769,9 +768,9 @@ def _sync_download(
                         actual_dur = new_dur
                         res_info["duration"] = new_dur
 
-                    # 3. Восстановление оригинальной 1.0x студийной скорости и тональности (ИСКЛЮЧИТЕЛЬНО ДЛЯ ССЫЛОК APPLE MUSIC!)
-                    # Для всех остальных платформ аудиопоток остается 100% нетронутым в оригинальном качестве.
-                    if is_apple_music and not requested_modifiers and expected_duration and expected_duration > 35:
+                    # 3. Восстановление оригинальной 1.0x студийной скорости и тональности
+                    # Применяется при известном эталонном хронометраже (Apple Music и текстовый поиск)
+                    if (is_apple_music or is_text_input) and not requested_modifiers and expected_duration and expected_duration > 35:
                         is_official_topic = cand_source == "youtube" and (
                             "topic" in str(selected_entry.get("uploader") or "").lower() or
                             "topic" in str(selected_entry.get("channel") or "").lower() or
@@ -786,7 +785,7 @@ def _sync_download(
                                 requested_modifiers=requested_modifiers,
                                 actual_dur=actual_dur,
                                 req_tag=req_tag,
-                                is_apple_music=is_apple_music
+                                is_apple_music=(is_apple_music or is_text_input)
                             )
                             if restored_dur > 0 and restored_dur != actual_dur:
                                 actual_dur = restored_dur
@@ -808,10 +807,21 @@ def _sync_download(
                         # Для Apple Music: строгий допуск максимум 4 секунды
                         if diff <= 4:
                             is_duration_acceptable = True
+                    elif is_text_input:
+                        # Для текстового поиска с известным эталоном: строгий допуск максимум 4 секунды
+                        if diff <= 4:
+                            is_duration_acceptable = True
                     else:
                         # Для ВСЕХ остальных платформ: стандартный допуск 25 секунд
                         if diff <= 25:
                             is_duration_acceptable = True
+
+                    print(
+                        f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' ({cand_source}): "
+                        f"actual_dur={actual_dur}s expected={expected_duration}s diff={diff}s "
+                        f"match_ratio={cand_match_ratio:.2f} acceptable={is_duration_acceptable}",
+                        flush=True
+                    )
 
                     if is_duration_acceptable and (not core_title_words or cand_match_ratio >= 0.5):
                         # Идеальное попадание! Удаляем возможный бэкап и возвращаем результат
@@ -975,8 +985,8 @@ def _sync_download(
                                             audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
                                             if audio_files:
                                                 sc_dur = int(res_cand.get("duration") or 0)
-                                                if is_apple_music and not requested_modifiers and expected_duration and expected_duration > 35:
-                                                    restored_dur = _restore_studio_speed_and_pitch_if_needed(audio_files[0], expected_duration, requested_modifiers, sc_dur, req_tag, is_apple_music=is_apple_music)
+                                                if (is_apple_music or is_text_input) and not requested_modifiers and expected_duration and expected_duration > 35:
+                                                    restored_dur = _restore_studio_speed_and_pitch_if_needed(audio_files[0], expected_duration, requested_modifiers, sc_dur, req_tag, is_apple_music=(is_apple_music or is_text_input))
                                                     if restored_dur > 0 and restored_dur != sc_dur:
                                                         res_cand["duration"] = restored_dur
                                                         clean_st = re.sub(r'[\(\[\,\-]\s*(?:slowed|sped\s*up|reverb|slow)[^\)\]]*[\)\]]?', '', s_title, flags=re.IGNORECASE).strip()

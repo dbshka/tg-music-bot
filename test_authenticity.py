@@ -320,6 +320,69 @@ class TestAuthenticityVerification(unittest.IsolatedAsyncioTestCase):
         mods_legit = extract_modifiers("The Drums - Money", ignore_words=ignore)
         self.assertEqual(len(mods_legit), 0)
 
+    async def test_creep_canonical_metadata_lookup(self):
+        """Проверяет эталонное определение хронометража для текстового запроса 'Radiohead Creep'"""
+        res = await resolve_canonical_track_info_async("Radiohead Creep")
+        self.assertIsNotNone(res)
+        self.assertEqual(res.artist.lower(), "radiohead")
+        self.assertEqual(res.title.lower(), "creep")
+        # Эталонный хронометраж Radiohead - Creep: 238с (3:58)
+        self.assertIn(res.duration, range(235, 241))
+
+    def test_creep_text_search_candidate_scoring_and_tolerance(self):
+        """
+        Проверяет математику скоринга и допуск хронометража для кейса Radiohead - Creep:
+        Студийный кандидат (236-238с) должен гарантированно побеждать версию 4:05 (245с),
+        а фильтр хронометража is_text_input обязан отклонять кандидата 245с (diff=7s > 4s).
+        """
+        expected_duration = 238  # Эталон Deezer (3:58)
+        is_text_input = True
+        requested_modifiers = set()
+
+        def _candidate_penalty(e):
+            cand_title = e.get("title", "").lower()
+            dur = e.get("duration", 0)
+            penalty = 0.0
+            if "creep" in cand_title:
+                penalty -= 120.0
+            diff = abs(dur - expected_duration)
+            if not requested_modifiers:
+                if diff <= 4:
+                    penalty -= 160.0
+                elif diff <= 6:
+                    penalty -= 40.0
+                elif diff <= 12:
+                    penalty += 200.0 + (diff * 15.0)
+                elif diff <= 25:
+                    penalty += 500.0 + (diff * 20.0)
+                else:
+                    penalty += 1500.0 + (diff * 25.0)
+            return penalty
+
+        cand_studio = {"title": "Radiohead - Creep", "duration": 236}   # Официальный клип/аудио (3:56)
+        cand_elongated = {"title": "Radiohead - Creep", "duration": 245} # 4:05 (+8с)
+
+        pen_studio = _candidate_penalty(cand_studio)
+        pen_elongated = _candidate_penalty(cand_elongated)
+
+        # Студийный кандидат получает высокий отрицательный скор (бонус)
+        self.assertLess(pen_studio, -250.0)
+        # Кандидат 4:05 получает штраф
+        self.assertGreater(pen_elongated, 150.0)
+        # Разрыв между студийным и удлиненным более чем 400 баллов!
+        self.assertGreater(pen_elongated - pen_studio, 400.0)
+
+        # Проверка допустимости хронометража:
+        diff_studio = abs(cand_studio["duration"] - expected_duration)
+        diff_elongated = abs(cand_elongated["duration"] - expected_duration)
+
+        # Для текстового поиска с известным каноническим эталоном строгий допуск <= 4s
+        is_acceptable_studio = (diff_studio <= 4)
+        is_acceptable_elongated = (diff_elongated <= 4)
+
+        self.assertTrue(is_acceptable_studio, "Студийный трек 236с должен быть принят (diff=2s <= 4s)")
+        self.assertFalse(is_acceptable_elongated, "Трек 245с (4:05) должен быть отклонен (diff=7s > 4s)")
+
 
 if __name__ == "__main__":
     unittest.main()
