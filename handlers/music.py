@@ -503,6 +503,20 @@ async def _execute_download_and_send(
             )
             return
 
+        # Финальный барьер перед отправкой в Telegram: аутентичность и хронометраж студийного оригинала
+        if (is_apple_music or is_text_input) and track_info.duration and track_info.duration > 35:
+            user_mods = extract_modifiers(raw_query)
+            if not user_mods:
+                actual_final_dur = downloaded_audio.duration or 0
+                final_diff = abs(actual_final_dur - track_info.duration)
+                if final_diff > 4:
+                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > 4s (got {actual_final_dur}s vs canonical {track_info.duration}s). Refusing to send to Telegram.", flush=True)
+                    await status_msg.edit_text(
+                        "⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности студийного оригинала (отклонение хронометража более 4 сек). Попробуйте уточнить запрос."
+                    )
+                    downloaded_audio.cleanup()
+                    return
+
         await status_msg.edit_text("Отправка трека в Telegram...")
 
         audio_file = FSInputFile(downloaded_audio.file_path)

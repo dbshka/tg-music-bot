@@ -1147,6 +1147,25 @@ def _sync_download(
     extracted_title = _clean_audio_branding(custom_title or info.get("track") or info.get("title") or "Unknown Track")
     extracted_artist = _clean_audio_branding(custom_artist or info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist")
     duration = int(info.get("duration") or 0)
+    try:
+        from mutagen import File as MutagenFile
+        mf = MutagenFile(audio_path)
+        if mf and mf.info and hasattr(mf.info, "length"):
+            duration = int(round(mf.info.length))
+    except Exception:
+        pass
+
+    # Финальная валидация хронометража перед отдачей DownloadedAudio
+    if (is_apple_music or is_text_input) and expected_duration and expected_duration > 35:
+        from services.extractor import extract_modifiers
+        query_mods = extract_modifiers(f"{custom_artist or ''} {custom_title or ''}")
+        if not query_mods and duration > 0:
+            final_dl_diff = abs(duration - expected_duration)
+            if final_dl_diff > 4:
+                raise ValueError(
+                    f"Финальная проверка отклонена: итоговый аудиофайл имеет длительность {duration}с "
+                    f"при эталоне {expected_duration}с (разница {final_dl_diff}с > 4с)."
+                )
 
     t_tag0 = time.perf_counter()
     _apply_custom_metadata(audio_path, extracted_title, extracted_artist, thumbnail_path)
@@ -1346,7 +1365,9 @@ async def download_track(
                     bool(thumbnail_url),
                     expected_duration,
                     request_id,
-                    cancel_event
+                    cancel_event,
+                    is_apple_music,
+                    is_text_input
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
                     raise ValueError(f"Fallback YouTube вернул превью ({audio.duration}s)")
@@ -1384,7 +1405,9 @@ async def download_track(
                         bool(thumbnail_url),
                         expected_duration,
                         request_id,
-                        cancel_event
+                        cancel_event,
+                        is_apple_music,
+                        is_text_input
                     )
                     if expected_duration and expected_duration > 60 and audio.duration <= 35:
                         raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
