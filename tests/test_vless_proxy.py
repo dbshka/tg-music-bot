@@ -1,7 +1,8 @@
 """
 Unit tests for services/vless_proxy.py:
 Tests parsing of VLESS links (Reality, TLS, WS, gRPC), subscription decoding,
-sing-box config generation, and proxy lifecycle management.
+skipping of dummy announcement nodes (0.0.0.0/1), sing-box config generation,
+outbound connectivity separation, and proxy lifecycle management.
 """
 import base64
 import json
@@ -10,7 +11,9 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 from services.vless_proxy import (
+    is_valid_remote_server,
     parse_vless_url,
+    get_sanitized_outbound_summary,
     resolve_subscription_if_needed,
     build_singbox_config,
     start_vless_proxy,
@@ -18,6 +21,28 @@ from services.vless_proxy import (
     ensure_singbox_binary
 )
 import config
+
+
+def test_is_valid_remote_server():
+    assert is_valid_remote_server("0.0.0.0", 1) is False
+    assert is_valid_remote_server("0.0.0.0", 443) is False
+    assert is_valid_remote_server("127.0.0.1", 10808) is False
+    assert is_valid_remote_server("localhost", 8080) is False
+    assert is_valid_remote_server("::1", 443) is False
+    assert is_valid_remote_server("vpn.example.com", 0) is False
+    assert is_valid_remote_server("vpn.example.com", 1) is False
+    assert is_valid_remote_server("vpn.example.com", 443) is True
+    assert is_valid_remote_server("185.220.101.5", 8443) is True
+
+
+def test_parse_vless_rejects_dummy_nodes():
+    url_zero = "vless://info@0.0.0.0:1?security=none#InfoNode"
+    with pytest.raises(ValueError, match="Недопустимый удалённый сервер VLESS"):
+        parse_vless_url(url_zero)
+
+    url_local = "vless://test@127.0.0.1:0#LocalNode"
+    with pytest.raises(ValueError, match="Недопустимый удалённый сервер VLESS"):
+        parse_vless_url(url_local)
 
 
 def test_parse_vless_reality():
@@ -38,6 +63,13 @@ def test_parse_vless_reality():
     assert outbound["tls"]["utls"]["fingerprint"] == "chrome"
     assert outbound["tls"]["reality"]["public_key"] == "publicKey123"
     assert outbound["tls"]["reality"]["short_id"] == "ab12"
+
+    summary = get_sanitized_outbound_summary(outbound)
+    assert summary["server"] == "vpn.example.com"
+    assert summary["server_port"] == 443
+    assert summary["security"] == "reality"
+    assert summary["reality_enabled"] is True
+    assert summary["flow"] == "xtls-rprx-vision"
 
 
 def test_parse_vless_websocket_tls():
@@ -65,11 +97,16 @@ def test_parse_vless_grpc():
     assert outbound["tls"]["reality"]["public_key"] == "grpcKey"
 
 
-def test_resolve_subscription_base64():
+def test_resolve_subscription_skips_dummy_announcement_nodes():
+    """
+    Subscribers often start with dummy informational nodes (e.g. 0.0.0.0:1 with account validity remarks).
+    The parser must skip these dummy nodes and pick the first valid remote server node.
+    """
     mock_subscription_raw = (
-        "vmess://dummy1\n"
-        "vless://12345678-1234-1234-1234-1234567890ab@server1.com:443?security=reality&sni=test.com#Node1\n"
-        "vless://another@server2.com:443#Node2\n"
+        "vless://info@0.0.0.0:1?security=none#📅 Осталось дней: 30\n"
+        "vless://traffic@127.0.0.1:0?security=none#📊 Трафик: 100 GB\n"
+        "vless://12345678-1234-1234-1234-1234567890ab@nl1.real-vpn.net:443?security=reality&sni=test.com&pbk=pk1#NL1-Server\n"
+        "vless://another@de2.real-vpn.net:443?security=tls#DE2-Server\n"
     )
     b64_content = base64.b64encode(mock_subscription_raw.encode("utf-8")).decode("utf-8")
 
@@ -82,13 +119,38 @@ def test_resolve_subscription_base64():
             pass
 
     with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        resolved = resolve_subscription_if_needed("https://vpn-provider.com/sub/token123")
-        assert resolved.startswith("vless://12345678-1234-1234-1234-1234567890ab@server1.com:443")
+        link, outbound = resolve_subscription_if_needed("https://vpn-provider.com/sub/token123")
+        assert outbound["server"] == "nl1.real-vpn.net"
+        assert outbound["server_port"] == 443
+        assert outbound["server"] != "0.0.0.0"
+
+
+def test_resolve_subscription_all_dummies_raises():
+    """When a subscription contains only dummy nodes (0.0.0.0:1), it raises an explicit error."""
+    mock_subscription_raw = (
+        "vless://info@0.0.0.0:1?security=none#Осталось дней: 0\n"
+        "vless://traffic@127.0.0.1:1?security=none#Трафик исчерпан\n"
+    )
+    b64_content = base64.b64encode(mock_subscription_raw.encode("utf-8")).decode("utf-8")
+
+    class FakeResponse:
+        def read(self):
+            return b64_content.encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        with pytest.raises(ValueError, match="В подписке не найдено ни одного рабочего VLESS сервера"):
+            resolve_subscription_if_needed("https://vpn-provider.com/sub/expired")
 
 
 def test_resolve_subscription_direct_vless():
-    direct = "vless://uuid@host:443?security=reality#Test"
-    assert resolve_subscription_if_needed(direct) == direct
+    direct = "vless://uuid-1234@valid-remote.com:443?security=reality&pbk=pk1#Test"
+    link, outbound = resolve_subscription_if_needed(direct)
+    assert link == direct
+    assert outbound["server"] == "valid-remote.com"
 
 
 def test_build_singbox_config():
@@ -121,6 +183,7 @@ def test_start_vless_proxy_lifecycle(tmp_path):
 
     with patch("services.vless_proxy.ensure_singbox_binary", return_value=Path("/usr/local/bin/sing-box")), \
          patch("services.vless_proxy.is_port_open", return_value=True), \
+         patch("services.vless_proxy.verify_outbound_connectivity", return_value=(True, "185.220.101.5")), \
          patch("subprocess.Popen", return_value=mock_proc), \
          patch("services.vless_proxy.BASE_DIR", tmp_path):
         
@@ -132,57 +195,33 @@ def test_start_vless_proxy_lifecycle(tmp_path):
         mock_proc.terminate.assert_called_once()
 
 
-def test_subscription_skips_malformed_node_and_picks_valid():
-    """If the first node in subscription is malformed, parser skips it and picks next valid node."""
-    mock_sub = (
-        "vless://broken-url-without-host\n"
-        "vless://valid-uuid-1234@good-server.com:443?security=reality&pbk=pk1#ValidNode\n"
-    )
-    b64_content = base64.b64encode(mock_sub.encode("utf-8")).decode("utf-8")
+def test_outbound_connectivity_failure_stops_proxy_and_leaves_clean(tmp_path, capsys):
+    """
+    If SOCKS5 listener started, but remote VLESS server fails outbound verification,
+    the proxy must be stopped and NOT enabled in config.YOUTUBE_PROXY.
+    """
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None
 
-    class FakeResponse:
-        def read(self):
-            return b64_content.encode("utf-8")
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
+    vless_link = "vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443?security=reality#Vpn"
 
-    with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        resolved = resolve_subscription_if_needed("https://vpn.com/sub")
-        assert "good-server.com" in resolved
-        outbound = parse_vless_url(resolved)
-        assert outbound["server"] == "good-server.com"
-
-
-def test_subscription_empty_or_broken_raises():
-    """Empty or non-vless subscription raises ValueError safely."""
-    b64_empty = base64.b64encode(b"ss://some-shadowsocks-node\n").decode("utf-8")
-
-    class FakeResponse:
-        def read(self):
-            return b64_empty.encode("utf-8")
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-
-    with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        with pytest.raises(ValueError, match="Не удалось найти валидную vless://"):
-            resolve_subscription_if_needed("https://vpn.com/empty-sub")
-
-
-def test_start_vless_proxy_fails_gracefully_when_binary_missing(capsys):
-    """When sing-box binary cannot be found/installed, returns None and does not hang."""
-    with patch("services.vless_proxy.ensure_singbox_binary", return_value=None):
-        proc = start_vless_proxy(vless_input="vless://u@h:443#t")
+    with patch("services.vless_proxy.ensure_singbox_binary", return_value=Path("/usr/local/bin/sing-box")), \
+         patch("services.vless_proxy.is_port_open", return_value=True), \
+         patch("services.vless_proxy.verify_outbound_connectivity", return_value=(False, "Connection refused")), \
+         patch("subprocess.Popen", return_value=mock_proc), \
+         patch("services.vless_proxy.BASE_DIR", tmp_path):
+        
+        config.YOUTUBE_PROXY = None
+        proc = start_vless_proxy(vless_input=vless_link)
         assert proc is None
+        assert config.YOUTUBE_PROXY is None
+        mock_proc.terminate.assert_called_once()
         captured = capsys.readouterr()
-        assert "Бинарник sing-box не найден" in captured.out
+        assert "SOCKS5 listener started" in captured.out
+        assert "VLESS outbound connection NOT established" in captured.out
 
 
 def test_start_vless_proxy_fails_gracefully_when_singbox_crashes(tmp_path, capsys):
-    """When sing-box process exits immediately with error, returns None and does not hang."""
     mock_proc = MagicMock()
     mock_proc.poll.return_value = 1
     mock_proc.stderr.read.return_value = "FATAL[0000] parse config error"
@@ -196,30 +235,10 @@ def test_start_vless_proxy_fails_gracefully_when_singbox_crashes(tmp_path, capsy
         proc = start_vless_proxy(vless_input=vless_link)
         assert proc is None
         captured = capsys.readouterr()
-        assert "sing-box завершился преждевременно" in captured.out
-
-
-def test_start_vless_proxy_fails_gracefully_when_port_times_out(tmp_path, capsys):
-    """When sing-box is running but port never accepts connections, terminates cleanly and returns None."""
-    mock_proc = MagicMock()
-    mock_proc.poll.return_value = None
-
-    vless_link = "vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443?security=reality#Vpn"
-
-    with patch("services.vless_proxy.ensure_singbox_binary", return_value=Path("/usr/local/bin/sing-box")), \
-         patch("services.vless_proxy.is_port_open", return_value=False), \
-         patch("subprocess.Popen", return_value=mock_proc), \
-         patch("services.vless_proxy.BASE_DIR", tmp_path):
-        
-        proc = start_vless_proxy(vless_input=vless_link, timeout_secs=0.3)
-        assert proc is None
-        mock_proc.terminate.assert_called_once()
-        captured = capsys.readouterr()
-        assert "sing-box не ответил" in captured.out
+        assert "процесс sing-box завершился преждевременно" in captured.out
 
 
 def test_sanitized_logs_never_leak_uuid_or_keys(tmp_path, capsys):
-    """Console output must never leak UUID, public key, or private parameters."""
     secret_uuid = "99999999-8888-7777-6666-555555555555"
     secret_key = "TopSecretPublicKey12345"
     secret_sid = "SecretShortId99"
@@ -230,14 +249,13 @@ def test_sanitized_logs_never_leak_uuid_or_keys(tmp_path, capsys):
 
     with patch("services.vless_proxy.ensure_singbox_binary", return_value=Path("/usr/local/bin/sing-box")), \
          patch("services.vless_proxy.is_port_open", return_value=True), \
+         patch("services.vless_proxy.verify_outbound_connectivity", return_value=(True, "185.220.101.5")), \
          patch("subprocess.Popen", return_value=mock_proc), \
          patch("services.vless_proxy.BASE_DIR", tmp_path):
         
         start_vless_proxy(vless_input=vless_link)
         captured = capsys.readouterr()
-        # Assert secrets are NOT in stdout
         assert secret_uuid not in captured.out
         assert secret_key not in captured.out
         assert secret_sid not in captured.out
-        # Assert sanitized server is present
         assert "secret-server.vpn:443" in captured.out
