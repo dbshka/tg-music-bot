@@ -22,4 +22,6 @@ downloads/
 .idea/
 .vscode/
 .bin/
-
+# Local VPN configs (sensitive)
+xray*.json
+vless_nodes*.txt

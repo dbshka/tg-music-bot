@@ -54,7 +54,10 @@ from services.identity import (
     TRACK_MODIFIERS,
     PERFORMANCE_MODIFIERS,
     DSP_SUPPORTED_MODIFIERS,
-    SEMANTIC_MODIFIERS
+    SEMANTIC_MODIFIERS,
+    is_candidate_matching_modifiers,
+    SUPER_SLOWED_GROUP,
+    SLOWED_GROUP
 )
 
 
@@ -89,60 +92,26 @@ def extract_speed_multiplier_ratio(text: str) -> Optional[float]:
 
 def _apply_audio_modifier_if_needed(audio_path: Path, requested_modifiers: set, cand_modifiers: set, req_tag: str = "", req_query: str = "") -> int:
     """
-    Если пользователь явно запросил slowed/sped up/speed multiplier, а скачанный трек является
-    оригинальной версией без модификаторов, программно применяем эффект через FFmpeg.
+    КРИТИЧЕСКОЕ ТРЕБОВАНИЕ: Программная модификация аудио через FFmpeg DSP полностью отключена.
+    Все модификаторы (Slowed, Super Slowed, Sped Up, Reverb, Nightcore и др.) должны быть найдены
+    в виде готового релиза.
+    Если запрошен модификатор, а скачанный файл его не содержит, выбрасываем ValueError,
+    не производя никакой модификации аудио через FFmpeg.
     """
     if not requested_modifiers:
         return 0
 
-    non_dsp_requested = requested_modifiers - {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"}
-    if non_dsp_requested and not (non_dsp_requested & cand_modifiers):
-        raise ValueError(
-            f"Версия с запрошенной модификацией ({', '.join(sorted(non_dsp_requested))}) не найдена. "
-            f"Оригинальный трек отклонён во избежание подмены."
-        )
-
-    if requested_modifiers & cand_modifiers:
+    if is_candidate_matching_modifiers(requested_modifiers, cand_modifiers):
+        # Кандидат уже является готовой версией с запрошенным модификатором
         return 0
 
-    is_slowed = bool(requested_modifiers & {"super slowed", "super slow", "ultra slowed", "slowed", "slow"})
-    is_sped_up = bool(requested_modifiers & {"speed up", "speedup", "sped up", "spedup", "fast version"})
-    mult_ratio = extract_speed_multiplier_ratio(req_query) if "speed_multiplier" in requested_modifiers else None
-
-    if not (is_slowed or is_sped_up or mult_ratio):
-        return 0
-
-    temp_out = audio_path.with_name(f"mod_{audio_path.name}")
-    if mult_ratio:
-        filter_str = f"asetrate=44100*{mult_ratio:.4f},aresample=44100"
-    elif is_slowed:
-        filter_str = "asetrate=44100*0.89,aresample=44100"
-    else:
-        filter_str = "asetrate=44100*1.15,aresample=44100"
-
-    print(f"{req_tag}[AUDIO_MOD] Применяем программный фильтр {filter_str} к оригинальному аудио...", flush=True)
-    import subprocess
-    cmd = [
-        "ffmpeg", "-y", "-i", str(audio_path),
-        "-filter_complex", filter_str,
-        "-c:a", "aac", "-b:a", "192k", "-threads", "2",
-        str(temp_out)
-    ]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        if res.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 1000:
-            shutil.move(temp_out, audio_path)
-            from mutagen import File as MutagenFile
-            mf = MutagenFile(audio_path)
-            new_dur = int(mf.info.length) if (mf and mf.info and hasattr(mf.info, "length")) else 0
-            print(f"{req_tag}[AUDIO_MOD] Фильтр успешно применен! Новая длительность: {new_dur}s", flush=True)
-            return new_dur
-        else:
-            raise RuntimeError(f"FFmpeg audio modifier filter failed (code {res.returncode})")
-    except subprocess.TimeoutExpired:
-        if temp_out.exists():
-            temp_out.unlink(missing_ok=True)
-        raise RuntimeError("FFmpeg audio modifier filter timed out (60s limit)")
+    # Кандидат не содержит запрошенную модификацию -> отказ от подмены
+    missing = requested_modifiers - cand_modifiers
+    missing_desc = ', '.join(sorted(missing)) if missing else ', '.join(sorted(requested_modifiers))
+    raise ValueError(
+        f"Версия с запрошенной модификацией ({missing_desc}) не найдена. "
+        f"Оригинальный трек отклонён во избежание подмены."
+    )
 
 
 def _restore_studio_speed_and_pitch_if_needed(
@@ -366,14 +335,16 @@ def compute_candidate_penalty(
 
     if is_apple_music:
         if req_mods:
-            matching = req_mods & cand_modifiers
-            if matching:
-                penalty -= 150.0 * len(matching)
+            if is_candidate_matching_modifiers(req_mods, cand_modifiers):
+                matching = req_mods & cand_modifiers
+                penalty -= 800.0 * max(1, len(matching))
+                if (req_mods & SUPER_SLOWED_GROUP) and (cand_modifiers & SUPER_SLOWED_GROUP):
+                    penalty -= 500.0
             else:
-                penalty += 200.0
+                penalty += 8000.0
         else:
             if cand_modifiers:
-                penalty += 4000.0
+                penalty += 5000.0
 
         if expected_duration:
             diff = abs(dur - expected_duration)
@@ -422,20 +393,21 @@ def compute_candidate_penalty(
 
     elif is_text_input:
         if req_mods:
-            matching = req_mods & cand_modifiers
-            unrequested = cand_modifiers - req_mods
-            if matching:
-                penalty -= 500.0 * len(matching)
+            if is_candidate_matching_modifiers(req_mods, cand_modifiers):
+                matching = req_mods & cand_modifiers
+                unrequested = cand_modifiers - req_mods
+                if req_mods & SUPER_SLOWED_GROUP:
+                    unrequested -= SLOWED_GROUP
+                penalty -= 800.0 * max(1, len(matching))
+                if (req_mods & SUPER_SLOWED_GROUP) and (cand_modifiers & SUPER_SLOWED_GROUP):
+                    penalty -= 500.0
                 if unrequested:
                     penalty += 300.0 * len(unrequested)
             else:
-                if unrequested:
-                    penalty += 4000.0
-                else:
-                    penalty += 600.0
+                penalty += 8000.0
         else:
             if cand_modifiers:
-                penalty += 4000.0
+                penalty += 5000.0
 
         if expected_duration:
             diff = abs(dur - expected_duration)
@@ -486,14 +458,16 @@ def compute_candidate_penalty(
                 penalty += 300.0
     else:
         if req_mods:
-            matching = req_mods & cand_modifiers
-            if matching:
-                penalty -= 150.0 * len(matching)
+            if is_candidate_matching_modifiers(req_mods, cand_modifiers):
+                matching = req_mods & cand_modifiers
+                penalty -= 800.0 * max(1, len(matching))
+                if (req_mods & SUPER_SLOWED_GROUP) and (cand_modifiers & SUPER_SLOWED_GROUP):
+                    penalty -= 500.0
             else:
-                penalty += 200.0
+                penalty += 8000.0
         else:
-            for mod in cand_modifiers:
-                penalty += 350.0
+            if cand_modifiers:
+                penalty += 5000.0
 
         if expected_duration:
             diff = abs(dur - expected_duration)
@@ -554,7 +528,8 @@ def _sync_download(
     request_id: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
     is_apple_music: bool = False,
-    is_text_input: bool = False
+    is_text_input: bool = False,
+    requested_variant: Optional[str] = None
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
@@ -684,13 +659,8 @@ def _sync_download(
                     return []
 
             # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
-            req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search}".lower()
+            req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search} {requested_variant or ''}".lower()
             requested_modifiers = extract_modifiers(req_context) or set()
-            dsp_supported_modifiers = {
-                "slowed", "slow", "super slowed", "super slow", "ultra slowed",
-                "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"
-            }
-            semantic_requested = requested_modifiers - dsp_supported_modifiers
 
             # Ключевые слова названия трека для семантической проверки
             core_title_words = extract_core_title_words(custom_title or clean_search, custom_artist)
@@ -703,18 +673,17 @@ def _sync_download(
 
             import concurrent.futures
             if is_apple_music or is_text_input:
-                # Для Apple Music и текстовых запросов: ищем официальные студийные дорожки Topic и чистый аудиопоток
                 if requested_modifiers:
-                    clean_core_title = " ".join(core_title_words) if core_title_words else ""
-                    clean_core_query = f"{clean_artist_str} {clean_core_title}".strip()
+                    mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
+                    variant_query = clean_q_simple
+                    if mod_term.lower() not in clean_q_simple.lower():
+                        variant_query = f"{clean_q_simple} {mod_term}".strip()
+
                     search_tasks = [
-                        ("youtube", f"ytsearch6:{clean_q_simple}"),
-                        ("soundcloud", f"scsearch5:{clean_q_simple}")
+                        ("youtube", f"ytsearch6:{variant_query}"),
+                        ("youtube", f"ytsearch4:{clean_artist_str} - {clean_title_str} ({mod_term})".strip()),
+                        ("soundcloud", f"scsearch5:{variant_query}")
                     ]
-                    # Если пользователь запросил темповую модификацию (1.1x, slowed и др.),
-                    # параллельно опрашиваем чистый студийный трек, чтобы применить эффект через FFmpeg при отсутствии готового релиза
-                    if clean_core_query and clean_core_query.lower() != clean_q_simple.lower():
-                        search_tasks.append(("youtube", f"ytsearch3:{clean_core_query}"))
                 else:
                     search_tasks = [
                         ("youtube", f"ytsearch5:{clean_q_simple} Topic"),
@@ -724,16 +693,25 @@ def _sync_download(
                     if clean_search and clean_search != clean_q_simple:
                         search_tasks.append(("youtube", f"ytsearch3:{clean_search}"))
             else:
-                # Для ссылок на другие платформы (Spotify, YouTube, SoundCloud) - ультрабыстрый минимальный опрос
-                search_tasks = [
-                    ("youtube", f"ytsearch5:{clean_q_simple}"),
-                    ("soundcloud", f"scsearch5:{clean_q_simple}")
-                ]
+                if requested_modifiers:
+                    mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
+                    variant_query = clean_q_simple
+                    if mod_term.lower() not in clean_q_simple.lower():
+                        variant_query = f"{clean_q_simple} {mod_term}".strip()
+                    search_tasks = [
+                        ("youtube", f"ytsearch6:{variant_query}"),
+                        ("soundcloud", f"scsearch5:{variant_query}")
+                    ]
+                else:
+                    search_tasks = [
+                        ("youtube", f"ytsearch5:{clean_q_simple}"),
+                        ("soundcloud", f"scsearch5:{clean_q_simple}")
+                    ]
 
             clean_core_title = " ".join(core_title_words) if core_title_words else ""
             if clean_core_title and custom_artist and requested_modifiers:
-                # Дополнительный точный поиск в SoundCloud по имени артиста и ключевым словам названия
-                search_tasks.append(("soundcloud", f"scsearch3:{custom_artist} {clean_core_title}"))
+                mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
+                search_tasks.append(("soundcloud", f"scsearch3:{custom_artist} {clean_core_title} {mod_term}"))
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks))
             try:
@@ -946,10 +924,10 @@ def _sync_download(
                                             pass
                                 continue
 
-                            # Если запрошен семантический модификатор (acoustic, live, remix, cover, instrumental, reverb),
-                            # а кандидат его НЕ содержит — отклоняем, чтобы не отдать обычный студийный трек!
-                            if semantic_requested and not (semantic_requested & cand_modifiers):
-                                print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не содержит запрошенный модификатор {semantic_requested}. Отклоняем.", flush=True)
+                            # Если запрошен любой модификатор (slowed, super slowed, sped up, reverb, acoustic и т.д.),
+                            # а кандидат его НЕ удовлетворяет — отклоняем, чтобы не отдать обычный студийный трек!
+                            if requested_modifiers and not is_candidate_matching_modifiers(requested_modifiers, cand_modifiers):
+                                print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не удовлетворяет запрошенным модификаторам {requested_modifiers} (кандидат: {cand_modifiers}). Отклоняем.", flush=True)
                                 for temp_f in output_dir.iterdir():
                                     if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                                         try:
@@ -968,12 +946,9 @@ def _sync_download(
                     is_duration_acceptable = False
                     if not expected_duration:
                         is_duration_acceptable = True
-                    elif requested_modifiers and (requested_modifiers & cand_modifiers):
-                        is_tempo_req = bool(requested_modifiers & {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"})
-                        if is_tempo_req or diff <= 45:
-                            is_duration_acceptable = True
-                    elif requested_modifiers and bool(requested_modifiers & {"slowed", "slow", "super slowed", "super slow", "ultra slowed", "sped up", "spedup", "speed up", "speedup", "fast version", "speed_multiplier"}):
-                        # Программно применили темповый модификатор
+                    elif requested_modifiers and is_candidate_matching_modifiers(requested_modifiers, cand_modifiers):
+                        # Для готовых релизов с модификациями (slowed, super slowed, sped up, live и др.)
+                        # хронометраж закономерно отличается от студийного оригинала, поэтому принимаем готовый релиз
                         is_duration_acceptable = True
                     elif is_apple_music or is_text_input:
                         # Строгий допуск для студийного оригинала:
@@ -1113,7 +1088,7 @@ def _sync_download(
                                         continue
 
                                     if requested_modifiers:
-                                        if semantic_requested and not (semantic_requested & retry_mods):
+                                        if not is_candidate_matching_modifiers(requested_modifiers, retry_mods):
                                             for temp_f in output_dir.iterdir():
                                                 if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                                                     try:
@@ -1211,7 +1186,7 @@ def _sync_download(
                                     }
                                     if s_conflicting:
                                         continue
-                                    if semantic_requested and not (semantic_requested & s_mods):
+                                    if not is_candidate_matching_modifiers(requested_modifiers, s_mods):
                                         continue
 
                                 max_sc_diff = 45 if requested_modifiers else (4 if (is_apple_music or is_text_input) else 35)
@@ -1375,8 +1350,8 @@ def _sync_download(
     # Финальная валидация хронометража перед отдачей DownloadedAudio (Apple Music, Spotify, Deezer, Text search)
     is_direct_media_url = bool(not query_or_url.startswith(("ytsearch", "scsearch")) and any(d in query_or_url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com", "bandcamp.com", "vk.com", "tiktok.com")))
     if not is_direct_media_url and expected_duration and expected_duration > 35:
-        query_mods = extract_modifiers(f"{custom_artist or ''} {custom_title or ''}")
-        if not query_mods and duration > 0:
+        all_req_mods = extract_modifiers(f"{custom_artist or ''} {custom_title or ''} {query_or_url} {requested_variant or ''}")
+        if not all_req_mods and (not requested_variant or requested_variant == "original") and duration > 0:
             final_dl_diff = abs(duration - expected_duration)
             max_final_gate = max(4, min(7, int(expected_duration * 0.02)))
             if final_dl_diff > max_final_gate:
@@ -1487,7 +1462,8 @@ async def download_track(
     expected_duration: Optional[int] = None,
     request_id: Optional[str] = None,
     is_apple_music: bool = False,
-    is_text_input: bool = False
+    is_text_input: bool = False,
+    requested_variant: Optional[str] = None
 ) -> DownloadedAudio:
     """
     Асинхронная функция загрузки трека в MP3.
@@ -1519,7 +1495,8 @@ async def download_track(
             request_id,
             cancel_event,
             is_apple_music,
-            is_text_input
+            is_text_input,
+            requested_variant
         )
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)

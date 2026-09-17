@@ -45,6 +45,7 @@ from services.database import (
     delete_cached_track_async,
     invalidate_cached_file_id_async,
 )
+from services.identity import extract_modifiers, is_candidate_matching_modifiers
 from handlers.tag_editor import get_audio_edit_keyboard
 
 logger = logging.getLogger(__name__)
@@ -375,10 +376,10 @@ async def _execute_download_and_send(
             )
             combined_q = f"{custom_artist} {custom_title}"
             canonical = None
-            if not has_track_modifiers(combined_q):
+            if variant == "original" and not has_track_modifiers(combined_q):
                 canonical = await resolve_canonical_track_info_async(combined_q)
 
-            if canonical:
+            if canonical and variant == "original":
                 eff_artist = canonical.artist or custom_artist
                 eff_title = canonical.title or custom_title
                 custom_artist = eff_artist
@@ -393,9 +394,12 @@ async def _execute_download_and_send(
                     duration=canonical.duration
                 )
             else:
+                target_q = f"{custom_artist} {custom_title}"
+                if variant != "original":
+                    target_q = f"{custom_artist} {custom_title} {variant}"
                 track_info = ExtractedTrack(
                     platform="TextSearch",
-                    target=f"ytsearch5:{custom_artist} {custom_title}",
+                    target=f"ytsearch6:{target_q}" if variant != "original" else f"ytsearch5:{target_q}",
                     is_search=True,
                     title=custom_title,
                     artist=custom_artist,
@@ -433,14 +437,20 @@ async def _execute_download_and_send(
             _, cached_mods = extract_track_modifiers(f"{cached_title} {cached_artist}")
 
             should_invalidate = False
-            # 1. Для каталогов (Apple Music / Spotify / Deezer / Text): несовпадение хронометража более чем на 4 сек
-            if not is_direct_media and has_canonical_dur and cached_dur > 0 and abs(cached_dur - track_info.duration) > 4:
+            # 1. Для каталогов (Apple Music / Spotify / Deezer / Text): несовпадение хронометража более чем на 4 сек (только для оригинала!)
+            if variant == "original" and not is_direct_media and has_canonical_dur and cached_dur > 0 and abs(cached_dur - track_info.duration) > 4:
                 print(f"[MUSIC][request_id={req_id}] Catalog cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging.", flush=True)
                 should_invalidate = True
-            # 2. Если в кэше лежит ремикс/микс/драмка, а пользователь искал оригинал
+            # 2. Если в кэше лежит ремикс/микс/драмка/slowed, а пользователь искал оригинал
             elif variant == "original" and cached_mods:
                 print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached track '{cached_title}' has unwanted modifiers {cached_mods}. Purging.", flush=True)
                 should_invalidate = True
+            # 3. Если пользователь искал вариант, а в кэше трек без требуемого варианта
+            elif variant != "original":
+                target_mods = extract_modifiers(variant)
+                if not is_candidate_matching_modifiers(target_mods, cached_mods):
+                    print(f"[MUSIC][request_id={req_id}] Variant cache INVALIDATED: cached track '{cached_title}' does not match variant '{variant}'. Purging.", flush=True)
+                    should_invalidate = True
 
             if should_invalidate:
                 print(
@@ -507,7 +517,8 @@ async def _execute_download_and_send(
                         expected_duration=track_info.duration,
                         request_id=req_id,
                         is_apple_music=is_apple_music,
-                        is_text_input=is_text_input
+                        is_text_input=is_text_input,
+                        requested_variant=variant
                     )
         except Exception as dl_err:
             is_direct_url = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com")))
@@ -546,7 +557,8 @@ async def _execute_download_and_send(
                             expected_duration=track_info.duration,
                             request_id=f"{req_id}_fb",
                             is_apple_music=is_apple_music,
-                            is_text_input=is_text_input
+                            is_text_input=is_text_input,
+                            requested_variant=variant
                         )
             else:
                 raise dl_err
@@ -562,18 +574,27 @@ async def _execute_download_and_send(
             return
 
         # Финальный барьер перед отправкой в Telegram: аутентичность и хронометраж студийного оригинала или канонической версии
-        if not is_direct_media and has_canonical_dur:
-            _, query_mods = extract_track_modifiers(raw_query)
-            has_user_dsp_mods = bool(query_mods and any(m in query_mods for m in ["speed_multiplier", "8d", "nightcore", "bass boost"]))
-            if not has_user_dsp_mods:
+        if not is_direct_media:
+            if variant == "original" and has_canonical_dur:
                 actual_final_dur = downloaded_audio.duration or 0
                 final_diff = abs(actual_final_dur - track_info.duration)
                 max_final_diff = max(4, min(7, int(track_info.duration * 0.02)))
                 if final_diff > max_final_diff:
-                    ver_desc = f"версии «{variant}»" if variant != "original" else "студийного оригинала"
-                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s for {ver_desc}). Refusing to send to Telegram.", flush=True)
+                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s for студийного оригинала). Refusing to send to Telegram.", flush=True)
                     await status_msg.edit_text(
-                        f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности {ver_desc} (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
+                        f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности студийного оригинала (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
+                    )
+                    downloaded_audio.cleanup()
+                    return
+            elif variant != "original":
+                target_mods = extract_modifiers(variant)
+                file_text = f"{downloaded_audio.title} {downloaded_audio.artist}".lower()
+                ignore_artist = set(re.findall(r'[\w]+', (downloaded_audio.artist or '').lower()))
+                dl_mods = extract_modifiers(file_text, ignore_words=ignore_artist)
+                if not is_candidate_matching_modifiers(target_mods, dl_mods):
+                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: downloaded audio '{downloaded_audio.title}' lacks requested variant '{variant}' (got mods: {dl_mods}). Refusing to send to Telegram.", flush=True)
+                    await status_msg.edit_text(
+                        f"⚠️ К сожалению, готовая версия «{variant}» для данного трека не найдена. Оригинальный трек отклонён во избежание подмены."
                     )
                     downloaded_audio.cleanup()
                     return

@@ -126,19 +126,103 @@ PERFORMANCE_MODIFIERS = {
     "acoustic session", "live session", "unplugged"
 }
 
-DSP_SUPPORTED_MODIFIERS = {
-    "slowed", "super slowed", "ultra slowed", "slowed down", "slow version", "slower",
-    "sped up", "speed up", "speedup", "spedup", "fast version",
-    "speed_multiplier"
-}
+# DSP-модификация аудио через FFmpeg полностью отключена:
+# Все пользовательские модификаторы требуют поиска готовой версии (Ready-Made Variants)
+DSP_SUPPORTED_MODIFIERS = set()
 
 SEMANTIC_MODIFIERS = {
+    # Tempo & Pitch variants (теперь требуют готовый релиз, без DSP):
+    "slowed", "super slowed", "ultra slowed", "slowed down", "slow version", "slower", "slow",
+    "sped up", "speed up", "speedup", "spedup", "fast version", "speed_multiplier",
+    "reverb", "reverbed", "slowed + reverb", "slowed & reverb", "nightcore", "daycore",
+    # Versions & Edits:
     "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix", "club mix", "dance mix",
     "live", "лайв", "концерт", "performance", "acoustic", "акустика", "unplugged",
     "cover", "кавер", "tribute", "karaoke", "караоке",
     "instrumental", "инструментал", "minus", "минус", "acapella", "a cappella",
     "clean", "explicit", "remaster", "remastered", "demo"
 }
+
+SUPER_SLOWED_GROUP: Set[str] = {"super slowed down", "super slowed", "super slow", "ultra slowed"}
+SLOWED_GROUP: Set[str] = {"slowed down", "slowed", "slower", "slow version", "slow"}
+SPED_UP_GROUP: Set[str] = {"speed up", "speedup", "sped up", "spedup", "fast version", "speed_multiplier"}
+REVERB_GROUP: Set[str] = {"reverb", "reverbed", "slowed + reverb", "slowed & reverb", "slowed and reverb", "slowed+reverb", "slowed reverb", "slowedreverb", "sped up + reverb"}
+NIGHTCORE_GROUP: Set[str] = {"nightcore"}
+DAYCORE_GROUP: Set[str] = {"daycore"}
+ACOUSTIC_GROUP: Set[str] = {"acoustic", "акустика", "piano", "пианино", "unplugged"}
+LIVE_GROUP: Set[str] = {"live", "лайв", "концерт", "performance"}
+COVER_GROUP: Set[str] = {"cover", "кавер", "tribute"}
+REMIX_GROUP: Set[str] = {"remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix", "club mix", "dance mix"}
+INSTRUMENTAL_GROUP: Set[str] = {"instrumental", "инструментал", "minus", "минус", "karaoke", "караоке"}
+ACAPELLA_GROUP: Set[str] = {"acapella", "a cappella", "акапелла"}
+BASS_BOOST_GROUP: Set[str] = {"bass boost", "bass boosted"}
+EIGHT_D_GROUP: Set[str] = {"8d", "16d"}
+
+
+def is_candidate_matching_modifiers(requested_modifiers: Set[str], cand_modifiers: Set[str]) -> bool:
+    """
+    Проверяет, удовлетворяет ли найденный кандидат запрошенным модификаторам:
+    - Super Slowed: строго требует super slowed, обычный slowed НЕ считается совпадением;
+    - Slowed: требует slowed или super slowed;
+    - Sped Up: требует ускоренную версию;
+    - Reverb: требует наличие реверберации;
+    - Для комбинаций (например Slowed + Reverb): требует удовлетворения ВСЕХ запрошенных компонентов;
+    - Кандидат-оригинал без модификаторов отклоняется, если запрошен хотя бы один модификатор.
+    """
+    if not requested_modifiers:
+        return True
+
+    cand_mods = set(cand_modifiers) if cand_modifiers else set()
+    req_mods = set(requested_modifiers)
+
+    # 1. Super Slowed: строго требует super slowed, обычный slowed не считается совпадением
+    if req_mods & SUPER_SLOWED_GROUP:
+        if not (cand_mods & SUPER_SLOWED_GROUP):
+            return False
+    # 2. Slowed (если super slowed НЕ запрашивался): требует slowed или super slowed
+    elif req_mods & SLOWED_GROUP:
+        if not (cand_mods & (SLOWED_GROUP | SUPER_SLOWED_GROUP)):
+            return False
+
+    # 3. Sped Up:
+    if req_mods & SPED_UP_GROUP:
+        if not (cand_mods & SPED_UP_GROUP):
+            return False
+
+    # 4. Reverb:
+    if req_mods & REVERB_GROUP:
+        if not (cand_mods & REVERB_GROUP):
+            return False
+
+    # 5. Nightcore:
+    if req_mods & NIGHTCORE_GROUP:
+        if not (cand_mods & NIGHTCORE_GROUP):
+            return False
+
+    # 6. Daycore:
+    if req_mods & DAYCORE_GROUP:
+        if not (cand_mods & DAYCORE_GROUP):
+            return False
+
+    # 7. Прочие группы (acoustic, live, remix, instrumental и др.)
+    for grp in [ACOUSTIC_GROUP, LIVE_GROUP, COVER_GROUP, REMIX_GROUP, INSTRUMENTAL_GROUP, ACAPELLA_GROUP, BASS_BOOST_GROUP, EIGHT_D_GROUP]:
+        if req_mods & grp:
+            if not (cand_mods & grp):
+                return False
+
+    # 8. Любые другие модификаторы:
+    handled_groups = (
+        SUPER_SLOWED_GROUP | SLOWED_GROUP | SPED_UP_GROUP | REVERB_GROUP |
+        NIGHTCORE_GROUP | DAYCORE_GROUP | ACOUSTIC_GROUP | LIVE_GROUP |
+        COVER_GROUP | REMIX_GROUP | INSTRUMENTAL_GROUP | ACAPELLA_GROUP |
+        BASS_BOOST_GROUP | EIGHT_D_GROUP
+    )
+    other_req = req_mods - handled_groups
+    for m in other_req:
+        if m not in cand_mods:
+            return False
+
+    return True
 
 
 # -------------------------------------------------------------
