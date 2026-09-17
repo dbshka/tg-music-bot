@@ -17,6 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import BOT_TOKEN, PROXY, CUSTOM_API_SERVER, DOWNLOADS_DIR, BOT_VERSION, get_cookies_info
 from services.database import init_db
 from services.http_client import close_shared_session
+from services.vless_proxy import start_vless_proxy, stop_vless_proxy
 from handlers.admin import router as admin_router
 from handlers.music import router as music_router
 from handlers.tag_editor import router as tag_editor_router
@@ -146,6 +147,9 @@ async def main():
     except Exception:
         pass
 
+    # Запуск VLESS / Happ VPN прокси (если задана переменная VLESS_URL)
+    vless_proc = start_vless_proxy()
+
     # Запуск фонового веб-сервера (для UptimeRobot и защиты от сна на Hugging Face / Render / Koyeb)
     runner = await start_healthcheck_server()
 
@@ -200,6 +204,7 @@ async def main():
     except Exception as e:
         logger.exception("Непредвиденная ошибка при работе бота: %s", e)
     finally:
+        stop_vless_proxy(vless_proc)
         if runner:
             await runner.cleanup()
         await close_shared_session()

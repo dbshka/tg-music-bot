@@ -26,6 +26,8 @@ BOT_VERSION = "3.0.0"
 PROXY = os.getenv("PROXY")
 # Отдельный прокси для YouTube (поддерживает HTTP/HTTPS/SOCKS5), с fallback на общий PROXY
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY") or PROXY
+# VLESS / Happ VPN ссылка или подписка для автоматического локального SOCKS5-прокси через sing-box
+VLESS_URL = os.getenv("VLESS_URL") or os.getenv("YOUTUBE_VLESS_URL")
 
 
 def get_sanitized_proxy_info(proxy_url: Optional[str]) -> str:

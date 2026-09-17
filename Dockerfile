@@ -10,6 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Добавление Deno (нативный JS-рантайм yt-dlp по умолчанию для решения челленджей YouTube)
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
+# Добавление sing-box (для VLESS / Happ VPN прокси)
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${ARCH}.tar.gz" | tar -xz --strip-components=1 -C /usr/local/bin/ "sing-box-1.10.7-linux-${ARCH}/sing-box" && \
+    chmod +x /usr/local/bin/sing-box
+
 # Создание пользователя с UID 1000 (стандарт безопасности Hugging Face Spaces)
 RUN useradd -m -u 1000 user
 USER user

@@ -21,4 +21,5 @@ downloads/
 # IDE
 .idea/
 .vscode/
+.bin/
 
