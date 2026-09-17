@@ -24,7 +24,24 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
 
-from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info, YOUTUBE_PROXY, get_sanitized_proxy_info
+import config
+from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info, get_sanitized_proxy_info
+
+# Модульная переменная для обратной совместимости с моками в тестах (unittest.mock.patch)
+YOUTUBE_PROXY = None
+
+
+def get_current_youtube_proxy() -> Optional[str]:
+    """
+    Возвращает актуальный YouTube прокси.
+    Гарантирует, что downloader всегда получает актуальное значение прокси,
+    установленное dynamic-стартом VLESS (config.YOUTUBE_PROXY),
+    а также корректно работает при мокировании в тестах (patch("services.downloader.YOUTUBE_PROXY", ...)).
+    """
+    cfg_proxy = getattr(config, "YOUTUBE_PROXY", None)
+    if cfg_proxy:
+        return cfg_proxy
+    return globals().get("YOUTUBE_PROXY")
 from services.http_client import get_shared_session
 from services.identity import (
     clean_unicode_text,
@@ -579,9 +596,13 @@ def _sync_download(
     # Клиенты YouTube:
     is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
 
-    if is_youtube and YOUTUBE_PROXY:
-        ydl_opts["proxy"] = YOUTUBE_PROXY
-        print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(YOUTUBE_PROXY)}", flush=True)
+    yt_proxy = get_current_youtube_proxy()
+    if is_youtube and yt_proxy:
+        ydl_opts["proxy"] = yt_proxy
+        print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+    elif is_youtube:
+        ydl_opts.pop("proxy", None)
+        print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
 
     if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
@@ -629,11 +650,14 @@ def _sync_download(
             def _fetch_candidates(target_q, src_name):
                 s_opts = dict(options)
                 s_opts.pop("extractor_args", None)  # Поисковые эндпоинты не должны использовать player_client!
+                yt_proxy = get_current_youtube_proxy()
                 if src_name == "soundcloud":
                     s_opts.pop("cookiefile", None)
                     s_opts.pop("proxy", None)  # Прокси применяется исключительно к YouTube-трафику
-                elif src_name == "youtube" and YOUTUBE_PROXY:
-                    s_opts["proxy"] = YOUTUBE_PROXY
+                elif src_name == "youtube" and yt_proxy:
+                    s_opts["proxy"] = yt_proxy
+                else:
+                    s_opts.pop("proxy", None)
                 s_opts["extract_flat"] = True
                 s_opts["noplaylist"] = True
                 s_opts["ignoreerrors"] = True
@@ -732,9 +756,9 @@ def _sync_download(
                 try:
                     fb_opts = dict(options)
                     fb_opts.pop("extractor_args", None)
-                    fb_opts.pop("cookiefile", None)
-                    if YOUTUBE_PROXY:
-                        fb_opts["proxy"] = YOUTUBE_PROXY
+                    yt_proxy = get_current_youtube_proxy()
+                    if yt_proxy:
+                        fb_opts["proxy"] = yt_proxy
                     else:
                         fb_opts.pop("proxy", None)
                     fb_opts["extract_flat"] = True
@@ -817,8 +841,14 @@ def _sync_download(
                     cand_dl_opts.pop("cookiefile", None)
                     cand_dl_opts.pop("extractor_args", None)
                     cand_dl_opts.pop("proxy", None)  # Прокси применяется только к YouTube
-                elif cand_source == "youtube" and YOUTUBE_PROXY:
-                    cand_dl_opts["proxy"] = YOUTUBE_PROXY
+                elif cand_source == "youtube":
+                    yt_proxy = get_current_youtube_proxy()
+                    if yt_proxy:
+                        cand_dl_opts["proxy"] = yt_proxy
+                        print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+                    else:
+                        cand_dl_opts.pop("proxy", None)
+                        print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
 
                 hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
                 def p_hook(d):
@@ -1224,6 +1254,15 @@ def _sync_download(
             inv_idx = len(invocations) + 1
             t_d0 = time.perf_counter()
             dl_opts = dict(options)
+            is_direct_yt = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
+            if is_direct_yt:
+                yt_proxy = get_current_youtube_proxy()
+                if yt_proxy:
+                    dl_opts["proxy"] = yt_proxy
+                    print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+                else:
+                    dl_opts.pop("proxy", None)
+                    print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
             hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
             def p_hook(d):
                 if cancel_event and cancel_event.is_set():

@@ -259,3 +259,91 @@ def test_sanitized_logs_never_leak_uuid_or_keys(tmp_path, capsys):
         assert secret_key not in captured.out
         assert secret_sid not in captured.out
         assert "secret-server.vpn:443" in captured.out
+
+
+def test_downloader_dynamic_proxy_after_vless_startup(tmp_path):
+    """
+    REGRESSION TEST:
+    1. Initially config.YOUTUBE_PROXY is None.
+    2. services.downloader starts with proxy None (not cached).
+    3. start_vless_proxy() starts sing-box and sets config.YOUTUBE_PROXY to socks5://127.0.0.1:10808.
+    4. Downloader executes a YouTube operation and picks up the new dynamic proxy:
+       cand_dl_opts["proxy"] == "socks5://127.0.0.1:10808".
+    5. Initial None is proved not to be cached.
+    6. stop_vless_proxy() properly resets proxy to None.
+    """
+    import services.downloader
+    from services.downloader import _sync_download, get_current_youtube_proxy
+
+    # 1. Начальное состояние: прокси не установлен
+    config.YOUTUBE_PROXY = None
+    services.downloader.YOUTUBE_PROXY = None
+    assert get_current_youtube_proxy() is None
+
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None
+    vless_link = "vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443?security=reality&sni=yahoo.com&pbk=key123#Vpn"
+
+    recorded_opts = []
+
+    class CapturingFakeYDL:
+        def __init__(self, opts):
+            self.opts = dict(opts)
+            recorded_opts.append(self.opts)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {"title": "Test Dynamic Song", "duration": 180}
+            return {
+                "entries": [
+                    {
+                        "id": "cand_dyn",
+                        "title": "Test Dynamic Song",
+                        "uploader": "Artist - Topic",
+                        "duration": 180,
+                        "webpage_url": "https://www.youtube.com/watch?v=cand_dyn",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+
+    with patch("services.vless_proxy.ensure_singbox_binary", return_value=Path("/usr/local/bin/sing-box")), \
+         patch("services.vless_proxy.is_port_open", return_value=True), \
+         patch("services.vless_proxy.verify_outbound_connectivity", return_value=(True, "146.255.189.4")), \
+         patch("subprocess.Popen", return_value=mock_proc), \
+         patch("services.vless_proxy.BASE_DIR", tmp_path):
+
+        # 2. Запуск VLESS прокси
+        proc = start_vless_proxy(vless_input=vless_link, socks_host="127.0.0.1", socks_port=10808)
+        assert proc is mock_proc
+        assert config.YOUTUBE_PROXY == "socks5://127.0.0.1:10808"
+        assert get_current_youtube_proxy() == "socks5://127.0.0.1:10808"
+
+        # 3. Выполняем загрузку через downloader
+        with patch("yt_dlp.YoutubeDL", side_effect=CapturingFakeYDL), \
+             patch("services.downloader._apply_custom_metadata", return_value=None):
+            res = _sync_download(
+                query_or_url="ytsearch5:Artist Test Dynamic Song",
+                output_dir=tmp_path,
+                custom_title="Test Dynamic Song",
+                custom_artist="Artist",
+                expected_duration=180,
+                is_text_input=True
+            )
+            assert res is not None
+
+        # 4. Проверяем cand_dl_opts
+        dl_calls = [opt for opt in recorded_opts if opt.get("extract_flat") is False]
+        assert len(dl_calls) >= 1
+        cand_dl_opts = dl_calls[0]
+        assert cand_dl_opts.get("proxy") == "socks5://127.0.0.1:10808"
+
+        # 5. Остановка прокси сбрасывает настройки
+        stop_vless_proxy(proc)
+        assert config.YOUTUBE_PROXY is None
+        assert get_current_youtube_proxy() is None

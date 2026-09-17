@@ -483,6 +483,11 @@ def start_vless_proxy(
         if outbound_ok:
             proxy_url = f"socks5://{socks_host}:{socks_port}"
             config.YOUTUBE_PROXY = proxy_url
+            try:
+                import services.downloader
+                services.downloader.YOUTUBE_PROXY = proxy_url
+            except (ImportError, AttributeError):
+                pass
             _active_process = proc
             print(f"[VLESS] ✅ VLESS outbound connection established! Внешний выходной IP: {ext_info} (сервер: {server_info})", flush=True)
             return proc
@@ -513,6 +518,14 @@ def stop_vless_proxy(proc: Optional[subprocess.Popen] = None) -> None:
                 pass
     if target == _active_process:
         _active_process = None
+
+    # Сброс прокси в config и downloader
+    config.YOUTUBE_PROXY = None
+    try:
+        import services.downloader
+        services.downloader.YOUTUBE_PROXY = None
+    except (ImportError, AttributeError):
+        pass
 
     # Очистка временного файла конфигурации sing-box
     try:
