@@ -24,7 +24,7 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
 
-from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info
+from config import DOWNLOADS_DIR, DEFAULT_AUDIO_BITRATE, MAX_FILE_SIZE_BYTES, BASE_DIR, get_cookies_info, YOUTUBE_PROXY, get_sanitized_proxy_info
 from services.http_client import get_shared_session
 from services.identity import (
     clean_unicode_text,
@@ -577,24 +577,27 @@ def _sync_download(
     }
 
     # Клиенты YouTube:
-    # TV клиент не требует GVS PO Token и исключает ошибки SABR streaming и 'Requested format is not available'
     is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
+
+    if is_youtube and YOUTUBE_PROXY:
+        ydl_opts["proxy"] = YOUTUBE_PROXY
+        print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(YOUTUBE_PROXY)}", flush=True)
 
     if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "mweb", "ios"],
+                "player_client": ["android"],
             }
         }
         print(f"{req_tag}[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "mweb", "ios"],
+                "player_client": ["android"],
             }
         }
-        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты android, mweb, ios)", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиент android)", flush=True)
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
@@ -628,6 +631,9 @@ def _sync_download(
                 s_opts.pop("extractor_args", None)  # Поисковые эндпоинты не должны использовать player_client!
                 if src_name == "soundcloud":
                     s_opts.pop("cookiefile", None)
+                    s_opts.pop("proxy", None)  # Прокси применяется исключительно к YouTube-трафику
+                elif src_name == "youtube" and YOUTUBE_PROXY:
+                    s_opts["proxy"] = YOUTUBE_PROXY
                 s_opts["extract_flat"] = True
                 s_opts["noplaylist"] = True
                 s_opts["ignoreerrors"] = True
@@ -727,6 +733,10 @@ def _sync_download(
                     fb_opts = dict(options)
                     fb_opts.pop("extractor_args", None)
                     fb_opts.pop("cookiefile", None)
+                    if YOUTUBE_PROXY:
+                        fb_opts["proxy"] = YOUTUBE_PROXY
+                    else:
+                        fb_opts.pop("proxy", None)
                     fb_opts["extract_flat"] = True
                     fb_opts["noplaylist"] = True
                     fb_opts["ignoreerrors"] = True
@@ -806,6 +816,9 @@ def _sync_download(
                 if cand_source == "soundcloud":
                     cand_dl_opts.pop("cookiefile", None)
                     cand_dl_opts.pop("extractor_args", None)
+                    cand_dl_opts.pop("proxy", None)  # Прокси применяется только к YouTube
+                elif cand_source == "youtube" and YOUTUBE_PROXY:
+                    cand_dl_opts["proxy"] = YOUTUBE_PROXY
 
                 hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
                 def p_hook(d):
@@ -1039,7 +1052,7 @@ def _sync_download(
                             retry_cand_opts.pop("cookiefile", None)
                             retry_cand_opts["extractor_args"] = {
                                 "youtube": {
-                                    "player_client": ["android", "mweb"]
+                                    "player_client": ["android"]
                                 }
                             }
                             try:
@@ -1123,13 +1136,15 @@ def _sync_download(
                         bf.rename(output_dir / orig_name)
                 return best_fallback_info["res_info"]
 
-            # Экстренный поиск в SoundCloud
-            if last_cand_error or not entries:
+            # Экстренный поиск в SoundCloud (запрещён для прямых ссылок YouTube!)
+            is_direct_yt = bool(("youtube.com" in query_or_url or "youtu.be" in query_or_url) and not query_or_url.startswith("ytsearch"))
+            if (last_cand_error or not entries) and not is_direct_yt:
                 print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{clean_search}' в SoundCloud...", flush=True)
                 try:
                     sc_opts = dict(options)
                     sc_opts.pop("cookiefile", None)
                     sc_opts.pop("extractor_args", None)
+                    sc_opts.pop("proxy", None)  # Прокси применяется только к YouTube
                     sc_opts["extract_flat"] = True
                     sc_opts["noplaylist"] = True
                     sc_opts["ignoreerrors"] = True
@@ -1176,6 +1191,7 @@ def _sync_download(
                                     sc_opts_dl = dict(options)
                                     sc_opts_dl.pop("cookiefile", None)
                                     sc_opts_dl.pop("extractor_args", None)
+                                    sc_opts_dl.pop("proxy", None)  # Прокси только для YouTube
                                     sc_opts_dl["extract_flat"] = False
                                     try:
                                         with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
@@ -1550,12 +1566,15 @@ async def download_track(
                 return audio
             except Exception as yt_err:
                 print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
-        elif is_bot_blocked:
-            print(f"{req_tag}[DOWNLOADER] Обнаружена блокировка YouTube IP (bot-check / 429). Пропускаем YouTube Search и сразу переходим к SoundCloud Fallback.", flush=True)
+        is_direct_yt = bool(("youtube.com" in query_or_url or "youtu.be" in query_or_url) and not query_or_url.startswith("ytsearch"))
+        if is_direct_yt:
+            print(f"{req_tag}[DOWNLOADER] Прямая ссылка YouTube завершилась ошибкой ({primary_error}). Fallback в SoundCloud запрещён.", flush=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise primary_error
 
         # 2. Fallback в SoundCloud (выбирает полный трек среди лучших вариантов запроса)
-        # Применяется только если исходный запрос был ссылкой, а не уже выполненным поиском (ytsearch/scsearch)
-        if not query_or_url.startswith(("ytsearch", "scsearch")):
+        # Применяется только если исходный запрос был ссылкой на сторонний сервис, а не прямым YouTube или поиском
+        if not query_or_url.startswith(("ytsearch", "scsearch")) and not is_direct_yt:
             for fb_q in fallback_queries[:2]:
                 try:
                     print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fb_q}", flush=True)

@@ -10,12 +10,8 @@ def hermetic_dns_for_tests():
     def hermetic_getaddrinfo(host, port=None, *args, **kwargs):
         known_hosts = (
             "www.youtube.com",
-            "open.spotify.com",
             "youtube.com",
             "music.youtube.com",
-            "soundcloud.com",
-            "api.soundcloud.com",
-            "itunes.apple.com",
         )
         if host in known_hosts:
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("142.250.190.46", port or 443))]

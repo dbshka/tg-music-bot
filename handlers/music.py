@@ -351,6 +351,23 @@ async def _execute_download_and_send(
             status_msg = await message.reply("Анализирую ссылку...")
             print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
             track_info = await resolve_track_url(url)
+            # Определение варианта для URL-входов:
+            # Приоритет:
+            # 1. Явные пользовательские модификаторы (url_mods / variant != "original")
+            # 2. Канонический вариант из названия трека (Spotify, Apple Music и др.)
+            # 3. "original"
+            if variant == "original" and track_info and track_info.title:
+                _, title_mods = extract_track_modifiers(track_info.title)
+                if title_mods:
+                    if "super slowed" in title_mods:
+                        variant = "super slowed"
+                    elif "super slow" in title_mods:
+                        variant = "super slow"
+                    elif "ultra slowed" in title_mods:
+                        variant = "ultra slowed"
+                    else:
+                        variant = ", ".join(title_mods)
+                    print(f"[MUSIC][request_id={req_id}] Variant detected from canonical title: variant='{variant}' (title='{track_info.title}')", flush=True)
         elif custom_artist and custom_title:
             status_msg = await message.reply(
                 f"Ищу трек: <b>{html.escape(custom_artist)} — {html.escape(custom_title)}</b>...",
@@ -421,7 +438,7 @@ async def _execute_download_and_send(
                 print(f"[MUSIC][request_id={req_id}] Catalog cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging.", flush=True)
                 should_invalidate = True
             # 2. Если в кэше лежит ремикс/микс/драмка, а пользователь искал оригинал
-            elif not user_mods and cached_mods:
+            elif variant == "original" and cached_mods:
                 print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached track '{cached_title}' has unwanted modifiers {cached_mods}. Purging.", flush=True)
                 should_invalidate = True
 
@@ -544,17 +561,19 @@ async def _execute_download_and_send(
             )
             return
 
-        # Финальный барьер перед отправкой в Telegram: аутентичность и хронометраж студийного оригинала
+        # Финальный барьер перед отправкой в Telegram: аутентичность и хронометраж студийного оригинала или канонической версии
         if not is_direct_media and has_canonical_dur:
-            _, user_mods = extract_track_modifiers(raw_query)
-            if not user_mods:
+            _, query_mods = extract_track_modifiers(raw_query)
+            has_user_dsp_mods = bool(query_mods and any(m in query_mods for m in ["speed_multiplier", "8d", "nightcore", "bass boost"]))
+            if not has_user_dsp_mods:
                 actual_final_dur = downloaded_audio.duration or 0
                 final_diff = abs(actual_final_dur - track_info.duration)
                 max_final_diff = max(4, min(7, int(track_info.duration * 0.02)))
                 if final_diff > max_final_diff:
-                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s). Refusing to send to Telegram.", flush=True)
+                    ver_desc = f"версии «{variant}»" if variant != "original" else "студийного оригинала"
+                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s for {ver_desc}). Refusing to send to Telegram.", flush=True)
                     await status_msg.edit_text(
-                        f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности студийного оригинала (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
+                        f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности {ver_desc} (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
                     )
                     downloaded_audio.cleanup()
                     return

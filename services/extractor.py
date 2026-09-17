@@ -470,7 +470,7 @@ async def _extract_spotify_embed_metadata(track_id: str, session: aiohttp.Client
             if resp.status == 200:
                 html = await resp.text()
                 import json
-                m_data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+                m_data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, flags=re.DOTALL)
                 if m_data:
                     data = json.loads(m_data.group(1))
                     entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})

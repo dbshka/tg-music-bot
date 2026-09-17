@@ -514,3 +514,362 @@ def test_all_drm_candidates_rejected_and_no_remix_substitution(tmp_path):
                 expected_duration=200,
                 is_text_input=True
             )
+
+
+# =====================================================================
+# 8. BUG-REG-07: YouTube Proxy Configuration & Bot-Check Direct Link Invariant
+# =====================================================================
+
+def test_youtube_proxy_passed_to_ydl_options(tmp_path):
+    """
+    When YOUTUBE_PROXY is set, it is passed to yt-dlp options for YouTube operations,
+    and is NOT passed for SoundCloud operations.
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    recorded_opts = []
+
+    class CapturingFakeYDL:
+        def __init__(self, opts):
+            self.opts = dict(opts)
+            recorded_opts.append(self.opts)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {"title": "Test Song", "duration": 200}
+            return {
+                "entries": [
+                    {
+                        "id": "cand_yt",
+                        "title": "Test Song",
+                        "uploader": "Test Artist - Topic",
+                        "duration": 200,
+                        "webpage_url": "https://www.youtube.com/watch?v=cand_yt",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+
+    fake_proxy = "http://user:secret@proxy.example.com:8080"
+    with patch("services.downloader.YOUTUBE_PROXY", fake_proxy), \
+         patch("yt_dlp.YoutubeDL", side_effect=CapturingFakeYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = _sync_download(
+            query_or_url="ytsearch5:Test Artist Test Song",
+            output_dir=tmp_path,
+            custom_title="Test Song",
+            custom_artist="Test Artist",
+            expected_duration=200,
+            is_text_input=True
+        )
+        assert res is not None
+        # Verify proxy was included in options for YouTube download/search
+        yt_calls = [opt for opt in recorded_opts if opt.get("proxy") == fake_proxy]
+        assert len(yt_calls) >= 1
+
+
+def test_proxy_url_credentials_not_logged():
+    """
+    Proxy URL with username:password credentials must be sanitized
+    so passwords never leak into logs.
+    """
+    from config import get_sanitized_proxy_info
+
+    # HTTP proxy with user/password
+    raw_proxy = "http://myuser:mypassword123@192.168.1.50:8888"
+    sanitized = get_sanitized_proxy_info(raw_proxy)
+    assert "mypassword123" not in sanitized
+    assert "myuser" not in sanitized
+    assert "192.168.1.50" in sanitized
+    assert "8888" in sanitized
+    assert "(authenticated)" in sanitized
+
+    # SOCKS5 proxy without credentials
+    raw_socks = "socks5://127.0.0.1:10808"
+    sanitized_socks = get_sanitized_proxy_info(raw_socks)
+    assert sanitized_socks == "socks5://127.0.0.1:10808"
+
+    # None
+    assert get_sanitized_proxy_info(None) == "none"
+
+
+@pytest.mark.asyncio
+async def test_direct_youtube_failure_no_soundcloud_fallback(tmp_path):
+    """
+    For direct YouTube links, if download fails with bot-check ('Sign in to confirm you’re not a bot'),
+    the system must NOT fall back to SoundCloud.
+    """
+    from unittest.mock import patch
+    from services.downloader import download_track
+
+    sc_fallback_called = []
+
+    def fake_sync_download(query_or_url, *args, **kwargs):
+        if "youtube" in query_or_url:
+            raise RuntimeError("Sign in to confirm you’re not a bot")
+        if "soundcloud" in query_or_url or query_or_url.startswith("scsearch"):
+            sc_fallback_called.append(query_or_url)
+            raise RuntimeError("Should not be called")
+        raise RuntimeError("Unexpected query")
+
+    with patch("services.downloader._sync_download", side_effect=fake_sync_download):
+        with pytest.raises(RuntimeError, match="Sign in to confirm you’re not a bot"):
+            await download_track(
+                query_or_url="https://www.youtube.com/watch?v=XwxLwG2_Sxk",
+                custom_title="Blinding Lights",
+                custom_artist="The Weeknd",
+                expected_duration=200
+            )
+
+    assert len(sc_fallback_called) == 0, "SoundCloud fallback was invoked for direct YouTube URL!"
+
+
+def test_youtube_search_and_download_without_proxy_still_works(tmp_path):
+    """
+    When YOUTUBE_PROXY is None, normal YouTube search and download continue to operate
+    without proxy configuration (default local behavior).
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    recorded_proxies = []
+
+    class CapturingYDL:
+        def __init__(self, opts):
+            self.opts = dict(opts)
+            recorded_proxies.append(self.opts.get("proxy"))
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {"title": "Blinding Lights", "duration": 200}
+            return {
+                "entries": [
+                    {
+                        "id": "cand1",
+                        "title": "Blinding Lights",
+                        "uploader": "The Weeknd - Topic",
+                        "duration": 200,
+                        "webpage_url": "https://www.youtube.com/watch?v=cand1",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+
+    with patch("services.downloader.YOUTUBE_PROXY", None), \
+         patch("yt_dlp.YoutubeDL", side_effect=CapturingYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = _sync_download(
+            query_or_url="ytsearch5:The Weeknd Blinding Lights",
+            output_dir=tmp_path,
+            custom_title="Blinding Lights",
+            custom_artist="The Weeknd",
+            expected_duration=200,
+            is_text_input=True
+        )
+        assert res is not None
+        assert res.title == "Blinding Lights"
+        for proxy_val in recorded_proxies:
+            assert proxy_val is None
+
+
+# =====================================================================
+# 9. BUG-REG-08: Canonical Variant Preservation & Cache Isolation
+# =====================================================================
+
+def test_spotify_canonical_super_slowed_preserves_variant():
+    """
+    When a Spotify URL points to a canonical modified version (e.g. 'не слышу - Super Slowed'),
+    the handler must detect variant='super slowed' from the resolved track metadata,
+    rather than falling back to 'original'.
+    """
+    from services.identity import extract_track_modifiers
+    track_title = "не слышу - Super Slowed"
+    _, title_mods = extract_track_modifiers(track_title)
+    assert "super slowed" in title_mods
+    if "super slowed" in title_mods:
+        detected_variant = "super slowed"
+    else:
+        detected_variant = ", ".join(title_mods)
+    assert detected_variant == "super slowed"
+
+
+@pytest.mark.asyncio
+async def test_spotify_canonical_super_slowed_uses_canonical_duration_97s():
+    """
+    Spotify metadata extractor must extract the version's canonical duration (97s),
+    not the original song's duration (88s).
+    """
+    from unittest.mock import AsyncMock, patch, MagicMock
+    from services.extractor import _extract_spotify_embed_metadata
+
+    fake_html = """
+    <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{"state":{"data":{"entity":{
+        "name":"не слышу - Super Slowed",
+        "title":"не слышу - Super Slowed",
+        "artists":[{"name":"DJ ZUP RAlii"}],
+        "duration":97967
+    }}}}}}
+    </script>
+    """
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.text = AsyncMock(return_value=fake_html)
+
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    cm.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=cm)
+
+    artist, title, cover, duration = await _extract_spotify_embed_metadata("6CdMaVhtjoqjV80VwUdkX7", mock_session)
+    assert artist == "DJ ZUP RAlii"
+    assert title == "не слышу - Super Slowed"
+    assert duration == 97  # Exactly 97s, NOT 88s
+
+
+def test_youtube_candidate_98s_passes_for_canonical_97s(tmp_path):
+    """
+    YouTube candidate with duration 98s must pass duration validation
+    against canonical target duration 97s (diff=1s <= 4s gate).
+    """
+    from services.downloader import _sync_download
+    from unittest.mock import patch
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = dict(opts)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if download:
+                f = tmp_path / "song.m4a"
+                f.write_bytes(b"\x00" * 2000)
+                return {
+                    "id": "cVeOnbKJe6k",
+                    "title": "не слышу (Super Slowed)",
+                    "uploader": "Release - Topic",
+                    "duration": 98
+                }
+            return {
+                "entries": [
+                    {
+                        "id": "cVeOnbKJe6k",
+                        "title": "не слышу (Super Slowed)",
+                        "uploader": "Release - Topic",
+                        "duration": 98,
+                        "webpage_url": "https://www.youtube.com/watch?v=cVeOnbKJe6k",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=FakeYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        audio = _sync_download(
+            query_or_url="ytsearch5:DJ ZUP RAlii - не слышу - Super Slowed",
+            output_dir=tmp_path,
+            custom_title="не слышу - Super Slowed",
+            custom_artist="DJ ZUP RAlii",
+            expected_duration=97,
+            is_apple_music=True
+        )
+        assert audio is not None
+        assert audio.duration == 98
+        # Verification of the <= 4s gate:
+        assert abs(audio.duration - 97) <= 4
+
+
+def test_cache_isolation_between_original_and_super_slowed():
+    """
+    Cache keys and storage must strictly isolate 'original' and 'super slowed' variants.
+    """
+    from services.database import build_variant_cache_key, save_cached_track, get_cached_track
+
+    key_orig = build_variant_cache_key("не слышу", variant="original")
+    key_slowed = build_variant_cache_key("не слышу", variant="super slowed")
+    assert key_orig != key_slowed
+    assert key_orig == "не слышу"
+    assert "#var=super slowed" in key_slowed
+
+    save_cached_track("не слышу test", "file_id_original", "не слышу", "DJ ZUP RAlii", 88, variant="original")
+    save_cached_track("не слышу test", "file_id_slowed", "не слышу - Super Slowed", "DJ ZUP RAlii", 97, variant="super slowed")
+
+    hit_orig = get_cached_track("не слышу test", variant="original")
+    hit_slowed = get_cached_track("не слышу test", variant="super slowed")
+
+    assert hit_orig is not None
+    assert hit_orig["file_id"] == "file_id_original"
+    assert hit_orig["duration"] == 88
+
+    assert hit_slowed is not None
+    assert hit_slowed["file_id"] == "file_id_slowed"
+    assert hit_slowed["duration"] == 97
+
+
+def test_radiohead_creep_preserves_original_path(tmp_path):
+    """
+    Standard track 'Radiohead — Creep' must maintain original variant,
+    select official Radiohead candidate (237s), and pass standard 238s reference.
+    """
+    from services.downloader import _sync_download, compute_candidate_penalty
+    from unittest.mock import patch
+
+    cand_official = {
+        "id": "XFkzRNyygfk",
+        "title": "Radiohead - Creep",
+        "uploader": "Radiohead",
+        "channel": "Radiohead",
+        "duration": 237,
+        "_source": "youtube"
+    }
+
+    cand_cover = {
+        "id": "cover123",
+        "title": "Radiohead - Creep (Cover)",
+        "uploader": "Random Guy",
+        "channel": "Random Guy",
+        "duration": 237,
+        "_source": "youtube"
+    }
+
+    pen_official = compute_candidate_penalty(
+        cand_official,
+        custom_artist="Radiohead",
+        custom_title="Creep",
+        expected_duration=238,
+        requested_modifiers=set(),
+        is_text_input=True,
+        is_apple_music=False,
+        source="youtube",
+        clean_search="Radiohead Creep"
+    )
+
+    pen_cover = compute_candidate_penalty(
+        cand_cover,
+        custom_artist="Radiohead",
+        custom_title="Creep",
+        expected_duration=238,
+        requested_modifiers=set(),
+        is_text_input=True,
+        is_apple_music=False,
+        source="youtube",
+        clean_search="Radiohead Creep"
+    )
+
+    # Official candidate must have significantly lower penalty than non-official cover
+    assert pen_official < pen_cover

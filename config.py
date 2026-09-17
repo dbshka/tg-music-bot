@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # Загрузка переменных из .env
@@ -22,8 +23,27 @@ DEFAULT_AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192")
 BOT_VERSION = "3.0.0"
 
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
-# Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
 PROXY = os.getenv("PROXY")
+# Отдельный прокси для YouTube (поддерживает HTTP/HTTPS/SOCKS5), с fallback на общий PROXY
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY") or PROXY
+
+
+def get_sanitized_proxy_info(proxy_url: Optional[str]) -> str:
+    """Возвращает безопасную строку описания прокси без учетных данных (логина и пароля)."""
+    if not proxy_url:
+        return "none"
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(proxy_url)
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname or "unknown"
+        port = f":{parsed.port}" if parsed.port else ""
+        auth_note = " (authenticated)" if (parsed.username or parsed.password) else ""
+        return f"{scheme}://{host}{port}{auth_note}"
+    except Exception:
+        return "configured (sanitized)"
+
+
 CUSTOM_API_SERVER = os.getenv("CUSTOM_API_SERVER")
 if CUSTOM_API_SERVER:
     CUSTOM_API_SERVER = CUSTOM_API_SERVER.rstrip("/")
