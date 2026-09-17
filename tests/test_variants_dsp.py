@@ -346,3 +346,134 @@ def test_8_regular_youtube_download_flow(tmp_path):
         assert downloaded.title == "Blinding Lights"
         assert downloaded.artist == "The Weeknd"
         assert downloaded.file_path.exists()
+
+
+# =====================================================================
+# REGRESSION TESTS FOR SOURCE METADATA & FINAL VALIDATION
+# =====================================================================
+
+def test_regression_1_slowed_request_with_slowed_source_title_passes():
+    """1. Blinding Lights Slowed + source title Blinding Lights (Slowed) -> PASS."""
+    target_mods = extract_modifiers("slowed")
+    source_title = "The Weeknd - Blinding Lights (Slowed)"
+    source_mods = extract_modifiers(source_title)
+    assert "slowed" in source_mods
+    assert is_candidate_matching_modifiers(target_mods, source_mods) is True
+
+
+def test_regression_2_slowed_request_with_slowed_down_source_title_passes():
+    """2. Blinding Lights Slowed + source title Blinding Lights (Slowed Down) -> PASS."""
+    target_mods = extract_modifiers("slowed")
+    source_title = "The Weeknd - Blinding Lights (Slowed Down)"
+    source_mods = extract_modifiers(source_title)
+    assert "slowed" in source_mods
+    assert is_candidate_matching_modifiers(target_mods, source_mods) is True
+
+
+def test_regression_3_slowed_request_with_original_source_title_fails():
+    """3. Blinding Lights Slowed + source title Blinding Lights -> FAIL."""
+    target_mods = extract_modifiers("slowed")
+    source_title = "The Weeknd - Blinding Lights"
+    source_mods = extract_modifiers(source_title)
+    assert not source_mods
+    assert is_candidate_matching_modifiers(target_mods, source_mods) is False
+
+
+def test_regression_4_custom_title_does_not_destroy_source_title(tmp_path):
+    """4. custom_title='Blinding Lights' не должен уничтожать source_title."""
+    from services.downloader import DownloadedAudio
+    audio = DownloadedAudio(
+        file_path=tmp_path / "track.m4a",
+        title="Blinding Lights",
+        artist="The Weeknd",
+        duration=225,
+        thumbnail_path=None,
+        filesize=1000,
+        folder_path=tmp_path,
+        source_title="The Weeknd - Blinding Lights (Slowed Down)",
+        source_modifiers={"slowed"}
+    )
+    assert audio.title == "Blinding Lights"
+    assert audio.source_title == "The Weeknd - Blinding Lights (Slowed Down)"
+
+
+def test_regression_5_source_modifiers_preserved_on_downloaded_audio(tmp_path):
+    """5. source_modifiers сохраняются после создания DownloadedAudio."""
+    from services.downloader import DownloadedAudio
+    audio = DownloadedAudio(
+        file_path=tmp_path / "track.m4a",
+        title="Blinding Lights",
+        artist="The Weeknd",
+        duration=225,
+        thumbnail_path=None,
+        filesize=1000,
+        folder_path=tmp_path,
+        source_title="The Weeknd - Blinding Lights (Slowed + Reverb)",
+        source_modifiers={"slowed", "reverb"}
+    )
+    assert audio.source_modifiers == {"slowed", "reverb"}
+
+
+def test_regression_6_regular_blinding_lights_has_no_variant():
+    """6. Обычный Blinding Lights остаётся без variant."""
+    clean_title, mods = extract_track_modifiers("Blinding Lights")
+    assert clean_title == "Blinding Lights"
+    assert not mods
+
+    full_clean, full_mods = extract_track_modifiers("The Weeknd — Blinding Lights")
+    assert not full_mods
+    variant = ", ".join(full_mods) if full_mods else "original"
+    assert variant == "original"
+
+
+def test_regression_7_super_slowed_does_not_turn_into_slowed():
+    """7. Super Slowed не превращается автоматически в Slowed."""
+    target_super_slowed = extract_modifiers("super slowed")
+    assert "super slowed" in target_super_slowed
+
+    # Кандидат только с обычным slowed НЕ должен удовлетворять запросу super slowed
+    cand_slowed_only = {"slowed"}
+    assert is_candidate_matching_modifiers(target_super_slowed, cand_slowed_only) is False
+
+    # Кандидат с super slowed удовлетворяет
+    cand_super_slowed = {"super slowed"}
+    assert is_candidate_matching_modifiers(target_super_slowed, cand_super_slowed) is True
+
+
+def test_sync_download_populates_source_metadata(tmp_path):
+    """Интеграционный тест: _sync_download корректно заполняет source_title и source_modifiers."""
+    from services.downloader import _sync_download
+
+    fake_ydl_result = {
+        "title": "The Weeknd - Blinding Lights (Slowed Down)",
+        "uploader": "Slowed Vibes",
+        "duration": 235,
+        "webpage_url": "https://www.youtube.com/watch?v=mock123",
+        "_source": "youtube"
+    }
+
+    def fake_extract_info(url, download=False):
+        if download:
+            af = tmp_path / "Blinding Lights.m4a"
+            af.write_bytes(b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 2000)
+        return fake_ydl_result
+
+    mock_ydl_instance = MagicMock()
+    mock_ydl_instance.__enter__.return_value = mock_ydl_instance
+    mock_ydl_instance.extract_info.side_effect = fake_extract_info
+
+    with patch("yt_dlp.YoutubeDL", return_value=mock_ydl_instance), \
+         patch("services.downloader._apply_custom_metadata"):
+        downloaded = _sync_download(
+            query_or_url="https://www.youtube.com/watch?v=mock123",
+            output_dir=tmp_path,
+            custom_title="Blinding Lights",
+            custom_artist="The Weeknd",
+            expected_duration=None,
+            requested_variant="slowed"
+        )
+        assert downloaded is not None
+        assert downloaded.title == "Blinding Lights"
+        assert downloaded.source_title == "The Weeknd - Blinding Lights (Slowed Down)"
+        assert "slowed" in downloaded.source_modifiers
+        assert is_candidate_matching_modifiers({"slowed"}, downloaded.source_modifiers) is True

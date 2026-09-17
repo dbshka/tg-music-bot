@@ -448,7 +448,10 @@ async def _execute_download_and_send(
             # 3. Если пользователь искал вариант, а в кэше трек без требуемого варианта
             elif variant != "original":
                 target_mods = extract_modifiers(variant)
-                if not is_candidate_matching_modifiers(target_mods, cached_mods):
+                cached_var = cached.get("variant")
+                cached_var_mods = extract_modifiers(cached_var) if cached_var else set()
+                combined_cached_mods = cached_mods | cached_var_mods
+                if not is_candidate_matching_modifiers(target_mods, combined_cached_mods):
                     print(f"[MUSIC][request_id={req_id}] Variant cache INVALIDATED: cached track '{cached_title}' does not match variant '{variant}'. Purging.", flush=True)
                     should_invalidate = True
 
@@ -588,11 +591,20 @@ async def _execute_download_and_send(
                     return
             elif variant != "original":
                 target_mods = extract_modifiers(variant)
-                file_text = f"{downloaded_audio.title} {downloaded_audio.artist}".lower()
-                ignore_artist = set(re.findall(r'[\w]+', (downloaded_audio.artist or '').lower()))
-                dl_mods = extract_modifiers(file_text, ignore_words=ignore_artist)
-                if not is_candidate_matching_modifiers(target_mods, dl_mods):
-                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: downloaded audio '{downloaded_audio.title}' lacks requested variant '{variant}' (got mods: {dl_mods}). Refusing to send to Telegram.", flush=True)
+                # Финальная проверка подлинности найденного варианта:
+                # В первую очередь используем source_modifiers и source_title из DownloadedAudio,
+                # так как downloaded_audio.title может быть намеренно нормализован через custom_title.
+                cand_mods = set(downloaded_audio.source_modifiers or set())
+                if not cand_mods and downloaded_audio.source_title:
+                    ignore_artist = set(re.findall(r'[\w]+', (downloaded_audio.artist or '').lower()))
+                    cand_mods = extract_modifiers(downloaded_audio.source_title, ignore_words=ignore_artist)
+                if not cand_mods:
+                    file_text = f"{downloaded_audio.title} {downloaded_audio.artist}".lower()
+                    ignore_artist = set(re.findall(r'[\w]+', (downloaded_audio.artist or '').lower()))
+                    cand_mods = extract_modifiers(file_text, ignore_words=ignore_artist)
+
+                if not is_candidate_matching_modifiers(target_mods, cand_mods):
+                    print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: downloaded audio '{downloaded_audio.title}' (source: '{downloaded_audio.source_title}') lacks requested variant '{variant}' (got mods: {cand_mods}, target: {target_mods}). Refusing to send to Telegram.", flush=True)
                     await status_msg.edit_text(
                         f"⚠️ К сожалению, готовая версия «{variant}» для данного трека не найдена. Оригинальный трек отклонён во избежание подмены."
                     )

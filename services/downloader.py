@@ -72,6 +72,8 @@ class DownloadedAudio:
     folder_path: Path
     perf_timings: Optional[dict] = None
     invocations: Optional[list] = None
+    source_title: Optional[str] = None
+    source_modifiers: Optional[set] = None
 
     def cleanup(self):
         """Удаляет временную папку загрузки и все файлы внутри."""
@@ -1006,6 +1008,8 @@ def _sync_download(
                             "result": "OK"
                         })
                         print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
+                        res_info["_source_title"] = cand_entry_title or cand_title
+                        res_info["_source_modifiers"] = cand_modifiers
                         return res_info
 
                     # Длительность отличается, сохраняем как резервный вариант ТОЛЬКО ЕСЛИ название совпадает и нет модификаторов!
@@ -1027,6 +1031,8 @@ def _sync_download(
                             for af in audio_files:
                                 backup_p = output_dir / f"backup_{af.name}"
                                 shutil.copy2(af, backup_p)
+                            res_info["_source_title"] = cand_entry_title or cand_title
+                            res_info["_source_modifiers"] = cand_modifiers
                             best_fallback_info = {"res_info": res_info, "diff": diff}
 
                     for temp_f in output_dir.iterdir():
@@ -1115,6 +1121,8 @@ def _sync_download(
                                     dur_ok = not expected_duration or (diff <= max_retry_diff)
                                     if dur_ok:
                                         print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
+                                        res_info["_source_title"] = retry_title
+                                        res_info["_source_modifiers"] = retry_mods
                                         return res_info
                             except Exception as sub_retry_err:
                                 print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} также завершился ошибкой ({sub_retry_err}).", flush=True)
@@ -1214,6 +1222,8 @@ def _sync_download(
                                                 new_sc_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, s_mods, req_tag, req_query=clean_search)
                                                 if new_sc_dur > 0:
                                                     res_cand["duration"] = new_sc_dur
+                                                res_cand["_source_title"] = s_title
+                                                res_cand["_source_modifiers"] = s_mods
                                                 return res_cand
                                     except Exception as s_err:
                                         print(f"{req_tag}[DOWNLOADER] SoundCloud fallback candidate '{s_url}' не удался: {s_err}", flush=True)
@@ -1284,6 +1294,9 @@ def _sync_download(
                 "result": "OK"
             })
             print(f"{req_tag}[YTDLP] invocation=#{inv_idx} purpose='direct_download' source='{source}' start={t_d0 - t_start_all:.2f}s end={t_d1 - t_start_all:.2f}s duration={dur_dl_all:.2f}s result='OK'", flush=True)
+            res_info["_source_title"] = res_info.get("title") or ""
+            direct_text = f"{res_info.get('title') or ''} {res_info.get('uploader') or ''} {res_info.get('channel') or ''}".lower()
+            res_info["_source_modifiers"] = extract_modifiers(direct_text)
             return res_info
 
     try:
@@ -1338,6 +1351,17 @@ def _sync_download(
 
     extracted_title = _clean_audio_branding(custom_title or info.get("track") or info.get("title") or "Unknown Track")
     extracted_artist = _clean_audio_branding(custom_artist or info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist")
+
+    raw_source_title = info.get("_source_title") or info.get("title") or info.get("track") or extracted_title
+    source_title = _clean_audio_branding(raw_source_title) or raw_source_title
+
+    raw_source_mods = info.get("_source_modifiers")
+    if raw_source_mods is not None:
+        source_modifiers = set(raw_source_mods)
+    else:
+        src_text = f"{source_title} {info.get('uploader') or ''} {info.get('channel') or ''}".lower()
+        source_modifiers = extract_modifiers(src_text) or set()
+
     duration = int(info.get("duration") or 0)
     try:
         from mutagen import File as MutagenFile
@@ -1373,7 +1397,9 @@ def _sync_download(
         filesize=filesize,
         folder_path=output_dir,
         perf_timings=perf_timings,
-        invocations=invocations
+        invocations=invocations,
+        source_title=source_title,
+        source_modifiers=source_modifiers
     )
 
 
