@@ -1026,8 +1026,11 @@ def _sync_download(
                     )
                     max_backup_diff = (max(4, min(7, int(expected_duration * 0.02))) if is_official_high_confidence else 4) if (is_apple_music or is_text_input) else 12
                     has_required_mods = True
-                    if semantic_requested:
-                        has_required_mods = bool(semantic_requested & cand_modifiers)
+                    if requested_modifiers:
+                        has_required_mods = is_candidate_matching_modifiers(
+                            requested_modifiers,
+                            cand_modifiers
+                        )
                     if (cand_match_ratio >= 0.5 or not core_title_words) and has_required_mods and (requested_modifiers or not cand_modifiers) and diff <= max_backup_diff:
                         print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' имеет допустимую резервную разницу длительности {diff}s (<= {max_backup_diff}s). Сохраняем как резерв.", flush=True)
                         if best_fallback_info is None or diff < best_fallback_info.get("diff", 99999):
