@@ -69,6 +69,12 @@ else:
     STORAGE_CHANNEL_ID = None
 DB_PATH = BASE_DIR / "bot_database.db"
 
+# Настройки постоянного хранилища и кэша Cloudflare D1
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_D1_DATABASE_ID = os.getenv("CLOUDFLARE_D1_DATABASE_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "43200"))
+
 # Настройки cookies для YouTube (обход блокировок хостинга)
 import base64
 import tempfile

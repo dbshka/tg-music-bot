@@ -44,6 +44,15 @@ from services.extractor import (
     UNSUPPORTED_URL_FALLBACK_TEXT,
     clean_unicode_text,
 )
+from services.persistent_cache import (
+    build_source_key,
+    get_persistent_track_async,
+    save_persistent_track_async,
+    invalidate_persistent_track_async,
+    get_persistent_search_results_async,
+    save_persistent_search_results_async,
+    check_metadata_match,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +106,22 @@ def _extract_https_thumbnail(url: str, default_thumb: Optional[str]) -> Optional
         m = re.search(r'(?:v=|\/shorts\/|\/embed\/|youtu\.be\/)([a-zA-Z0-9_-]{11})', url)
         if m:
             return f"https://i.ytimg.com/vi/{m.group(1)}/hqdefault.jpg"
-    return None
-
-
-
-
+def is_unusable_file_id_error(err: Exception) -> bool:
+    """
+    Определяет, указывает ли ошибка Telegram на невалидный или устаревший file_id.
+    """
+    msg = str(err).lower()
+    patterns = [
+        "wrong file identifier",
+        "invalid file id",
+        "file_reference_expired",
+        "wrong remote file identifier",
+        "can't find file",
+        "wrong type of the file",
+        "file identifier is not",
+        "unusable file_id",
+    ]
+    return any(p in msg for p in patterns)
 
 @router.inline_query()
 async def handle_inline_query(inline_query: InlineQuery):
@@ -253,21 +273,50 @@ async def handle_inline_query(inline_query: InlineQuery):
     except Exception as e:
         logger.warning("Ошибка проверки кэша в inline query: %s", e)
 
-    # 5. Если в кэше меньше 5 треков — выполняем плоский поиск кандидатов (extract_flat)
+    # 5. Если в кэше меньше 5 треков — выполняем поиск кандидатов
     q_artist, q_title = extract_artist_title_from_query(query_text)
     remaining_slots = 5 - len(results)
     if remaining_slots > 0:
         try:
-            search_items, _ = await search_tracks_async(query_text, limit=5)
-            for item in search_items:
+            # 5a. Проверка persistent search cache (L1 + Cloudflare D1)
+            cached_search_candidates = await get_persistent_search_results_async(query_text)
+            candidates_to_process: List[Dict[str, Any]] = []
+
+            if cached_search_candidates and isinstance(cached_search_candidates, list):
+                candidates_to_process = cached_search_candidates
+            else:
+                search_items, _ = await search_tracks_async(query_text, limit=5)
+                for item in search_items:
+                    art, tit, alb, dur, thumb = resolve_canonical_candidate_metadata(
+                        item,
+                        query_artist=q_artist,
+                        query_title=q_title
+                    )
+                    candidates_to_process.append({
+                        "url": item.url,
+                        "title": tit,
+                        "artist": art,
+                        "album": alb,
+                        "duration": dur,
+                        "thumbnail": thumb or item.thumbnail,
+                        "formatted_duration": item.formatted_duration or (f"{dur // 60}:{dur % 60:02d}" if dur > 0 else "")
+                    })
+
+                # Сохраняем результаты в persistent search cache
+                if candidates_to_process:
+                    asyncio.create_task(
+                        save_persistent_search_results_async(query_text, candidates_to_process)
+                    )
+
+            for cand_data in candidates_to_process:
                 if len(results) >= 5:
                     break
-                artist, title, album, duration, thumb_url = resolve_canonical_candidate_metadata(
-                    item,
-                    query_artist=q_artist,
-                    query_title=q_title
-                )
-                dur_str = item.formatted_duration or (f"{duration // 60}:{duration % 60:02d}" if duration > 0 else "")
+                artist = cand_data.get("artist") or "Unknown Artist"
+                title = cand_data.get("title") or "Unknown Track"
+                album = cand_data.get("album")
+                duration = int(cand_data.get("duration") or 0)
+                cand_url = cand_data.get("url") or ""
+                dur_str = cand_data.get("formatted_duration") or (f"{duration // 60}:{duration % 60:02d}" if duration > 0 else "")
 
                 # Пропускаем, если такой трек уже добавлен из кэша
                 sig = f"{artist} - {title}".lower()
@@ -276,11 +325,11 @@ async def handle_inline_query(inline_query: InlineQuery):
                 seen_keys.add(sig)
 
                 cand_id = uuid.uuid4().hex[:10]
-                resolved_thumb_url = _extract_https_thumbnail(item.url, thumb_url or item.thumbnail)
+                resolved_thumb_url = _extract_https_thumbnail(cand_url, cand_data.get("thumbnail"))
 
                 save_inline_candidate(
                     cand_id=cand_id,
-                    target=item.url,
+                    target=cand_url,
                     title=title,
                     artist=artist,
                     album=album,
@@ -416,8 +465,12 @@ async def process_inline_download(
 
     artist = candidate.get("artist") or "Unknown Artist"
     title = candidate.get("title") or "Unknown Track"
+    album = candidate.get("album")
+    duration = candidate.get("duration")
     target = candidate.get("target") or f"{artist} - {title}"
-    dedup_key = target.strip()
+
+    source_key, source_type, source_id = build_source_key(target)
+    dedup_key = source_key
 
     # 1. Сразу переводим сообщение в состояние DOWNLOADING и удаляем техническую клавиатуру
     if inline_message_id:
@@ -460,7 +513,7 @@ async def process_inline_download(
                         media=file_id,
                         title=title,
                         performer=artist,
-                        duration=candidate.get("duration") or 0
+                        duration=duration or 0
                     )
                 )
                 logger.info("INLINE MESSAGE EDITED\nresult_id=art_%s\nsuccess=true", cand_id)
@@ -474,18 +527,79 @@ async def process_inline_download(
     file_id = None
     effective_storage_id = get_effective_storage_channel_id()
     try:
-        # 3. Проверка кэша базы данных: возможно, файл уже загружен
-        cached = await get_cached_track_async(target)
-        if not cached and artist and title:
-            cached = await get_cached_track_async(f"{artist} - {title}")
+        # 3. Persistent Cache Lookup (L1 RAM + Cloudflare D1)
+        cached_track = await get_persistent_track_async(source_key)
+        if cached_track and is_valid_telegram_file_id(cached_track.telegram_file_id):
+            is_match, cached_hash, current_hash = check_metadata_match(
+                cached_track, artist=artist, title=title, album=album, duration=duration
+            )
+            if is_match:
+                file_id = cached_track.telegram_file_id
+                logger.info("Persistent cache HIT\nsource_key=%s\nfile_id=%s", source_key, file_id)
+            else:
+                logger.info(
+                    "Persistent cache metadata mismatch -> treating as MISS to refresh ID3 tags:\n"
+                    "  source_key=%s\n"
+                    "  cached_hash=%s (cached: %r - %r, album=%r)\n"
+                    "  current_hash=%s (candidate: %r - %r, album=%r)",
+                    source_key,
+                    cached_hash, cached_track.artist, cached_track.title, cached_track.album,
+                    current_hash, artist, title, album
+                )
+                file_id = None
+        else:
+            # Fallback к legacy local SQLite кэшу, если в D1 еще нет
+            legacy_cached = await get_cached_track_async(target)
+            if not legacy_cached and artist and title:
+                legacy_cached = await get_cached_track_async(f"{artist} - {title}")
+            cached_file_id = legacy_cached.get("file_id") if legacy_cached else None
+            if is_valid_telegram_file_id(cached_file_id):
+                file_id = cached_file_id
+                logger.info("Persistent cache HIT\nsource_key=%s\nfile_id=%s", source_key, file_id)
+                # Асинхронно мигрируем запись в D1
+                asyncio.create_task(
+                    save_persistent_track_async(
+                        source_key=source_key,
+                        source_type=source_type,
+                        source_id=source_id,
+                        artist=legacy_cached.get("artist") or artist,
+                        title=legacy_cached.get("title") or title,
+                        album=album,
+                        duration=legacy_cached.get("duration") or duration,
+                        telegram_file_id=file_id
+                    )
+                )
 
-        cached_file_id = cached.get("file_id") if cached else None
-        if is_valid_telegram_file_id(cached_file_id):
-            file_id = cached_file_id
-            logger.info("INLINE CACHE HIT: cand_id=%s, file_id=%s", cand_id, file_id)
+        # 4. Если в кэше найден file_id — пытаемся сразу применить через edit_message_media
+        if file_id:
+            if inline_message_id:
+                try:
+                    await bot.edit_message_media(
+                        inline_message_id=inline_message_id,
+                        media=InputMediaAudio(
+                            media=file_id,
+                            title=(cached_track.title if cached_track else title),
+                            performer=(cached_track.artist if cached_track else artist),
+                            duration=((cached_track.duration if cached_track else duration) or 0)
+                        )
+                    )
+                    logger.info("INLINE MESSAGE EDITED\nresult_id=art_%s\nsuccess=true", cand_id)
+                    print(f"INLINE MESSAGE EDITED\nresult_id=art_{cand_id}\nsuccess=true", flush=True)
+                    if not fut.done():
+                        fut.set_result(file_id)
+                    return file_id
+                except Exception as media_err:
+                    if is_unusable_file_id_error(media_err):
+                        logger.info("Invalid Telegram file_id, invalidating cache\nsource_key=%s", source_key)
+                        await invalidate_persistent_track_async(source_key, file_id)
+                        file_id = None
+                    else:
+                        raise media_err
 
-        # 4. Если в кэше нет — скачиваем через существующий download_track()
+        # 5. Если в кэше нет (или file_id был инвалидирован) — скачиваем через download_track()
         if not file_id:
+            logger.info("Persistent cache MISS\nsource_key=%s", source_key)
+            logger.info("Persistent cache MISS -> downloading\nsource_key=%s", source_key)
             logger.info(
                 "INLINE DOWNLOAD EXECUTE:\n"
                 "  query=%s\n"
@@ -568,6 +682,7 @@ async def process_inline_download(
 
             file_id = uploaded_msg.audio.file_id
 
+            logger.info("Uploaded audio to Telegram storage\nsource_key=%s\nstorage_message_id=%s", source_key, uploaded_msg.message_id)
             logger.info(
                 "INLINE TELEGRAM UPLOAD COMPLETE:\n"
                 "  cand_id=%s\n"
@@ -576,20 +691,19 @@ async def process_inline_download(
                 cand_id, effective_storage_id, file_id
             )
 
-            # 6. Сохраняем в кэш базы данных
-            await save_cached_track_async(
-                query=candidate["target"],
-                file_id=file_id,
-                title=downloaded.title,
+            # 6. Сохраняем в Persistent Cache (Cloudflare D1 + L1)
+            await save_persistent_track_async(
+                source_key=source_key,
+                source_type=source_type,
+                source_id=source_id,
                 artist=downloaded.artist,
-                duration=downloaded.duration
-            )
-            await save_cached_track_async(
-                query=f"{downloaded.artist} - {downloaded.title}",
-                file_id=file_id,
                 title=downloaded.title,
-                artist=downloaded.artist,
-                duration=downloaded.duration
+                album=downloaded.album,
+                duration=downloaded.duration,
+                telegram_file_id=file_id,
+                telegram_file_unique_id=uploaded_msg.audio.file_unique_id,
+                storage_message_id=uploaded_msg.message_id,
+                file_size=downloaded.filesize
             )
 
         if not fut.done():
