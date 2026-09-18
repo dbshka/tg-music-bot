@@ -75,6 +75,7 @@ class DownloadedAudio:
     source_title: Optional[str] = None
     source_modifiers: Optional[set] = None
     cover_path: Optional[Path] = None
+    album: Optional[str] = None
 
     def cleanup(self):
         """Удаляет временную папку загрузки и все файлы внутри."""
@@ -1485,7 +1486,7 @@ def _sync_download(
 
     # 1. Authoritative Title: если передан валидный custom_title, YouTube никогда его не подменяет
     extracted_title = None
-    if custom_title and custom_title.strip():
+    if custom_title and custom_title.strip() and custom_title.strip().lower() != "unknown track":
         extracted_title = _clean_audio_branding(custom_title.strip())
 
     # 2. Authoritative Artist: если передан валидный custom_artist, YouTube никогда его не подменяет
@@ -1528,6 +1529,14 @@ def _sync_download(
         if not extracted_title:
             extracted_title = _clean_audio_branding(yt_track or cand_tit_from_title or raw_info_title or "Unknown Track")
 
+    # 4. Authoritative Album: если передан custom_album, YouTube никогда его не подменяет.
+    # Если custom_album не передан, берем структурированный album из info (если не generic).
+    extracted_album = None
+    if custom_album and custom_album.strip():
+        extracted_album = _clean_audio_branding(custom_album.strip())
+    elif info.get("album") and not is_generic_artist_name(str(info.get("album"))):
+        extracted_album = _clean_audio_branding(str(info.get("album")).strip())
+
     raw_source_title = info.get("_source_title") or info.get("title") or info.get("track") or extracted_title
     source_title = _clean_audio_branding(raw_source_title) or raw_source_title
 
@@ -1561,7 +1570,7 @@ def _sync_download(
                 )
 
     t_tag0 = time.perf_counter()
-    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, embedded_cover_path or thumbnail_path, album=custom_album)
+    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, embedded_cover_path or thumbnail_path, album=extracted_album)
     perf_timings["tags"] = time.perf_counter() - t_tag0
 
     return DownloadedAudio(
@@ -1576,7 +1585,8 @@ def _sync_download(
         invocations=invocations,
         source_title=source_title,
         source_modifiers=source_modifiers,
-        cover_path=embedded_cover_path or thumbnail_path
+        cover_path=embedded_cover_path or thumbnail_path,
+        album=extracted_album
     )
 
 
@@ -1600,6 +1610,12 @@ GENERIC_ARTIST_NAMES = {
     "release - topic",
     "release – topic",
     "release — topic",
+    "artist",
+    "artist - topic",
+    "artist – topic",
+    "artist — topic",
+    "исполнитель",
+    "исполнитель - тема",
     "top tracks",
     "vevo",
     "official audio",
@@ -1750,7 +1766,7 @@ async def download_track(
                 cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
                 if cover_to_embed and cover_to_embed.exists():
                     audio.cover_path = cover_to_embed
-                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album)
+                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album or audio.album)
             except Exception:
                 pass
 
@@ -1819,7 +1835,7 @@ async def download_track(
                         cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
                         if cover_to_embed and cover_to_embed.exists():
                             audio.cover_path = cover_to_embed
-                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album)
+                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album or audio.album)
                     except Exception:
                         pass
                 if audio.thumbnail_path and not audio.thumbnail_path.exists():
@@ -1868,7 +1884,7 @@ async def download_track(
                             cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
                             if cover_to_embed and cover_to_embed.exists():
                                 audio.cover_path = cover_to_embed
-                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album)
+                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album or audio.album)
                         except Exception:
                             pass
                     if audio.thumbnail_path and not audio.thumbnail_path.exists():

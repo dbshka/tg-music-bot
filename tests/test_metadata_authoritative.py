@@ -23,7 +23,7 @@ from handlers.inline import (
     _parse_candidate_title_artist,
     handle_inline_query,
 )
-from services.search import SearchItem
+from services.search import SearchItem, resolve_canonical_candidate_metadata
 
 
 # ============================================================================
@@ -407,3 +407,228 @@ def test_text_search_fallback_without_external_metadata(tmp_path):
         assert str(id3.get("TPE1")) == "Макулатура"
         assert str(id3.get("TIT2")) == "Запястья"
         assert "Release" not in str(id3.get("TPE1"))
+
+
+# ============================================================================
+# 4. ТЕСТЫ КАНОНИЧЕСКИХ МЕТАДАННЫХ КАНДИДАТОВ (CANONICAL METADATA PRECEDENCE)
+# ============================================================================
+
+def test_resolve_canonical_candidate_metadata_preserves_ytm_casing():
+    """
+    Запрос пользователя с искаженным регистром (RsAC) НЕ подменяет
+    каноническое написание исполнителя из YouTube Music (RSAC).
+    """
+    candidate = SearchItem(
+        index=1,
+        title="Я всё ещё по тебе скучаю",
+        artist="RSAC",
+        album="Я всё ещё по тебе скучаю",
+        duration=185,
+        url="https://www.youtube.com/watch?v=rsac123",
+        source="ytmusic"
+    )
+
+    art, tit, alb, dur, thumb = resolve_canonical_candidate_metadata(
+        candidate=candidate,
+        query_artist="RsAC",
+        query_title="Я всё ещё по тебе скучаю"
+    )
+
+    assert art == "RSAC"
+    assert tit == "Я всё ещё по тебе скучаю"
+    assert alb == "Я всё ещё по тебе скучаю"
+    assert dur == 185
+
+
+def test_resolve_canonical_candidate_metadata_preserves_ytm_title_casing():
+    """Каноническое название трека из YTM не перетирается капсом из запроса."""
+    candidate = SearchItem(
+        index=1,
+        title="запястья",
+        artist="макулатура",
+        duration=195,
+        url="https://www.youtube.com/watch?v=makul123",
+        source="ytmusic"
+    )
+
+    art, tit, alb, dur, _ = resolve_canonical_candidate_metadata(
+        candidate=candidate,
+        query_artist="МАКУЛАТУРА",
+        query_title="ЗАПЯСТЬЯ"
+    )
+
+    assert art == "макулатура"
+    assert tit == "запястья"
+    assert dur == 195
+
+
+def test_resolve_canonical_candidate_metadata_preserves_youtube_separator_casing():
+    """
+    YouTube-кандидат с заголовком 'Artist - Title' сохраняет свой оригинальный регистр,
+    даже если пользователь ввел все в нижнем регистре.
+    """
+    candidate = SearchItem(
+        index=1,
+        title="The Weeknd - Blinding Lights (Official Music Video)",
+        uploader="The Weeknd",
+        duration=200,
+        url="https://www.youtube.com/watch?v=weeknd123",
+        source="youtube"
+    )
+
+    art, tit, alb, dur, _ = resolve_canonical_candidate_metadata(
+        candidate=candidate,
+        query_artist="the weeknd",
+        query_title="blinding lights"
+    )
+
+    assert art == "The Weeknd"
+    assert tit == "Blinding Lights"
+    assert alb is None
+    assert dur == 200
+
+
+def test_resolve_canonical_candidate_metadata_preserves_topic_uploader_casing():
+    """
+    YouTube-кандидат без разделителя в названии берет артиста из uploader (без - Topic),
+    сохраняя оригинальный регистр uploader-а.
+    """
+    candidate = SearchItem(
+        index=1,
+        title="Starboy",
+        uploader="The Weeknd - Topic",
+        duration=230,
+        url="https://www.youtube.com/watch?v=starboy123",
+        source="youtube"
+    )
+
+    art, tit, alb, dur, _ = resolve_canonical_candidate_metadata(
+        candidate=candidate,
+        query_artist="the weeknd",
+        query_title="starboy"
+    )
+
+    assert art == "The Weeknd"
+    assert tit == "Starboy"
+    assert dur == 230
+
+
+def test_resolve_canonical_candidate_metadata_never_takes_album_or_duration_from_query():
+    """Имя альбома и длительность никогда не заимствуются из запроса."""
+    candidate = SearchItem(
+        index=1,
+        title="Track Without Album",
+        artist="Original Artist",
+        album=None,
+        duration=150,
+        url="https://www.youtube.com/watch?v=noalb123",
+        source="ytmusic"
+    )
+
+    art, tit, alb, dur, _ = resolve_canonical_candidate_metadata(
+        candidate=candidate,
+        query_artist="Original Artist",
+        query_title="Track Without Album (Album Name)"
+    )
+
+    assert alb is None
+    assert dur == 150
+
+
+@pytest.mark.asyncio
+async def test_inline_query_uses_canonical_ytm_artist_not_query_casing():
+    """
+    End-to-end тест inline поиска: при запросе 'RsAC — Я всё ещё по тебе скучаю'
+    в карточке и базе данных сохраняется официальный 'RSAC'.
+    """
+    mock_items = [
+        SearchItem(
+            index=1,
+            title="Я всё ещё по тебе скучаю",
+            artist="RSAC",
+            album="Я всё ещё по тебе скучаю",
+            duration=185,
+            url="https://www.youtube.com/watch?v=rsac123",
+            source="ytmusic"
+        )
+    ]
+
+    mock_inline_query = MagicMock()
+    mock_inline_query.query = "RsAC — Я всё ещё по тебе скучаю"
+    mock_inline_query.answer = AsyncMock()
+
+    with patch("handlers.inline.search_cached_tracks_async", return_value=[]), \
+         patch("handlers.inline.search_tracks_async", return_value=(mock_items, None)), \
+         patch("handlers.inline.save_inline_candidate") as mock_save:
+
+        await handle_inline_query(mock_inline_query)
+
+        assert mock_inline_query.answer.called
+        results = mock_inline_query.answer.call_args[1]["results"]
+        assert len(results) == 1
+        article = results[0]
+
+        # В описании и карточке канонический RSAC
+        assert "RSAC" in article.description
+        assert "RsAC" not in article.description
+        assert "RSAC" in article.input_message_content.message_text
+        assert "RsAC" not in article.input_message_content.message_text
+
+        # В базе данных сохранен канонический RSAC и альбом Я всё ещё по тебе скучаю
+        mock_save.assert_called_once()
+        save_kwargs = mock_save.call_args[1]
+        assert save_kwargs["artist"] == "RSAC"
+        assert save_kwargs["title"] == "Я всё ещё по тебе скучаю"
+        assert save_kwargs["album"] == "Я всё ещё по тебе скучаю"
+        assert save_kwargs["duration"] == 185
+
+
+def test_downloader_album_precedence_canonical_over_source(tmp_path):
+    """
+    Проверяет строгий приоритет для альбома:
+    1. canonical album = A (переданный через custom_album) побеждает source album = B из info/файла.
+    2. При отсутствии custom_album (None), в TALB сохраняется source album = B.
+    """
+    # Сценарий 1: custom_album='Canonical Album A', source album='Source Album B'
+    mock_info = {
+        "title": "Track Title",
+        "artist": "Artist Name",
+        "album": "Source Album B",
+        "duration": 180,
+    }
+
+    dir1 = tmp_path / "run1"
+    dir1.mkdir(parents=True, exist_ok=True)
+    mock_ydl1 = _make_mock_ydl(dir1, mock_info)
+    with patch("yt_dlp.YoutubeDL", return_value=mock_ydl1):
+        downloaded = _sync_download(
+            query_or_url="https://www.youtube.com/watch?v=albumprec123",
+            output_dir=dir1,
+            custom_title="Track Title",
+            custom_artist="Artist Name",
+            custom_album="Canonical Album A",
+            skip_thumbnail=True,
+        )
+
+        assert downloaded.album == "Canonical Album A"
+        id3 = ID3(downloaded.file_path)
+        assert str(id3.get("TALB")) == "Canonical Album A"
+        assert str(id3.get("TALB")) != "Source Album B"
+
+    # Сценарий 2: custom_album=None (normal mode fallback), source album='Source Album B'
+    dir2 = tmp_path / "run2"
+    dir2.mkdir(parents=True, exist_ok=True)
+    mock_ydl2 = _make_mock_ydl(dir2, mock_info)
+    with patch("yt_dlp.YoutubeDL", return_value=mock_ydl2):
+        downloaded_fallback = _sync_download(
+            query_or_url="https://www.youtube.com/watch?v=albumprec123",
+            output_dir=dir2,
+            custom_title="Track Title",
+            custom_artist="Artist Name",
+            custom_album=None,
+            skip_thumbnail=True,
+        )
+
+        assert downloaded_fallback.album == "Source Album B"
+        id3_fb = ID3(downloaded_fallback.file_path)
+        assert str(id3_fb.get("TALB")) == "Source Album B"

@@ -59,7 +59,14 @@ if CUSTOM_API_SERVER:
 
 # ID администратора для просмотра статистики и управления
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6874119454"))
-STORAGE_CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID")
+_raw_storage = os.getenv("STORAGE_CHANNEL_ID", "").strip().strip("'\"")
+if _raw_storage:
+    try:
+        STORAGE_CHANNEL_ID = int(_raw_storage)
+    except ValueError:
+        STORAGE_CHANNEL_ID = _raw_storage
+else:
+    STORAGE_CHANNEL_ID = None
 DB_PATH = BASE_DIR / "bot_database.db"
 
 # Настройки cookies для YouTube (обход блокировок хостинга)

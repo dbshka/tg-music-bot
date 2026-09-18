@@ -7,7 +7,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yt_dlp
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -133,62 +133,138 @@ def extract_artist_title_from_query(query: str) -> Tuple[Optional[str], Optional
     return None, None
 
 
-def _parse_candidate_title_artist(
-    raw_title: str,
-    uploader: Optional[str],
-    query_artist: Optional[str] = None,
-    query_title: Optional[str] = None
-) -> Tuple[str, str]:
-    """
-    Разделяет строку на исполнителя и название трека с удалением брендинга.
-    YouTube uploader (например, 'Release', '... - Topic', лейблы) НИКОГДА
-    не подменяет реального исполнителя из запроса или названия трека.
-    """
+def _clean_candidate_title(raw_title: str) -> str:
+    """Очищает заголовок трека от лишних видео-приписок клипов (Official Video, Lyric Video и т.д.)."""
+    if not raw_title:
+        return ""
     cleaned = clean_unicode_text(raw_title).strip()
-    # Удаляем распространенные суффиксы клипов/аудио
     cleaned = re.sub(
         r'\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Official\s*Audio|Lyric\s*Video|Video|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
         '',
         cleaned,
         flags=re.IGNORECASE
     ).strip()
+    cleaned = _clean_audio_branding(cleaned) or cleaned
+    return cleaned.strip()
+
+
+def resolve_canonical_candidate_metadata(
+    candidate: Any,
+    query_artist: Optional[str] = None,
+    query_title: Optional[str] = None
+) -> Tuple[str, str, Optional[str], int, Optional[str]]:
+    """
+    Определяет канонические метаданные трека строго по приоритету:
+    1. YouTube Music metadata выбранного кандидата (candidate.artist, candidate.title, candidate.album).
+    2. Обычные YouTube metadata кандидата (разделитель Artist - Title, uploader/channel без - Topic).
+    3. Оригинальные метаданные аудиофайла (обрабатываются downloader-ом).
+    4. Распарсенные artist/title из запроса — ТОЛЬКО как fallback, если у кандидата метаданные
+       действительно отсутствуют или generic (например, 'Release').
+
+    Возвращает: (canonical_artist, canonical_title, canonical_album, duration, thumbnail_url)
+    """
+    def _safe_str(val: Any) -> Optional[str]:
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return None
+
+    raw_title = _safe_str(getattr(candidate, "title", None) if not isinstance(candidate, dict) else candidate.get("title")) or ""
+    raw_artist = _safe_str(getattr(candidate, "artist", None) if not isinstance(candidate, dict) else candidate.get("artist"))
+    raw_uploader = _safe_str(getattr(candidate, "uploader", None) if not isinstance(candidate, dict) else candidate.get("uploader"))
+    raw_channel = _safe_str(getattr(candidate, "channel", None) if not isinstance(candidate, dict) else candidate.get("channel"))
+    album = _safe_str(getattr(candidate, "album", None) if not isinstance(candidate, dict) else candidate.get("album"))
+
+    dur_raw = getattr(candidate, "duration", None) if not isinstance(candidate, dict) else candidate.get("duration")
+    try:
+        duration = int(dur_raw or 0)
+    except (TypeError, ValueError):
+        duration = 0
+
+    thumb = _safe_str(getattr(candidate, "thumbnail", None) if not isinstance(candidate, dict) else candidate.get("thumbnail"))
 
     artist = None
     title = None
 
-    # 1. Если в самом названии видео есть разделитель "Исполнитель - Название"
-    for sep in [" - ", " — ", " – ", " -- "]:
-        if sep in cleaned:
-            parts = cleaned.split(sep, 1)
-            cand_art = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
-            cand_tit = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
-            if cand_art and not is_generic_artist_name(cand_art):
-                artist = cand_art
-                title = cand_tit
-                break
+    # ПРИОРИТЕТ 1: YouTube Music metadata (кандидат имеет структурированного исполнителя)
+    if raw_artist and not is_generic_artist_name(raw_artist):
+        cleaned_art = _clean_audio_branding(raw_artist)
+        if cleaned_art and not is_generic_artist_name(cleaned_art):
+            artist = cleaned_art.strip()
+            if raw_title:
+                cleaned_title = _clean_candidate_title(raw_title)
+                if cleaned_title:
+                    title = cleaned_title
 
-    # 2. Если в названии видео нет разделителя (или исполнитель generic),
-    # используем исполнителя из запроса пользователя
-    if (not artist or is_generic_artist_name(artist)) and query_artist and not is_generic_artist_name(query_artist):
-        artist = _clean_audio_branding(query_artist) or query_artist
-        if not title:
-            title = _clean_audio_branding(cleaned) or query_title or cleaned
-
-    # 3. Если исполнитель всё ещё не определен, проверяем uploader (только если не generic!)
+    # ПРИОРИТЕТ 2: Обычные YouTube metadata кандидата
     if not artist or is_generic_artist_name(artist):
-        raw_uploader = (uploader or "").replace(" - Topic", "").replace("- Topic", "").replace(" – Topic", "").strip()
-        cleaned_up = _clean_audio_branding(raw_uploader) if raw_uploader else ""
-        if cleaned_up and not is_generic_artist_name(cleaned_up):
-            artist = cleaned_up
+        cleaned_raw_title = _clean_candidate_title(raw_title)
+        # 2a. Разделитель в названии "Исполнитель - Название"
+        for sep in [" - ", " — ", " – ", " -- "]:
+            if sep in cleaned_raw_title:
+                parts = cleaned_raw_title.split(sep, 1)
+                cand_art = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
+                cand_tit = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
+                if cand_art and not is_generic_artist_name(cand_art):
+                    artist = cand_art
+                    title = cand_tit
+                    break
 
-    # 4. Финальный fallback: гарантируем, что 'Release' или generic имя не вернется
+        # 2b. uploader / channel без "- Topic"
+        if not artist or is_generic_artist_name(artist):
+            raw_up = (raw_uploader or raw_channel or "").replace(" - Topic", "").replace("- Topic", "").replace(" – Topic", "").strip()
+            cleaned_up = _clean_audio_branding(raw_up) if raw_up else ""
+            if cleaned_up and not is_generic_artist_name(cleaned_up):
+                artist = cleaned_up
+
+    # Если title еще не определен, но есть raw_title
+    if not title and raw_title:
+        cand_tit_clean = _clean_candidate_title(raw_title)
+        if cand_tit_clean:
+            title = cand_tit_clean
+
+    # ПРИОРИТЕТ 4: Fallback на распарсенный запрос (ТОЛЬКО если у кандидата нет валидных метаданных)
     if not artist or is_generic_artist_name(artist):
-        artist = query_artist if (query_artist and not is_generic_artist_name(query_artist)) else "Unknown Artist"
+        if query_artist and not is_generic_artist_name(query_artist):
+            artist = _clean_audio_branding(query_artist) or query_artist.strip()
+        else:
+            artist = "Unknown Artist"
 
     if not title:
-        title = _clean_audio_branding(cleaned) or query_title or cleaned or "Unknown Track"
+        if query_title and query_title.strip():
+            title = _clean_audio_branding(query_title) or query_title.strip()
+        else:
+            title = "Unknown Track"
 
-    return artist, title
+    # Имя альбома никогда не берется из поискового запроса
+    # Длительность никогда не берется из поискового запроса
+
+    return artist, title, album, duration, thumb
+
+
+def _parse_candidate_title_artist(
+    raw_title: str,
+    uploader: Optional[str],
+    query_artist: Optional[str] = None,
+    query_title: Optional[str] = None,
+    candidate_artist: Optional[str] = None
+) -> Tuple[str, str]:
+    """
+    Разделяет строку на исполнителя и название трека с удалением брендинга.
+    Сохраняет обратную совместимость для существующих тестов,
+    делегируя определение канонических метаданных функции resolve_canonical_candidate_metadata.
+    """
+    dummy_item = SearchItem(
+        index=0,
+        title=raw_title,
+        uploader=uploader,
+        artist=candidate_artist
+    )
+    art, tit, _, _, _ = resolve_canonical_candidate_metadata(
+        dummy_item,
+        query_artist=query_artist,
+        query_title=query_title
+    )
+    return art, tit
 
 
 # ============================================================================
@@ -651,23 +727,17 @@ def search_inline_tracks_sync(query: str, limit: int = 5) -> Tuple[List[SearchIt
             continue
         seen_sigs.add(sig)
 
-        # 6. Защита Authoritative Metadata: Release не становится исполнителем
-        if it.artist and not is_generic_artist_name(it.artist):
-            art = it.artist
-            tit = it.title or "Unknown Track"
-        else:
-            art, tit = _parse_candidate_title_artist(
-                it.title,
-                it.uploader or it.channel,
-                query_artist=q_artist,
-                query_title=q_title
-            )
-        tit = tit or it.title or "Unknown Track"
-        if not art or is_generic_artist_name(art):
-            art = q_artist if (q_artist and not is_generic_artist_name(q_artist)) else "Unknown Artist"
+        # 6. Защита Authoritative Metadata: определение канонических метаданных
+        art, tit, alb, dur, th = resolve_canonical_candidate_metadata(
+            it,
+            query_artist=q_artist,
+            query_title=q_title
+        )
 
         it.clean_artist = art
         it.clean_title = tit
+        if alb and not it.album:
+            it.album = alb
         if canonical_thumb and (not it.thumbnail or "ytimg.com" in it.thumbnail):
             it.thumbnail = canonical_thumb
 

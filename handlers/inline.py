@@ -3,6 +3,7 @@ import hashlib
 import html
 import logging
 import re
+import traceback
 import uuid
 from typing import Dict, Optional, Any, List
 
@@ -32,6 +33,7 @@ from services.search import (
     search_tracks_async,
     extract_artist_title_from_query,
     _parse_candidate_title_artist,
+    resolve_canonical_candidate_metadata,
 )
 from services.downloader import download_track, _clean_audio_branding, is_generic_artist_name
 from services.extractor import (
@@ -51,6 +53,22 @@ router = Router(name="inline")
 _in_flight_downloads: Dict[str, asyncio.Future] = {}
 _in_flight_lock = asyncio.Lock()
 _active_tasks: set = set()
+
+
+def get_effective_storage_channel_id() -> Optional[Any]:
+    """
+    Возвращает очищенный и валидный chat_id канала-хранилища Telegram.
+    Поддерживает целочисленные ID каналов (-100...), строки и юзернеймы (@channel).
+    """
+    if not STORAGE_CHANNEL_ID:
+        return None
+    raw = str(STORAGE_CHANNEL_ID).strip().strip("'\"")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
 
 
 def is_valid_telegram_file_id(file_id: Optional[str]) -> bool:
@@ -244,16 +262,12 @@ async def handle_inline_query(inline_query: InlineQuery):
             for item in search_items:
                 if len(results) >= 5:
                     break
-                artist, title = _parse_candidate_title_artist(
-                    item.title,
-                    item.uploader,
+                artist, title, album, duration, thumb_url = resolve_canonical_candidate_metadata(
+                    item,
                     query_artist=q_artist,
                     query_title=q_title
                 )
-                title = title or item.title or "Unknown Track"
-                if not artist or is_generic_artist_name(artist):
-                    artist = q_artist if (q_artist and not is_generic_artist_name(q_artist)) else "Unknown Artist"
-                dur_str = item.formatted_duration or ""
+                dur_str = item.formatted_duration or (f"{duration // 60}:{duration % 60:02d}" if duration > 0 else "")
 
                 # Пропускаем, если такой трек уже добавлен из кэша
                 sig = f"{artist} - {title}".lower()
@@ -262,16 +276,16 @@ async def handle_inline_query(inline_query: InlineQuery):
                 seen_keys.add(sig)
 
                 cand_id = uuid.uuid4().hex[:10]
-                thumb_url = _extract_https_thumbnail(item.url, item.thumbnail)
+                resolved_thumb_url = _extract_https_thumbnail(item.url, thumb_url or item.thumbnail)
 
                 save_inline_candidate(
                     cand_id=cand_id,
                     target=item.url,
                     title=title,
                     artist=artist,
-                    album=item.album,
-                    duration=item.duration,
-                    thumbnail_url=thumb_url
+                    album=album,
+                    duration=duration,
+                    thumbnail_url=resolved_thumb_url
                 )
 
                 desc = f"{artist} • {dur_str}" if dur_str else artist
@@ -280,7 +294,7 @@ async def handle_inline_query(inline_query: InlineQuery):
                     id=f"art_{cand_id}",
                     title=title,
                     description=desc,
-                    thumbnail_url=thumb_url,
+                    thumbnail_url=resolved_thumb_url,
                     input_message_content=InputTextMessageContent(
                         message_text=(
                             f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
@@ -458,6 +472,7 @@ async def process_inline_download(
     # Первый поток выполняет загрузку
     downloaded = None
     file_id = None
+    effective_storage_id = get_effective_storage_channel_id()
     try:
         # 3. Проверка кэша базы данных: возможно, файл уже загружен
         cached = await get_cached_track_async(target)
@@ -467,11 +482,19 @@ async def process_inline_download(
         cached_file_id = cached.get("file_id") if cached else None
         if is_valid_telegram_file_id(cached_file_id):
             file_id = cached_file_id
+            logger.info("INLINE CACHE HIT: cand_id=%s, file_id=%s", cand_id, file_id)
 
         # 4. Если в кэше нет — скачиваем через существующий download_track()
         if not file_id:
-            logger.info("INLINE DOWNLOAD START\nresult_id=art_%s", cand_id)
-            print(f"INLINE DOWNLOAD START\nresult_id=art_{cand_id}", flush=True)
+            logger.info(
+                "INLINE DOWNLOAD EXECUTE:\n"
+                "  query=%s\n"
+                "  cand_id=%s\n"
+                "  source_url=%s\n"
+                "  expected_duration=%s\n"
+                "  storage_channel_id=%s",
+                query or f"{artist} - {title}", cand_id, candidate["target"], candidate.get("duration"), effective_storage_id
+            )
 
             # Приоритет обложек: Authoritative/Studio cover > Canonical cover (Deezer/iTunes) > YouTube fallback
             thumb_to_use = candidate.get("thumbnail_url")
@@ -487,27 +510,51 @@ async def process_inline_download(
                     logger.debug("Inline canonical art lookup skipped or timed out: %s", ex)
 
             req_id = f"inl_{uuid.uuid4().hex[:6]}"
+            custom_art = artist if (artist and not is_generic_artist_name(artist)) else None
+            custom_tit = title if (title and title.lower() != "unknown track") else None
             downloaded = await download_track(
                 query_or_url=candidate["target"],
-                custom_title=title,
-                custom_artist=artist,
+                custom_title=custom_tit,
+                custom_artist=custom_art,
                 thumbnail_url=thumb_to_use,
                 expected_duration=candidate.get("duration"),
                 request_id=req_id,
                 custom_album=candidate.get("album")
             )
 
+            logger.info(
+                "INLINE DOWNLOAD SUCCESS:\n"
+                "  cand_id=%s\n"
+                "  downloader_path=%s\n"
+                "  downloaded_duration=%s\n"
+                "  filesize=%s",
+                cand_id, downloaded.file_path, downloaded.duration, downloaded.filesize
+            )
+
             # ВАЖНО: Загрузка ТОЛЬКО в канал хранилища STORAGE_CHANNEL_ID!
             # Запрещено отправлять в ЛС пользователю или администратору!
-            if not STORAGE_CHANNEL_ID:
-                logger.error("STORAGE_CHANNEL_ID не настроен. Inline Mode требует STORAGE_CHANNEL_ID.")
+            if not effective_storage_id:
+                logger.error(
+                    "Inline storage channel is not configured: STORAGE_CHANNEL_ID environment variable is missing or empty. "
+                    "(cand_id=%s, target=%s, raw_STORAGE_CHANNEL_ID=%r)",
+                    cand_id, target, STORAGE_CHANNEL_ID
+                )
                 raise RuntimeError("STORAGE_CHANNEL_ID не настроен")
 
             thumb_file = FSInputFile(downloaded.thumbnail_path) if downloaded.thumbnail_path and downloaded.thumbnail_path.exists() else None
             audio_file = FSInputFile(downloaded.file_path)
 
+            logger.info(
+                "INLINE TELEGRAM UPLOAD ATTEMPT:\n"
+                "  cand_id=%s\n"
+                "  storage_channel_id=%s\n"
+                "  audio_file=%s\n"
+                "  has_thumb=%s",
+                cand_id, effective_storage_id, downloaded.file_path, bool(thumb_file)
+            )
+
             uploaded_msg = await bot.send_audio(
-                chat_id=STORAGE_CHANNEL_ID,
+                chat_id=effective_storage_id,
                 audio=audio_file,
                 title=downloaded.title,
                 performer=downloaded.artist,
@@ -520,6 +567,14 @@ async def process_inline_download(
                 raise RuntimeError("Не удалось получить audio object после загрузки в Telegram")
 
             file_id = uploaded_msg.audio.file_id
+
+            logger.info(
+                "INLINE TELEGRAM UPLOAD COMPLETE:\n"
+                "  cand_id=%s\n"
+                "  storage_channel_id=%s\n"
+                "  telegram_file_id=%s",
+                cand_id, effective_storage_id, file_id
+            )
 
             # 6. Сохраняем в кэш базы данных
             await save_cached_track_async(
@@ -537,14 +592,18 @@ async def process_inline_download(
                 duration=downloaded.duration
             )
 
-            logger.info("INLINE DOWNLOAD COMPLETE\nresult_id=art_%s\ntelegram_file_id_saved=true", cand_id)
-            print(f"INLINE DOWNLOAD COMPLETE\nresult_id=art_{cand_id}\ntelegram_file_id_saved=true", flush=True)
-
         if not fut.done():
             fut.set_result(file_id)
 
         # 7. Заменяем inline-сообщение в чате на аудиоплеер через edit_message_media
         if inline_message_id and file_id:
+            logger.info(
+                "INLINE EDIT MESSAGE MEDIA ATTEMPT:\n"
+                "  cand_id=%s\n"
+                "  inline_message_id=%s\n"
+                "  file_id=%s",
+                cand_id, inline_message_id, file_id
+            )
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
                 media=InputMediaAudio(
@@ -554,13 +613,34 @@ async def process_inline_download(
                     duration=downloaded.duration if downloaded else (candidate.get("duration") or 0)
                 )
             )
-            logger.info("INLINE MESSAGE EDITED\nresult_id=art_%s\nsuccess=true", cand_id)
-            print(f"INLINE MESSAGE EDITED\nresult_id=art_{cand_id}\nsuccess=true", flush=True)
+            logger.info("INLINE MESSAGE EDITED SUCCESS: cand_id=%s, inline_message_id=%s", cand_id, inline_message_id)
 
         return file_id
 
     except Exception as err:
-        logger.error("Ошибка при обработке inline download: %s", err)
+        logger.exception(
+            "INLINE DOWNLOAD PIPELINE EXCEPTION:\n"
+            "  query=%s\n"
+            "  cand_id=%s\n"
+            "  source_url=%s\n"
+            "  expected_duration=%s\n"
+            "  downloader_path=%s\n"
+            "  storage_channel_id=%s\n"
+            "  telegram_upload_success=%s\n"
+            "  file_id=%s\n"
+            "  exception_type=%s\n"
+            "  exception_message=%s",
+            query or f"{artist} - {title}",
+            cand_id,
+            target,
+            candidate.get("duration"),
+            str(downloaded.file_path) if downloaded else "None",
+            effective_storage_id,
+            bool(file_id),
+            file_id,
+            type(err).__name__,
+            str(err)
+        )
         if not fut.done():
             fut.set_exception(err)
         if inline_message_id:
@@ -577,8 +657,8 @@ async def process_inline_download(
                     text=err_text,
                     parse_mode="HTML"
                 )
-            except Exception:
-                pass
+            except Exception as edit_err:
+                logger.warning("Failed to edit inline message with error text: %s", edit_err)
         return None
 
     finally:
