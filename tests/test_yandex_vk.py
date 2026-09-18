@@ -282,7 +282,7 @@ async def test_resolve_yandex_music_rejects_unavailable_without_metadata():
 @pytest.mark.asyncio
 async def test_resolve_vk_music_requires_token():
     with patch.object(config, "VK_TOKEN", None):
-        with pytest.raises(ValueError, match="требует указания VK_TOKEN"):
+        with pytest.raises(ValueError, match="VK_TOKEN"):
             await resolve_vk_music_track("https://vk.com/audio-2001429780_128429780")
 
 
@@ -654,3 +654,147 @@ def test_youtube_downloader_receives_candidate_and_applies_source_metadata(tmp_p
     assert last_applied["title"] == "Blinding Lights"
     assert last_applied["artist"] == "The Weeknd"
     assert last_applied["album"] == "After Hours"
+
+
+@pytest.mark.asyncio
+async def test_yandex_draxxxy_clubb_regression(tmp_path):
+    """
+    Regression test for Yandex Music track Draxxxy — Clubb (154538326):
+    1. Resolves metadata (artist, title, album, duration 134s)
+    2. Generates search target ytsearch5:Draxxxy - Clubb
+    3. Candidate scoring penalizes unrelated tracks (e.g. 'Club Bizarre' by 'U 96')
+    4. Legitimate candidate with matching artist/title/duration is selected
+    5. When YouTube returns 0 candidates, raises ValueError safely.
+    """
+    from services.downloader import compute_candidate_penalty, _sync_download
+
+    fake_meta = {
+        "result": [
+            {
+                "id": 154538326,
+                "title": "Clubb",
+                "available": True,
+                "artists": [{"name": "Draxxxy"}],
+                "albums": [{"title": "Clubb"}],
+                "durationMs": 134200,
+                "ogImage": "avatars.yandex.net/get-music-content/17659805/1658ab98.a.43437214-2/%%"
+            }
+        ]
+    }
+
+    def fake_sync_http(url, headers=None, proxy=None, timeout=8.0):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = fake_meta
+        return mock_resp
+
+    with patch("services.yandex_vk._sync_http_request", side_effect=fake_sync_http):
+        res = await resolve_yandex_music_track("https://music.yandex.ru/album/43437214/track/154538326")
+        assert res["platform"] == "Yandex Music"
+        assert res["title"] == "Clubb"
+        assert res["artist"] == "Draxxxy"
+        assert res["album"] == "Clubb"
+        assert res["duration"] == 134
+        assert res["target"] == "ytsearch5:Draxxxy - Clubb"
+
+    # Verify candidate penalty on unrelated tracks
+    unrelated_cand = {
+        "title": "U 96 - Club Bizarre",
+        "uploader": "U 96",
+        "duration": 301,
+        "id": "u96_vid"
+    }
+    pen_unrelated = compute_candidate_penalty(
+        candidate=unrelated_cand,
+        custom_artist="Draxxxy",
+        custom_title="Clubb",
+        expected_duration=134,
+        is_apple_music=True
+    )
+    assert pen_unrelated > 4000.0, "Unrelated track must be penalized heavily"
+
+    # Verify candidate penalty on matching authentic candidate
+    legit_cand = {
+        "title": "Draxxxy - Clubb (Official Audio)",
+        "uploader": "Draxxxy - Topic",
+        "duration": 134,
+        "id": "draxxxy_vid"
+    }
+    pen_legit = compute_candidate_penalty(
+        candidate=legit_cand,
+        custom_artist="Draxxxy",
+        custom_title="Clubb",
+        expected_duration=134,
+        is_apple_music=True
+    )
+    assert pen_legit < 0.0, "Legitimate candidate must have low penalty"
+
+    # Verify safe failure when YouTube returns 0 candidates
+    class EmptyYDL:
+        def __init__(self, opts=None):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            return {"entries": []}
+
+    with patch("yt_dlp.YoutubeDL", side_effect=EmptyYDL):
+        with pytest.raises(ValueError, match="Трек не найден"):
+            _sync_download(
+                query_or_url="ytsearch5:Draxxxy - Clubb",
+                output_dir=tmp_path,
+                custom_title="Clubb",
+                custom_artist="Draxxxy",
+                expected_duration=134,
+                is_apple_music=True
+            )
+
+
+@pytest.mark.asyncio
+async def test_vk_music_ru_domain_and_token_regression():
+    """
+    Regression test for VK URL https://vk.ru/audio-2001878815_33878815:
+    1. extract_vk_audio_id parses owner_id and audio_id from vk.ru domain
+    2. Without VK_TOKEN, raises ValueError explaining metadata token requirement
+    3. With VK_TOKEN, calls VK API, resolves artist/title/duration, sets ytsearch5 target
+    4. Any malicious 'url' in VK API response is strictly ignored
+    """
+    url = "https://vk.ru/audio-2001878815_33878815"
+    assert extract_vk_audio_id(url) == ("-2001878815", "33878815")
+
+    # 1. No token -> clear error message about metadata requirement
+    with patch.object(config, "VK_TOKEN", None):
+        with pytest.raises(ValueError, match="требуется указание VK_TOKEN"):
+            await resolve_vk_music_track(url)
+
+    # 2. With token -> metadata resolved, routes to ytsearch5, ignores VK url
+    fake_vk_resp = {
+        "response": [
+            {
+                "id": 33878815,
+                "owner_id": -2001878815,
+                "artist": "Specific Artist",
+                "title": "Specific Track",
+                "duration": 180,
+                "url": "http://169.254.169.254/latest/meta-data/"
+            }
+        ]
+    }
+
+    def fake_sync_http(url, headers=None, proxy=None, timeout=8.0):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = fake_vk_resp
+        return mock_resp
+
+    with patch.object(config, "VK_TOKEN", "mock_token"), \
+         patch("services.yandex_vk._sync_http_request", side_effect=fake_sync_http):
+        res = await resolve_vk_music_track(url)
+        assert res["platform"] == "VK Music"
+        assert res["title"] == "Specific Track"
+        assert res["artist"] == "Specific Artist"
+        assert res["duration"] == 180
+        assert res["target"] == "ytsearch5:Specific Artist - Specific Track"
+        assert res["is_search"] is True
+        assert "url" not in res
+        assert "169.254" not in res["target"]

@@ -733,7 +733,10 @@ def _sync_download(
                 executor.shutdown(wait=False, cancel_futures=True)
 
             # Если параллельный опрос не вернул ни одного YouTube-кандидата,
-            # выполняем чистый fallback-запрос к YouTube без cookies
+            # выполняем чистый последовательный fallback-запрос к YouTube без cookies:
+            # 1. "{artist} - {title}"
+            # 2. "{title} {artist}"
+            # 3. "{artist} {title}"
             has_youtube = any(e.get("_source") == "youtube" for e in entries)
             if not has_youtube:
                 try:
@@ -750,13 +753,25 @@ def _sync_download(
                     fb_opts["socket_timeout"] = 7
                     fb_opts["retries"] = 1
                     with yt_dlp.YoutubeDL(fb_opts) as ydl_yt_fb:
-                        info_yt = ydl_yt_fb.extract_info(f"ytsearch5:{clean_q_simple}", download=False)
-                        fb_items = [e for e in (info_yt.get("entries") or []) if e]
-                        for fe in fb_items:
-                            fe["_source"] = "youtube"
-                        entries.extend(fb_items)
-                        if fb_items:
-                            print(f"{req_tag}[SEARCH] YouTube standalone fallback вернул {len(fb_items)} кандидатов.", flush=True)
+                        fb_queries = []
+                        if clean_search:
+                            fb_queries.append(clean_search)
+                        if clean_title_str and clean_artist_str:
+                            inv_fb = f"{clean_title_str} {clean_artist_str}".strip()
+                            if inv_fb not in fb_queries:
+                                fb_queries.append(inv_fb)
+                        if clean_q_simple and clean_q_simple not in fb_queries:
+                            fb_queries.append(clean_q_simple)
+
+                        for fb_q in fb_queries:
+                            info_yt = ydl_yt_fb.extract_info(f"ytsearch5:{fb_q}", download=False)
+                            fb_items = [e for e in (info_yt.get("entries") or []) if e]
+                            if fb_items:
+                                for fe in fb_items:
+                                    fe["_source"] = "youtube"
+                                entries.extend(fb_items)
+                                print(f"{req_tag}[SEARCH] YouTube standalone fallback '{fb_q}' вернул {len(fb_items)} кандидатов.", flush=True)
+                                break
                 except Exception as fb_err:
                     print(f"{req_tag}[SEARCH] YouTube standalone fallback search failed: {fb_err}", flush=True)
 
