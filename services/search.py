@@ -2,17 +2,38 @@ import asyncio
 import concurrent.futures
 import html
 import logging
+import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
 import yt_dlp
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from yt_dlp.extractor.common import SearchInfoExtractor
+from yt_dlp.extractor.youtube import YoutubeTabBaseInfoExtractor
+from yt_dlp.globals import extractors as _extractors_context
 
 from config import get_cookies_info
-from services.extractor import extract_core_title_words, compute_title_match_ratio
+from services.downloader import (
+    _clean_audio_branding,
+    get_current_youtube_proxy,
+    get_sanitized_proxy_info,
+    is_generic_artist_name,
+)
+from services.extractor import (
+    compute_title_match_ratio,
+    extract_core_title_words,
+    extract_track_modifiers,
+    resolve_canonical_track_info_async,
+)
+from services.identity import (
+    clean_unicode_text,
+    extract_modifiers,
+    is_candidate_matching_modifiers,
+    validate_artist_match,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +59,19 @@ def convert_keyboard_layout(text: str) -> str:
 class SearchItem:
     index: int
     title: str
-    uploader: Optional[str]
-    duration: int
-    url: str
-    source: str
+    uploader: Optional[str] = None
+    duration: int = 0
+    url: str = ""
+    source: str = ""
     thumbnail: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    channel: Optional[str] = None
+    score: float = 0.0
+    modifiers: Optional[Set[str]] = None
+    clean_artist: Optional[str] = None
+    clean_title: Optional[str] = None
+    is_live: bool = False
 
     @property
     def formatted_duration(self) -> str:
@@ -85,73 +114,409 @@ class SearchCache:
 search_cache = SearchCache()
 
 
-def _score_search_item(item: SearchItem, query: str) -> float:
-    """
-    Вычисляет оценку оригинальности и соответствия трека.
-    Официальный студийный оригинал всегда получает наивысший балл и выходит на 1 место.
-    """
-    score = 0.0
-    title_lower = item.title.lower()
-    uploader_lower = (item.uploader or "").lower()
-    q_lower = query.lower()
+# ============================================================================
+# 1. PARSING & AUTHORITATIVE METADATA HELPERS
+# ============================================================================
 
-    # 1. Бонус официального Topic-канала (на YouTube все оригинальные студийные треки выходят на Topic)
+def extract_artist_title_from_query(query: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Извлекает (artist, title) из поискового запроса пользователя вида 'Исполнитель — Название'.
+    Поддерживает варианты разделителей: ' -- ', '--', ' — ', '—', ' – ', '–', ' - '.
+    """
+    if not query:
+        return None, None
+    clean_q = clean_unicode_text(query).strip()
+    for pattern in [r'\s*(?:--|—|–)\s*', r'\s+-\s+']:
+        parts = re.split(pattern, clean_q, maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return parts[0].strip(), parts[1].strip()
+    return None, None
+
+
+def _parse_candidate_title_artist(
+    raw_title: str,
+    uploader: Optional[str],
+    query_artist: Optional[str] = None,
+    query_title: Optional[str] = None
+) -> Tuple[str, str]:
+    """
+    Разделяет строку на исполнителя и название трека с удалением брендинга.
+    YouTube uploader (например, 'Release', '... - Topic', лейблы) НИКОГДА
+    не подменяет реального исполнителя из запроса или названия трека.
+    """
+    cleaned = clean_unicode_text(raw_title).strip()
+    # Удаляем распространенные суффиксы клипов/аудио
+    cleaned = re.sub(
+        r'\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Official\s*Audio|Lyric\s*Video|Video|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
+        '',
+        cleaned,
+        flags=re.IGNORECASE
+    ).strip()
+
+    artist = None
+    title = None
+
+    # 1. Если в самом названии видео есть разделитель "Исполнитель - Название"
+    for sep in [" - ", " — ", " – ", " -- "]:
+        if sep in cleaned:
+            parts = cleaned.split(sep, 1)
+            cand_art = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
+            cand_tit = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
+            if cand_art and not is_generic_artist_name(cand_art):
+                artist = cand_art
+                title = cand_tit
+                break
+
+    # 2. Если в названии видео нет разделителя (или исполнитель generic),
+    # используем исполнителя из запроса пользователя
+    if (not artist or is_generic_artist_name(artist)) and query_artist and not is_generic_artist_name(query_artist):
+        artist = _clean_audio_branding(query_artist) or query_artist
+        if not title:
+            title = _clean_audio_branding(cleaned) or query_title or cleaned
+
+    # 3. Если исполнитель всё ещё не определен, проверяем uploader (только если не generic!)
+    if not artist or is_generic_artist_name(artist):
+        raw_uploader = (uploader or "").replace(" - Topic", "").replace("- Topic", "").replace(" – Topic", "").strip()
+        cleaned_up = _clean_audio_branding(raw_uploader) if raw_uploader else ""
+        if cleaned_up and not is_generic_artist_name(cleaned_up):
+            artist = cleaned_up
+
+    # 4. Финальный fallback: гарантируем, что 'Release' или generic имя не вернется
+    if not artist or is_generic_artist_name(artist):
+        artist = query_artist if (query_artist and not is_generic_artist_name(query_artist)) else "Unknown Artist"
+
+    if not title:
+        title = _clean_audio_branding(cleaned) or query_title or cleaned or "Unknown Track"
+
+    return artist, title
+
+
+# ============================================================================
+# 2. YOUTUBE MUSIC SEARCH EXTRACTOR (Custom ytmsearch implementation)
+# ============================================================================
+
+class YoutubeMusicSearchIE(YoutubeTabBaseInfoExtractor, SearchInfoExtractor):
+    """
+    Кастомный экстрактор для нативного поиска по YouTube Music (песни / studio releases).
+    Использует клиент web_music и секцию #songs.
+    Парсит внутренние JSON-структуры Innertube (musicResponsiveListItemRenderer).
+    """
+    IE_DESC = 'YouTube Music search (custom extractor)'
+    IE_NAME = 'youtube:music:search'
+    _SEARCH_KEY = 'ytmsearch'
+    _SEARCH_PARAMS = 'EgWKAQIIAWoKEAoQAxAEEAkQBQ=='  # Songs section
+
+    def _search_results(self, query):
+        return super()._search_results(query, self._SEARCH_PARAMS, default_client='web_music')
+
+    def _music_reponsive_list_entry(self, renderer):
+        vid = renderer.get('playlistItemData', {}).get('videoId')
+        cols = renderer.get('flexColumns', [])
+        title = None
+        artist = None
+        duration = None
+        album = None
+        if len(cols) > 0:
+            runs0 = cols[0].get('musicResponsiveListItemFlexColumnRenderer', {}).get('text', {}).get('runs', [])
+            if runs0:
+                title = runs0[0].get('text')
+        if len(cols) > 1:
+            runs1 = cols[1].get('musicResponsiveListItemFlexColumnRenderer', {}).get('text', {}).get('runs', [])
+            texts = [r.get('text') for r in runs1 if r.get('text') and r.get('text').strip() != '•']
+            if texts:
+                artist = texts[0]
+                for t in texts[1:]:
+                    clean_t = t.strip()
+                    if re.match(r'^\d+:\d+$', clean_t):
+                        pts = clean_t.split(':')
+                        try:
+                            duration = int(pts[0]) * 60 + int(pts[1])
+                        except Exception:
+                            pass
+                    elif not album and clean_t not in ('Song', 'Песня', 'Track', 'Single', 'Сингл', 'EP'):
+                        album = clean_t
+        thumbs = renderer.get('thumbnail', {}).get('musicThumbnailRenderer', {}).get('thumbnail', {}).get('thumbnails', [])
+        thumb_url = thumbs[-1].get('url') if thumbs else None
+        if vid:
+            return {
+                '_type': 'url',
+                'url': f'https://www.youtube.com/watch?v={vid}',
+                'id': vid,
+                'title': title,
+                'artist': artist,
+                'uploader': None,   # Семантически на YT Music нет uploader-канала, есть исполнитель (artist)
+                'channel': artist,
+                'duration': duration,
+                'thumbnail': thumb_url,
+                'album': album,
+                '_source': 'ytmusic'
+            }
+        return super()._music_reponsive_list_entry(renderer)
+
+
+def register_ytmsearch_extractor():
+    """Гарантирует регистрацию кастомного экстрактора ytmsearch в yt-dlp."""
+    try:
+        import yt_dlp.extractor
+        yt_dlp.extractor.import_extractors()
+        if 'YoutubeMusicSearchIE' not in _extractors_context.value:
+            _extractors_context.value = {'YoutubeMusicSearchIE': YoutubeMusicSearchIE, **_extractors_context.value}
+    except Exception as e:
+        logger.debug("ytmsearch extractor registration notice: %s", e)
+
+
+register_ytmsearch_extractor()
+
+
+# ============================================================================
+# 3. LIVE / CONCERT / PERFORMANCE DETECTION & SCORING
+# ============================================================================
+
+LIVE_MARKERS = {
+    "live", "лайв", "концерт", "performance", "concert", "festival",
+    "выступление", "live version", "concert version", "live performance",
+    "en vivo", "ao vivo", "dal vivo", "live at", "live in", "live from",
+    "live @", "tiny desk", "colors show", "live lounge"
+}
+
+UNWANTED_DEFAULT_MODIFIERS = {
+    "cover", "кавер", "karaoke", "караоке", "tribute", "parody", "пародия"
+}
+
+VENUE_EVENT_PATTERNS = [
+    re.compile(r'[\(\[\{][^\)\]\}]*(?:sentrum|stadium|festival|venue|arena|crocus|glavclub|стерео\s*плаза|stereo\s*plaza|фестиваль|стадион|выступление|концерт|олимпийский)[^\)\]\}]*[\)\]\}]', re.IGNORECASE),
+    re.compile(r'[\(\[\{][^\)\]\}]*(?:kiev|kyiv|moscow|london|paris|msk|spb|мск|спб|питер|минск)[^\)\]\}]*[\)\]\}]', re.IGNORECASE),
+    re.compile(r'@\s*(?:\d{2}\.\d{2}\.\d{2}|\d{4}|msk|мск|spb|спб|лес)', re.IGNORECASE),
+    re.compile(r'\b(?:live\s+at|live\s+in|concert\s+at|concert\s+in|выступление\s+в)\s+[\w\s]+', re.IGNORECASE),
+    re.compile(r'\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b'),
+    re.compile(r'\b(?:клуб|club)\s+[\w\s]+', re.IGNORECASE)
+]
+
+
+def detect_is_live(text: str) -> bool:
+    """
+    Определяет, является ли кандидат записью живого выступления, концерта или фестиваля.
+    Не штрафует обычные треки, где город является частью названия.
+    """
+    cleaned = text.lower()
+    for m in LIVE_MARKERS:
+        if re.search(r'(?<!\w)' + re.escape(m) + r'(?!\w)', cleaned):
+            return True
+    for pat in VENUE_EVENT_PATTERNS:
+        if pat.search(cleaned):
+            return True
+    return False
+
+
+def _find_studio_reference_duration(
+    candidates: List[SearchItem],
+    q_artist: Optional[str],
+    q_title: Optional[str]
+) -> Optional[int]:
+    """
+    Определяет эталонный хронометраж студийного релиза.
+    Сначала ищет среди официальных треков YouTube Music, затем среди YouTube Topic-релизов.
+    """
+    # 1. Приоритет: официальный трек YouTube Music с совпадением названия
+    for c in candidates:
+        if c.source == "ytmusic" and not c.is_live and c.duration and 45 <= c.duration <= 900:
+            if q_title:
+                core_words = extract_core_title_words(q_title, artist=q_artist)
+                if core_words and compute_title_match_ratio(c.title, core_words) >= 0.8:
+                    cand_art = c.artist or c.uploader or c.channel
+                    if not q_artist or not cand_art or validate_artist_match(q_artist, cand_art):
+                        return c.duration
+            else:
+                return c.duration
+
+    # 2. Поиск среди YouTube Topic-каналов (- Topic)
+    for c in candidates:
+        up = (c.uploader or "").lower()
+        ch = (c.channel or "").lower()
+        if ("- topic" in up or "- topic" in ch) and not c.is_live and c.duration and 45 <= c.duration <= 900:
+            if q_title:
+                core_words = extract_core_title_words(q_title, artist=q_artist)
+                if core_words and compute_title_match_ratio(c.title, core_words) >= 0.8:
+                    cand_art = c.artist or c.uploader or c.channel
+                    if not q_artist or not cand_art or validate_artist_match(q_artist, cand_art):
+                        return c.duration
+
+    return None
+
+
+def _score_inline_candidate(
+    item: SearchItem,
+    query_artist: Optional[str],
+    query_title: Optional[str],
+    requested_modifiers: Set[str],
+    canonical_duration: Optional[int] = None,
+) -> float:
+    """
+    Вычисляет оценку кандидата для Inline Mode:
+    1. Предпочитает: studio, official audio, official music source, Topic, YT Music.
+    2. Понижает/отбрасывает: live, concert, performance, festival, cover, karaoke, если не запрошены.
+    3. Если пользователь явно запросил live/concert/acoustic, поощряет соответствующие версии.
+    4. Строго защищает от подозрительной длительности при известном эталонном хронометраже.
+    """
+    score = 1000.0
+    title_lower = (item.title or "").lower()
+    uploader_lower = (item.uploader or item.channel or "").lower()
+    artist_lower = (item.artist or "").lower()
+    full_text = f"{title_lower} {uploader_lower} {artist_lower}".strip()
+
+    live_keywords = {"live", "лайв", "концерт", "performance", "concert", "festival", "выступление"}
+    is_live_requested = bool(requested_modifiers & live_keywords)
+
+    # 1. Проверка живого выступления (Live / Concert / Performance)
+    is_live_cand = detect_is_live(full_text)
+    item.is_live = is_live_cand
+
+    if is_live_cand and not is_live_requested:
+        # Стандартный запрос: live-версия проигрывает студийному оригиналу
+        score -= 5000.0
+    elif is_live_cand and is_live_requested:
+        # Пользователь явно запросил live: даем бонус
+        score += 600.0
+    elif not is_live_cand and is_live_requested:
+        # Пользователь запросил live, а найден студийный трек: штрафуем
+        score -= 3000.0
+
+    # 2. Нежелательные модификаторы (cover, karaoke, parody)
+    for unw in UNWANTED_DEFAULT_MODIFIERS:
+        if unw in full_text and unw not in requested_modifiers:
+            score -= 4000.0
+
+    # Acoustic проверка:
+    is_acoustic_cand = any(a in full_text for a in ("acoustic", "акустика", "unplugged"))
+    is_acoustic_req = any(a in requested_modifiers for a in ("acoustic", "акустика", "unplugged"))
+    if is_acoustic_cand and not is_acoustic_req:
+        score -= 3500.0
+    elif is_acoustic_cand and is_acoustic_req:
+        score += 600.0
+
+    # 3. Общие модификаторы (remix, slowed, sped up и др.)
+    cand_mods = extract_modifiers(full_text)
+    item.modifiers = cand_mods
+    if requested_modifiers:
+        if is_candidate_matching_modifiers(requested_modifiers, cand_mods):
+            score += 800.0
+        else:
+            score -= 5000.0
+    else:
+        # Если пользователь искал оригинал, а кандидат имеет чужие модификаторы:
+        other_mods = cand_mods - {"live", "performance"}
+        if other_mods:
+            score -= 3500.0
+
+    # 4. Приоритет официальных музыкальных источников
+    if item.source == "ytmusic":
+        score += 400.0
     if " - topic" in uploader_lower or uploader_lower.endswith("topic"):
-        score += 500.0
-
-    # 2. Бонус официального аудио / Vevo
-    if "official audio" in title_lower or "official release" in title_lower:
         score += 300.0
-    if "vevo" in uploader_lower or "official" in uploader_lower:
+    if any(k in title_lower for k in ["official audio", "official release", "original audio", "official music"]):
+        score += 250.0
+    if any(k in uploader_lower for k in ["vevo", "official"]):
         score += 150.0
 
-    # 3. Штраф за неоригинальные модификации (если пользователь явно их не искал)
-    unwanted_modifiers = [
-        "remix", "rmx", "slowed", "super slowed", "sped up", "speed up",
-        "nightcore", "daycore", "reverb", "lyrics", "текст", "караоке", "karaoke",
-        "instrumental", "минус", "минусовка", "reaction", "реакция", "разбор",
-        "cover", "кавер", "live", "лайв", "концерт", "bass boosted", "8d", "16d",
-        "parody", "пародия", "family guy", "meme", "edit"
-    ]
-    user_requested = {m for m in unwanted_modifiers if m in q_lower}
-    for mod in unwanted_modifiers:
-        if mod in title_lower and mod not in user_requested:
-            score -= 400.0
+    # 5. Семантическое соответствие названию
+    if query_title:
+        core_words = extract_core_title_words(query_title, artist=query_artist)
+        if core_words:
+            ratio = compute_title_match_ratio(item.title, core_words)
+            if ratio >= 0.8:
+                score += 300.0
+            elif ratio >= 0.5:
+                score += 100.0
+            else:
+                score -= 4000.0
 
-    # 4. Адекватный хронометраж для песни (2–5 минут)
-    if item.duration:
-        if 120 <= item.duration <= 320:
-            score += 100.0
-        elif item.duration < 60:
-            score -= 300.0  # Слишком короткий отрывок/превью
-        elif item.duration > 600:
-            score -= 500.0  # Слишком длинное видео
+    # 6. Валидация исполнителя
+    if query_artist and not is_generic_artist_name(query_artist):
+        effective_art = item.artist or full_text
+        if validate_artist_match(query_artist, effective_art):
+            score += 150.0
+        else:
+            score -= 3000.0
 
-    # 5. Семантическое соответствие ключевым словам названия
-    core_words = extract_core_title_words(query)
-    if core_words:
-        ratio = compute_title_match_ratio(item.title, core_words)
-        score += ratio * 350.0
+    # 7. Хронометраж и многоуровневая защита от подозрительной длительности
+    if canonical_duration and canonical_duration > 35 and item.duration:
+        diff = abs(item.duration - canonical_duration)
+        is_tempo_req = bool(requested_modifiers & {
+            "sped up", "spedup", "speed up", "speedup", "fast version",
+            "slowed", "slow", "super slowed", "super slow", "ultra slowed", "nightcore"
+        })
 
+        if is_tempo_req:
+            # При запросе изменения темпа длительность может отличаться
+            score += 0.0
+        elif is_live_requested:
+            # При запросе живого выступления допускается умеренно более широкий хронометраж
+            if diff <= 15:
+                score += 100.0
+            elif diff <= 45:
+                score -= diff * 5.0
+            else:
+                score -= 300.0 + (diff * 10.0)
+        else:
+            # Обычный студийный поиск: многоуровневая градуированная защита
+            if diff <= 2:
+                # Точное совпадение хронометража (208, 209 -> PASS)
+                score += 200.0
+            elif diff <= 4:
+                # Небольшая допустимая разница (212 -> PASS / допустимо)
+                score += 100.0
+            elif diff <= 8:
+                # Заметный штраф (215 (diff=7) -> заметный penalty)
+                score -= 350.0 + (diff - 4) * 40.0
+            elif diff <= 15:
+                # Сильный штраф (diff 9..15s)
+                score -= 1000.0 + (diff - 8) * 50.0
+            elif diff <= 30:
+                # Очень сильный штраф (180 (diff=28) -> сильный penalty)
+                score -= 2500.0 + (diff - 15) * 60.0
+            else:
+                # Полный отсев подозрительных записей (125 (diff=83) -> REJECT)
+                score -= 5000.0 + (diff - 30) * 80.0
+    else:
+        if 90 <= item.duration <= 360:
+            score += 50.0
+        elif 0 < item.duration < 45:
+            score -= 2500.0  # Слишком короткое превью
+        elif item.duration > 700:
+            score -= 2000.0  # Слишком длинный микс/подкаст
+
+    item.score = score
     return score
 
 
-def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
-    """Синхронно получает легковесные метаданные кандидатов поиска."""
+# ============================================================================
+# 4. EXTRACTION & SEARCH ENGINE
+# ============================================================================
+
+def _extract_source_items(src: str, query: str, limit: int) -> List[SearchItem]:
+    """Синхронно получает метаданные кандидатов из указанного источника (ytm, yt, sc)."""
     opts = {
         "extract_flat": "in_playlist",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "ignoreerrors": True,
-        "socket_timeout": 5,
+        "socket_timeout": 6,
     }
     cookies_info = get_cookies_info()
-    if src == "yt" and cookies_info.get("active"):
+    if cookies_info.get("active") and src in ("yt", "ytm"):
         opts["cookiefile"] = cookies_info["path"]
         opts["extractor_args"] = {"youtube": {"player_client": ["android", "mweb", "ios"]}}
 
-    raw_items = []
+    if src in ("yt", "ytm"):
+        yt_proxy = get_current_youtube_proxy()
+        if yt_proxy:
+            opts["proxy"] = yt_proxy
+
+    if src == "ytm":
+        register_ytmsearch_extractor()
+
+    items: List[SearchItem] = []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             prefix = f"{src}search{limit}:"
@@ -162,7 +527,7 @@ def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
                 u = e.get("webpage_url") or e.get("url") or e.get("id")
                 if not u:
                     continue
-                if not u.startswith("http") and src == "yt":
+                if not u.startswith("http") and src in ("yt", "ytm"):
                     u = f"https://www.youtube.com/watch?v={u}"
 
                 raw_title = e.get("title") or ""
@@ -174,115 +539,158 @@ def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
                 if dur > 900 and not any(k in q_lower for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
                     continue
 
-                raw_items.append({
-                    "title": title,
-                    "uploader": e.get("uploader"),
-                    "duration": dur,
-                    "url": u,
-                    "source": "youtube" if src == "yt" else "soundcloud",
-                    "thumbnail": e.get("thumbnail")
-                })
+                source_name = "ytmusic" if src == "ytm" else ("youtube" if src == "yt" else "soundcloud")
+                artist_val = e.get("artist")
+                items.append(SearchItem(
+                    index=0,
+                    title=title,
+                    artist=artist_val,
+                    uploader=e.get("uploader"),
+                    channel=e.get("channel"),
+                    duration=dur,
+                    url=u,
+                    source=source_name,
+                    thumbnail=e.get("thumbnail"),
+                    album=e.get("album")
+                ))
     except Exception as ex:
         logger.warning("Ошибка поиска по %s для '%s': %s", src, query, ex)
 
-    return raw_items
+    return items
 
 
-def _search_and_rank(query: str, limit: int = 30) -> List[SearchItem]:
-    """Выполняет поиск по источникам и ранжирует так, чтобы оригинал был всегда первым."""
-    yt_req_limit = 8 if limit <= 5 else 20
-    sc_req_limit = 5 if limit <= 5 else 15
-    timeout = 6.0 if limit <= 5 else 12.0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f_yt = executor.submit(_extract_source_items, "yt", query, yt_req_limit)
-        f_sc = executor.submit(_extract_source_items, "sc", query, sc_req_limit)
-        done, _ = concurrent.futures.wait([f_yt, f_sc], timeout=timeout)
-        try:
-            yt_raw = f_yt.result() if f_yt in done else []
-        except Exception as ex:
-            logger.warning("YT extraction failed for '%s': %s", query, ex)
-            yt_raw = []
-        try:
-            sc_raw = f_sc.result() if f_sc in done else []
-        except Exception as ex:
-            logger.warning("SC extraction failed for '%s': %s", query, ex)
-            sc_raw = []
+def search_inline_tracks_sync(query: str, limit: int = 5) -> Tuple[List[SearchItem], Optional[str]]:
+    """
+    Специализированный поисковый пайплайн для Inline Mode:
+    1. Основной поиск: YouTube Music (ytmsearch) — возвращает официальные студийные треки.
+    2. Вычисление эталонного студийного хронометража.
+    3. Скоринг кандидатов: предпочтение студии, защита от подозрительного хронометража.
+    4. Fallback поиск: обычный YouTube (ytsearch) и SoundCloud (scsearch) вызывается,
+       если YT Music вернул 0 результатов или после скоринга не набралось достаточно подходящих кандидатов.
+    5. Защита Authoritative Metadata: uploader Release никогда не становится исполнителем.
+    """
+    q_norm = clean_unicode_text(query).strip()
+    if not q_norm:
+        return [], None
 
-    seen_signatures = set()
-    combined: List[SearchItem] = []
+    # 1. Извлечение артиста, названия и модификаторов из запроса
+    q_artist, q_title = extract_artist_title_from_query(q_norm)
+    clean_q, req_mods_list = extract_track_modifiers(q_norm)
+    requested_modifiers = set(req_mods_list) if req_mods_list else set()
 
-    def _sig(title: str, dur: int) -> str:
+    canonical_thumb = None
+
+    search_term = f"{q_artist} - {q_title}" if (q_artist and q_title) else clean_q
+    ytm_limit = max(10, limit * 2)
+
+    # 2. ПЕРВИЧНЫЙ ПОИСК: YouTube Music (ytmsearch)
+    ytm_candidates: List[SearchItem] = []
+    has_sub_query = bool(q_title and q_title.lower() != search_term.lower() and len(q_title) >= 3)
+
+    if has_sub_query:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f_main = executor.submit(_extract_source_items, "ytm", search_term, ytm_limit)
+            f_sub = executor.submit(_extract_source_items, "ytm", q_title, 8)
+            done, _ = concurrent.futures.wait([f_main, f_sub], timeout=7.0)
+            res_main = f_main.result() if f_main in done else []
+            res_sub = f_sub.result() if f_sub in done else []
+            ytm_candidates = res_main + res_sub
+    else:
+        ytm_candidates = _extract_source_items("ytm", search_term, ytm_limit)
+
+    # 3. Вычисление эталонного студийного хронометража
+    canonical_duration = _find_studio_reference_duration(ytm_candidates, q_artist, q_title)
+
+    for it in ytm_candidates:
+        _score_inline_candidate(it, q_artist, q_title, requested_modifiers, canonical_duration)
+
+    # Отбираем кандидатов с высоким положительным баллом (показательно подходящие)
+    suitable_ytm = [c for c in ytm_candidates if c.score >= 500.0]
+
+    # 4. FALLBACK ПОИСК: Обычный YouTube (ytsearch) + SoundCloud (scsearch)
+    # Вызывается, если YTM вернул 0 результатов ИЛИ после скоринга не набралось достаточно подходящих кандидатов
+    combined_candidates: List[SearchItem] = list(suitable_ytm)
+    if len(suitable_ytm) < min(limit, 2):
+        yt_fb_limit = max(8, limit * 2)
+        sc_fb_limit = 5
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f_yt = executor.submit(_extract_source_items, "yt", search_term, yt_fb_limit)
+            f_sc = executor.submit(_extract_source_items, "sc", search_term, sc_fb_limit)
+            done, _ = concurrent.futures.wait([f_yt, f_sc], timeout=7.0)
+            fb_yt = f_yt.result() if f_yt in done else []
+            fb_sc = f_sc.result() if f_sc in done else []
+
+        fallback_items = fb_yt + fb_sc
+        if canonical_duration is None:
+            canonical_duration = _find_studio_reference_duration(fallback_items, q_artist, q_title)
+
+        for it in fallback_items:
+            _score_inline_candidate(it, q_artist, q_title, requested_modifiers, canonical_duration)
+            # Принимаем только кандидатов без критических штрафов (исключая подозрительный хронометраж и лайвы)
+            if it.score >= 500.0:
+                combined_candidates.append(it)
+
+    # Если совсем ничего не нашлось, пробуем взять кандидатов с приемлемым скором
+    if not combined_candidates:
+        combined_candidates = [c for c in ytm_candidates if c.score > -2000.0]
+
+    # 5. Дедупликация и сортировка кандидатов
+    seen_sigs = set()
+    ranked: List[SearchItem] = []
+
+    def _sig(title: str, dur: int, url: str) -> str:
         clean = "".join(c for c in title.lower() if c.isalnum())
-        return f"{clean}_{dur // 5}"
+        return f"{clean}_{dur // 4}_{url}"
 
-    for r in yt_raw + sc_raw:
-        sig = _sig(r["title"], r["duration"])
-        if sig not in seen_signatures:
-            seen_signatures.add(sig)
-            combined.append(SearchItem(
-                index=0,
-                title=r["title"],
-                uploader=r["uploader"],
-                duration=r["duration"],
-                url=r["url"],
-                source=r["source"],
-                thumbnail=r["thumbnail"]
-            ))
+    # Сортируем: наибольший скор на 1 месте!
+    sorted_items = sorted(combined_candidates, key=lambda c: c.score, reverse=True)
 
-    # Сортируем: оригинал ВСЕГДА на 1 месте!
-    ranked = sorted(combined, key=lambda it: _score_search_item(it, query), reverse=True)
+    for it in sorted_items:
+        sig = _sig(it.title, it.duration, it.url)
+        if sig in seen_sigs:
+            continue
+        seen_sigs.add(sig)
+
+        # 6. Защита Authoritative Metadata: Release не становится исполнителем
+        if it.artist and not is_generic_artist_name(it.artist):
+            art = it.artist
+            tit = it.title or "Unknown Track"
+        else:
+            art, tit = _parse_candidate_title_artist(
+                it.title,
+                it.uploader or it.channel,
+                query_artist=q_artist,
+                query_title=q_title
+            )
+        tit = tit or it.title or "Unknown Track"
+        if not art or is_generic_artist_name(art):
+            art = q_artist if (q_artist and not is_generic_artist_name(q_artist)) else "Unknown Artist"
+
+        it.clean_artist = art
+        it.clean_title = tit
+        if canonical_thumb and (not it.thumbnail or "ytimg.com" in it.thumbnail):
+            it.thumbnail = canonical_thumb
+
+        ranked.append(it)
+
     for i, it in enumerate(ranked):
         it.index = i + 1
-    return ranked[:limit]
+
+    return ranked[:limit], None
 
 
 def search_tracks_sync(query: str, limit: int = 30) -> Tuple[List[SearchItem], Optional[str]]:
-    """
-    Параллельный опрос YouTube и SoundCloud с дедупликацией.
-    Всегда выводит оригинал первым.
-    В САМУЮ ПОСЛЕДНЮЮ ОЧЕРЕДЬ: при 0 результатов пробует конвертацию раскладки и нечёткий поиск.
-    Возвращает (items, corrected_query_or_none).
-    """
-    q_norm = unicodedata.normalize("NFC", query).strip()
-    # 1. Основной поиск по исходному запросу
-    items = _search_and_rank(q_norm, limit)
-    if items:
-        return items, None
-
-    # -------------------------------------------------------------
-    # ТОЛЬКО В САМУЮ ПОСЛЕДНЮЮ ОЧЕРЕДЬ: если основной поиск вернул 0 результатов
-    # -------------------------------------------------------------
-    # Попытка 1: инвертированная раскладка клавиатуры (RU <-> EN)
-    flipped = convert_keyboard_layout(q_norm)
-    if flipped.lower() != q_norm.lower():
-        logger.info("Основной поиск '%s' пуст. Пробуем раскладку: '%s'", q_norm, flipped)
-        items = _search_and_rank(flipped, limit)
-        if items:
-            return items, flipped
-
-    # Попытка 2: нечёткий / расслабленный поиск по ключевым значимым словам
-    words = q_norm.split()
-    if len(words) >= 2:
-        relaxed = " ".join(w for w in words if len(w) >= 3)
-        if relaxed and relaxed.lower() != q_norm.lower():
-            logger.info("Поиск '%s' пуст. Пробуем relaxed запрос: '%s'", q_norm, relaxed)
-            items = _search_and_rank(relaxed, limit)
-            if items:
-                return items, relaxed
-
-    return [], None
+    """Синхронная точка входа для поиска треков."""
+    return search_inline_tracks_sync(query, limit)
 
 
 async def search_tracks_async(query: str, limit: int = 30) -> Tuple[List[SearchItem], Optional[str]]:
-    """Асинхронная обертка над поиском треков."""
-    return await asyncio.to_thread(search_tracks_sync, query, limit)
+    """Асинхронная обертка над поиском треков (используется handlers/inline.py)."""
+    return await asyncio.to_thread(search_inline_tracks_sync, query, limit)
 
 
 def render_search_page(session_id: str, query: str, items: List[SearchItem], page: int = 0, page_size: int = 10) -> Tuple[str, InlineKeyboardMarkup]:
-    """
-    Формирует текст сообщения со списком треков и инлайн-клавиатуру
-    в точности как в дизайне скриншота пользователя.
-    """
+    """Формирует текст сообщения со списком треков и инлайн-клавиатуру."""
     total_items = len(items)
     total_pages = (total_items + page_size - 1) // page_size if total_items > 0 else 1
     page = max(0, min(page, total_pages - 1))
@@ -291,7 +699,6 @@ def render_search_page(session_id: str, query: str, items: List[SearchItem], pag
     end_idx = min(start_idx + page_size, total_items)
     page_items = items[start_idx:end_idx]
 
-    # 1. Текст сообщения
     lines = [f"<b>{html.escape(query)}</b>\n"]
     for i, item in enumerate(page_items, start=start_idx + 1):
         dur_str = f" <b>{item.formatted_duration}</b>" if item.formatted_duration else ""
@@ -300,7 +707,6 @@ def render_search_page(session_id: str, query: str, items: List[SearchItem], pag
 
     text = "\n".join(lines)
 
-    # 2. Кнопки номеров треков (по 5 в ряд)
     keyboard_rows: List[List[InlineKeyboardButton]] = []
     current_row: List[InlineKeyboardButton] = []
 
@@ -318,7 +724,6 @@ def render_search_page(session_id: str, query: str, items: List[SearchItem], pag
     if current_row:
         keyboard_rows.append(current_row)
 
-    # 3. Кнопки пагинации
     nav_row: List[InlineKeyboardButton] = []
     if page > 0:
         nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"mspg:{session_id}:{page - 1}"))

@@ -260,7 +260,8 @@ async def test_inline_download_deduplication():
     mock_bot.send_audio = AsyncMock(return_value=mock_msg)
     mock_bot.delete_message = AsyncMock()
 
-    with patch("handlers.inline.download_track", side_effect=slow_download):
+    with patch("handlers.inline.STORAGE_CHANNEL_ID", -1001234567890), \
+         patch("handlers.inline.download_track", side_effect=slow_download):
         task1 = asyncio.create_task(
             process_inline_download(
                 cand_id=cand_id,
@@ -425,7 +426,8 @@ async def test_chosen_inline_result_triggers_download_task():
     mock_dl.cleanup = MagicMock()
     mock_dl.thumbnail_path = None
 
-    with patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)) as dl_mock, \
+    with patch("handlers.inline.STORAGE_CHANNEL_ID", -1001234567890), \
+         patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)) as dl_mock, \
          patch("handlers.inline.resolve_canonical_track_info_async", AsyncMock(return_value=None)):
         await handle_chosen_inline_result(chosen, mock_bot)
         # Даем фоновой задаче выполниться
@@ -434,10 +436,13 @@ async def test_chosen_inline_result_triggers_download_task():
         # 1. download_track был вызван ровно 1 раз
         assert dl_mock.called
 
-        # 2. КРИТИЧНО: bot.send_audio НЕ отправлял файл пользователю (from_user.id = 987654321)
+        # 2. КРИТИЧНО: bot.send_audio отправлял ТОЛЬКО в STORAGE_CHANNEL_ID, не в ЛС пользователя и не в ADMIN_ID
+        assert mock_bot.send_audio.called
         for call in mock_bot.send_audio.call_args_list:
             chat_id = call.kwargs.get("chat_id") or call.args[0]
+            assert chat_id == -1001234567890, "Должен использоваться только STORAGE_CHANNEL_ID!"
             assert chat_id != 987654321, "Запрещено отправлять аудио в ЛС пользователя!"
+            assert chat_id != 12345678, "Запрещено отправлять аудио администратору!"
 
         # 3. Сообщение в чате было отредактировано через edit_message_media
         assert mock_bot.edit_message_media.called
@@ -466,3 +471,499 @@ async def test_inline_query_with_unsupported_url():
         assert "Не удалось распознать" in art.title
         assert "Отправьте название трека" in art.description
         assert art.reply_markup is None # Не содержит кнопок скачивания!
+
+
+# ============================================================================
+# 4. ТЕСТЫ ДЛЯ УЛУЧШЕННОГО INLINE SEARCH, SCORING И STORAGE ИЗОЛЯЦИИ
+# ============================================================================
+
+from services.search import (
+    SearchItem,
+    detect_is_live,
+    _score_inline_candidate,
+    search_inline_tracks_sync,
+)
+
+
+def test_detect_is_live_accurate_and_safe():
+    """
+    Проверяет точное распознавание живых записей и концертов,
+    включая паттерны площадок вроде (Sentrum, Kiev),
+    без ложных срабатываний на треки с городами в названиях.
+    """
+    # 1. Живые записи должны детектироваться как live
+    assert detect_is_live("Пошлая Молли — Даже моя бэйби не знает (Sentrum, Kiev)") is True
+    assert detect_is_live("Пошлая Молли — Даже моя бэйби не знает (Live @ Sentrum)") is True
+    assert detect_is_live("Пошлая Молли — Даже моя бэйби не знает [LIVE]") is True
+    assert detect_is_live("Пошлая Молли - Даже моя бэйби не знает (концерт в клубе)") is True
+    assert detect_is_live("Radiohead - Creep (Live at Glastonbury)") is True
+    assert detect_is_live("Track Title (Moscow, 2021 live)") is True
+
+    # 2. Обычные названия треков с городами НЕ должны считаться live
+    assert detect_is_live("Midnight in Paris") is False
+    assert detect_is_live("London Calling") is False
+    assert detect_is_live("Walking in Memphis") is False
+    assert detect_is_live("Moscow Calling") is False
+    assert detect_is_live("Пошлая Молли - Даже моя бэйби не знает") is False
+
+
+def test_candidate_scoring_prefers_studio_over_live_and_sentrum():
+    """
+    Студийный оригинал всегда побеждает live-версии и записи с концертов (Sentrum, Kiev).
+    """
+    item_studio = SearchItem(
+        index=0,
+        title="Даже моя бэйби не знает",
+        uploader="Пошлая Молли",
+        duration=208,
+        url="https://www.youtube.com/watch?v=Lp_euDcDQ40",
+        source="ytmusic"
+    )
+    item_sentrum = SearchItem(
+        index=0,
+        title="Пошлая Молли — Даже моя бэйби не знает (Sentrum, Kiev)",
+        uploader="Concert Fan",
+        duration=215,
+        url="https://www.youtube.com/watch?v=ogeP8z5lwYo",
+        source="youtube"
+    )
+    item_live = SearchItem(
+        index=0,
+        title="Пошлая Молли - Даже моя бэйби не знает [ LIVE ]",
+        uploader="kvvalerka",
+        duration=220,
+        url="https://www.youtube.com/watch?v=IS_kxmuLZGM",
+        source="youtube"
+    )
+
+    score_studio = _score_inline_candidate(
+        item_studio,
+        query_artist="Пошлая Молли",
+        query_title="Даже моя бэйби не знает",
+        requested_modifiers=set()
+    )
+    score_sentrum = _score_inline_candidate(
+        item_sentrum,
+        query_artist="Пошлая Молли",
+        query_title="Даже моя бэйби не знает",
+        requested_modifiers=set()
+    )
+    score_live = _score_inline_candidate(
+        item_live,
+        query_artist="Пошлая Молли",
+        query_title="Даже моя бэйби не знает",
+        requested_modifiers=set()
+    )
+
+    assert score_studio > 1000.0, "Студийный трек из YT Music должен получить высокий положительный балл"
+    assert score_sentrum < 0.0, "Запись (Sentrum, Kiev) должна получить штраф и отрицательный балл"
+    assert score_live < 0.0, "Live-версия должна получить штраф и отрицательный балл"
+    assert score_studio > score_sentrum
+    assert score_studio > score_live
+
+
+def test_candidate_scoring_honors_live_modifier_when_requested():
+    """
+    Если пользователь явно запросил live, live-версия поощряется и побеждает студийную.
+    """
+    item_studio = SearchItem(
+        index=0,
+        title="Даже моя бэйби не знает",
+        uploader="Пошлая Молли",
+        duration=208,
+        url="https://www.youtube.com/watch?v=Lp_euDcDQ40",
+        source="ytmusic"
+    )
+    item_live = SearchItem(
+        index=0,
+        title="Пошлая Молли - Даже моя бэйби не знает (Live)",
+        uploader="kvvalerka",
+        duration=220,
+        url="https://www.youtube.com/watch?v=IS_kxmuLZGM",
+        source="youtube"
+    )
+
+    requested = {"live"}
+    score_studio = _score_inline_candidate(
+        item_studio,
+        query_artist="Пошлая Молли",
+        query_title="Даже моя бэйби не знает",
+        requested_modifiers=requested
+    )
+    score_live = _score_inline_candidate(
+        item_live,
+        query_artist="Пошлая Молли",
+        query_title="Даже моя бэйби не знает",
+        requested_modifiers=requested
+    )
+
+    assert score_live > score_studio, "При запросе 'live' живая версия должна побеждать студийную"
+    assert score_live > 1000.0
+
+
+def test_inline_search_ytm_primary_and_fallback_logic():
+    """
+    Проверяет, что search_inline_tracks_sync использует ytmsearch как primary,
+    и вызывает ytsearch/scsearch ТОЛЬКО при недостатке подходящих результатов.
+    """
+    # 1. Сценарий: YTM вернул качественные результаты -> fallback yt/sc НЕ вызывается
+    ytm_item = SearchItem(
+        index=0,
+        title="Даже моя бэйби не знает",
+        uploader="Пошлая Молли",
+        duration=208,
+        url="https://www.youtube.com/watch?v=Lp_euDcDQ40",
+        source="ytmusic"
+    )
+
+    called_sources = []
+    def mock_extract(src, query, limit):
+        called_sources.append(src)
+        if src == "ytm":
+            return [ytm_item, ytm_item, ytm_item]
+        return []
+
+    with patch("services.search._extract_source_items", side_effect=mock_extract):
+        items, _ = search_inline_tracks_sync("Пошлая Молли - Даже моя бэйби не знает", limit=3)
+        assert len(items) >= 1
+        assert "ytm" in called_sources
+        assert "yt" not in called_sources, "Fallback к обычному YouTube не должен вызываться при успешном YTM"
+
+    # 2. Сценарий: YTM вернул 0 результатов -> fallback yt и sc вызываются
+    called_sources.clear()
+    yt_fallback_item = SearchItem(
+        index=0,
+        title="Пошлая Молли - Даже моя бэйби не знает",
+        uploader="Пошлая Молли - Topic",
+        duration=208,
+        url="https://www.youtube.com/watch?v=fallback_yt_123",
+        source="youtube"
+    )
+    def mock_extract_empty_ytm(src, query, limit):
+        called_sources.append(src)
+        if src == "ytm":
+            return []
+        elif src == "yt":
+            return [yt_fallback_item]
+        return []
+
+    with patch("services.search._extract_source_items", side_effect=mock_extract_empty_ytm):
+        items, _ = search_inline_tracks_sync("Пошлая Молли - Даже моя бэйби не знает", limit=3)
+        assert len(items) >= 1
+        assert "ytm" in called_sources
+        assert "yt" in called_sources, "Fallback к обычному YouTube обязан вызваться, если YTM пуст"
+        assert items[0].url == "https://www.youtube.com/watch?v=fallback_yt_123"
+
+
+def test_inline_search_release_authoritative_protection():
+    """
+    Проверяет, что uploader 'Release' или 'Release - Topic' никогда не становится артистом.
+    """
+    candidate_item = SearchItem(
+        index=0,
+        title="Запястья",
+        uploader="Release - Topic",
+        duration=180,
+        url="https://www.youtube.com/watch?v=release_topic_123",
+        source="ytmusic"
+    )
+
+    with patch("services.search._extract_source_items", return_value=[candidate_item]):
+        items, _ = search_inline_tracks_sync("Макулатура -- Запястья", limit=1)
+        assert len(items) == 1
+        assert items[0].clean_artist == "Макулатура"
+        assert "Release" not in items[0].clean_artist
+
+
+@pytest.mark.asyncio
+async def test_inline_download_missing_storage_channel_id_fails_gracefully():
+    """
+    Проверяет, что при отсутствии STORAGE_CHANNEL_ID:
+    1. Пользователю выводится сообщение '⚠️ Не удалось подготовить аудио.'
+    2. Никаких сообщений НЕ отправляется ни в ЛС пользователя, ни администратору.
+    """
+    from handlers.inline import process_inline_download
+    import uuid
+
+    cand_id = f"missing_storage_{uuid.uuid4().hex[:6]}"
+    save_inline_candidate(
+        cand_id=cand_id,
+        target="https://www.youtube.com/watch?v=missing_storage_test",
+        title="Test Track",
+        artist="Test Artist",
+        album=None,
+        duration=180,
+        thumbnail_url=None
+    )
+
+    mock_bot = MagicMock()
+    mock_bot.edit_message_text = AsyncMock()
+    mock_bot.send_audio = AsyncMock()
+
+    mock_dl = MagicMock()
+    mock_dl.title = "Test Track"
+    mock_dl.artist = "Test Artist"
+    mock_dl.duration = 180
+    mock_dl.file_path = MagicMock()
+    mock_dl.file_path.exists.return_value = True
+    mock_dl.cleanup = MagicMock()
+    mock_dl.thumbnail_path = None
+
+    with patch("handlers.inline.STORAGE_CHANNEL_ID", None), \
+         patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)):
+        res = await process_inline_download(
+            cand_id=cand_id,
+            inline_message_id="inl_msg_missing_storage",
+            bot=mock_bot
+        )
+
+        assert res is None
+        # bot.send_audio НЕ должен быть вызван вообще!
+        assert not mock_bot.send_audio.called
+
+        # Сообщение должно быть отредактировано с дружелюбным текстом
+        assert mock_bot.edit_message_text.called
+        call_text = mock_bot.edit_message_text.call_args.kwargs.get("text") or mock_bot.edit_message_text.call_args.args[0]
+        assert "⚠️ Не удалось подготовить аудио." in call_text
+
+
+@pytest.mark.asyncio
+async def test_inline_download_strictly_uses_storage_channel_and_never_admin_or_user():
+    """
+    Проверяет, что при скачивании трека в Inline Mode bot.send_audio вызывается СТРОГО
+    в STORAGE_CHANNEL_ID, и НИКОГДА в ADMIN_ID или from_user.id.
+    """
+    from handlers.inline import process_inline_download
+    import uuid
+
+    uid = uuid.uuid4().hex[:8]
+    cand_id = f"strict_storage_{uid}"
+    title_str = f"Strict Track {uid}"
+    artist_str = f"Strict Artist {uid}"
+    target_url = f"https://www.youtube.com/watch?v=strict_storage_{uid}"
+
+    save_inline_candidate(
+        cand_id=cand_id,
+        target=target_url,
+        title=title_str,
+        artist=artist_str,
+        album=None,
+        duration=200,
+        thumbnail_url=None
+    )
+
+    mock_bot = MagicMock()
+    mock_bot.edit_message_text = AsyncMock()
+    mock_bot.edit_message_media = AsyncMock()
+    mock_msg = MagicMock()
+    mock_msg.audio.file_id = "BQACAgQAAxkBAAICaW_strict_file_id_123456"
+    mock_msg.message_id = 999
+    mock_bot.send_audio = AsyncMock(return_value=mock_msg)
+
+    mock_dl = MagicMock()
+    mock_dl.title = title_str
+    mock_dl.artist = artist_str
+    mock_dl.duration = 200
+    mock_dl.file_path = MagicMock()
+    mock_dl.file_path.exists.return_value = True
+    mock_dl.cleanup = MagicMock()
+    mock_dl.thumbnail_path = None
+
+    test_storage_id = -100999888777
+    admin_id = 12345678
+    user_id = 987654321
+
+    with patch("handlers.inline.STORAGE_CHANNEL_ID", test_storage_id), \
+         patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)):
+        res = await process_inline_download(
+            cand_id=cand_id,
+            inline_message_id="inl_msg_strict_storage",
+            bot=mock_bot
+        )
+
+        assert res == "BQACAgQAAxkBAAICaW_strict_file_id_123456"
+        assert mock_bot.send_audio.called
+
+        for call in mock_bot.send_audio.call_args_list:
+            chat_id = call.kwargs.get("chat_id") or call.args[0]
+            assert chat_id == test_storage_id, "Файл обязан отправляться строго в STORAGE_CHANNEL_ID!"
+            assert chat_id != admin_id, "Категорически запрещено отправлять в чат администратора!"
+            assert chat_id != user_id, "Категорически запрещено отправлять в ЛС пользователя!"
+
+
+# ============================================================================
+# 6. ТЕСТЫ ДЛЯ ДЕТЕКЦИИ И ШТРАФОВАНИЯ ПОДОЗРИТЕЛЬНОГО ХРОНОМЕТРАЖА (DURATION SCORING)
+# ============================================================================
+
+def test_duration_scoring_tiered_deltas_for_expected_208s():
+    """
+    Проверяет градуированную систему штрафов/бонусов за хронометраж при эталоне 208с (3:28):
+    - 208s (diff 0)  -> PASS (бонус +200)
+    - 209s (diff 1)  -> PASS (бонус +200)
+    - 212s (diff 4)  -> PASS / допустимо (бонус +100)
+    - 215s (diff 7)  -> заметный penalty (-470)
+    - 180s (diff 28) -> сильный penalty (-3280)
+    - 125s (diff 83, 2:05) -> REJECT / катастрофический штраф (-9240)
+    """
+    from services.search import SearchItem, _score_inline_candidate
+
+    canonical_dur = 208
+
+    # Создаем базовые элементы с одинаковыми текстовыми данными
+    def make_item(dur: int) -> SearchItem:
+        return SearchItem(
+            index=0,
+            title="Даже моя бэйби не знает",
+            artist="Пошлая Молли",
+            uploader="Пошлая Молли - Topic",
+            duration=dur,
+            url=f"https://www.youtube.com/watch?v=dur_{dur}",
+            source="ytmusic",
+        )
+
+    # 1. 208s (diff 0) -> PASS (+200)
+    item_208 = make_item(208)
+    score_208 = _score_inline_candidate(item_208, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+
+    # 2. 209s (diff 1) -> PASS (+200)
+    item_209 = make_item(209)
+    score_209 = _score_inline_candidate(item_209, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+    assert score_208 == score_209
+
+    # 3. 212s (diff 4) -> PASS / допустимо (+100)
+    item_212 = make_item(212)
+    score_212 = _score_inline_candidate(item_212, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+    assert score_208 - score_212 == 100.0  # +200 vs +100 = разница ровно 100
+
+    # 4. 215s (diff 7) -> заметный penalty (-470)
+    item_215 = make_item(215)
+    score_215 = _score_inline_candidate(item_215, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+    # diff=7: -350 - (7-4)*40 = -470. Разница с идеальным (+200): 670
+    assert score_208 - score_215 == 670.0
+
+    # 5. 180s (diff 28) -> сильный penalty (-3280)
+    item_180 = make_item(180)
+    score_180 = _score_inline_candidate(item_180, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+    # diff=28: -2500 - (28-15)*60 = -3280. Разница с идеальным (+200): 3480
+    assert score_208 - score_180 == 3480.0
+
+    # 6. 125s (2:05, diff 83) -> REJECT (-9240)
+    item_125 = make_item(125)
+    score_125 = _score_inline_candidate(item_125, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+    # diff=83: -5000 - (83-30)*80 = -9240. Разница с идеальным (+200): 9440
+    assert score_208 - score_125 == 9440.0
+    assert score_125 < -5000.0, "Кандидат с длительностью 2:05 обязан получить катастрофический штраф и статус REJECT"
+
+
+def test_duration_scoring_rejects_suspicious_205_candidate_in_ranking():
+    """
+    Проверяет сценарий пользователя:
+    #1 3:28 (208s) -> score ~1900-2350
+    #2 3:30 (210s) -> score ~1900-2350
+    #5 2:05 (125s) -> score < -5000 (REJECT), не попадает в подходящие кандидаты
+    """
+    from services.search import SearchItem, _score_inline_candidate
+
+    canonical_dur = 208
+    candidates = [
+        SearchItem(index=0, title="Даже моя бэйби не знает", artist="Пошлая Молли", uploader="Пошлая Молли - Topic", duration=208, url="https://ytm/1", source="ytmusic"),
+        SearchItem(index=0, title="Даже моя бэйби не знает", artist="Пошлая Молли", uploader="Пошлая Молли - Topic", duration=210, url="https://ytm/2", source="ytmusic"),
+        SearchItem(index=0, title="Даже моя бэйби не знает", artist="Пошлая Молли", uploader="Пошлая Молли - Topic", duration=209, url="https://ytm/3", source="ytmusic"),
+        SearchItem(index=0, title="Даже моя бэйби не знает", artist="Пошлая Молли", uploader="Пошлая Молли - Topic", duration=207, url="https://ytm/4", source="ytmusic"),
+        SearchItem(index=0, title="Даже моя бэйби не знает", artist="Пошлая Молли", uploader="Пошлая Молли", duration=125, url="https://yt/clip", source="youtube"),
+    ]
+
+    for c in candidates:
+        _score_inline_candidate(c, "Пошлая Молли", "Даже моя бэйби не знает", set(), canonical_dur)
+
+    ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+
+    # Кандидат 3:28 (208s) на 1 месте
+    assert ranked[0].duration == 208
+    assert ranked[0].score > 1500.0
+
+    # Кандидат 2:05 (125s) на последнем месте с глубоко отрицательным скором
+    assert ranked[-1].duration == 125
+    assert ranked[-1].score < -5000.0
+
+    # Проверяем фильтрацию suitable_ytm (score >= 500.0)
+    suitable = [c for c in candidates if c.score >= 500.0]
+    assert all(c.duration != 125 for c in suitable)
+    assert len(suitable) == 4
+
+
+def test_duration_scoring_tempo_modifiers_bypass_penalty():
+    """
+    Проверяет, что при запросе с модификатором темпа (sped up, slowed, nightcore)
+    штраф за отличие длительности от эталона НЕ начисляется.
+    """
+    from services.search import SearchItem, _score_inline_candidate
+
+    canonical_dur = 208
+    item_sped_up = SearchItem(
+        index=0,
+        title="Даже моя бэйби не знает (Sped Up)",
+        artist="Пошлая Молли",
+        uploader="Various Artists",
+        duration=150,
+        url="https://yt/spedup",
+        source="youtube"
+    )
+
+    req_mods = {"sped up"}
+    score = _score_inline_candidate(item_sped_up, "Пошлая Молли", "Даже моя бэйби не знает", req_mods, canonical_dur)
+    assert score > 1000.0
+
+
+def test_duration_scoring_live_modifier_allows_wider_tolerance():
+    """
+    Проверяет, что при явном запросе live-версии кандидат с отличием хронометража до 15 секунд
+    получает бонус, а не штраф.
+    """
+    from services.search import SearchItem, _score_inline_candidate
+
+    canonical_dur = 208
+    item_live = SearchItem(
+        index=0,
+        title="Даже моя бэйби не знает (Live в Москве)",
+        artist="Пошлая Молли",
+        uploader="Пошлая Молли",
+        duration=220,
+        url="https://yt/live",
+        source="youtube"
+    )
+
+    req_mods = {"live"}
+    score = _score_inline_candidate(item_live, "Пошлая Молли", "Даже моя бэйби не знает", req_mods, canonical_dur)
+    assert score > 1500.0
+
+
+def test_find_studio_reference_duration():
+    """
+    Проверяет извлечение эталонного хронометража:
+    1. Приоритет YT Music студийного трека над Topic и обычным видео.
+    2. Fallback на Topic-канал, если YT Music отсутствует.
+    3. Игнорирование live-треков при поиске эталона.
+    """
+    from services.search import SearchItem, _find_studio_reference_duration
+
+    # Случай 1: есть студийный трек YT Music
+    cands1 = [
+        SearchItem(index=0, title="Даже моя бэйби не знает (Live)", duration=240, source="ytmusic", is_live=True, url="1"),
+        SearchItem(index=0, title="Даже моя бэйби не знает", artist="Пошлая Молли", duration=208, source="ytmusic", is_live=False, url="2"),
+        SearchItem(index=0, title="Даже моя бэйби не знает", duration=210, uploader="Пошлая Молли - Topic", source="youtube", url="3"),
+    ]
+    assert _find_studio_reference_duration(cands1, "Пошлая Молли", "Даже моя бэйби не знает") == 208
+
+    # Случай 2: нет YT Music, но есть YouTube Topic
+    cands2 = [
+        SearchItem(index=0, title="Даже моя бэйби не знает", duration=209, uploader="Пошлая Молли - Topic", source="youtube", url="1"),
+        SearchItem(index=0, title="Даже моя бэйби не знает (Клип)", duration=125, uploader="Пошлая Молли", source="youtube", url="2"),
+    ]
+    assert _find_studio_reference_duration(cands2, "Пошлая Молли", "Даже моя бэйби не знает") == 209
+
+    # Случай 3: только сторонние неофициальные клипы
+    cands3 = [
+        SearchItem(index=0, title="Даже моя бэйби не знает (Клип)", duration=125, uploader="User123", source="youtube", url="1"),
+    ]
+    assert _find_studio_reference_duration(cands3, "Пошлая Молли", "Даже моя бэйби не знает") is None

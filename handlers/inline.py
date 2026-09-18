@@ -20,7 +20,7 @@ from aiogram.types import (
     FSInputFile
 )
 
-from config import STORAGE_CHANNEL_ID, ADMIN_ID
+from config import STORAGE_CHANNEL_ID
 from services.database import (
     save_inline_candidate,
     get_inline_candidate_async,
@@ -28,7 +28,11 @@ from services.database import (
     get_cached_track_async,
     save_cached_track_async,
 )
-from services.search import search_tracks_async
+from services.search import (
+    search_tracks_async,
+    extract_artist_title_from_query,
+    _parse_candidate_title_artist,
+)
 from services.downloader import download_track, _clean_audio_branding, is_generic_artist_name
 from services.extractor import (
     find_first_url,
@@ -78,77 +82,7 @@ def _extract_https_thumbnail(url: str, default_thumb: Optional[str]) -> Optional
     return None
 
 
-def extract_artist_title_from_query(query: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Извлекает (artist, title) из поискового запроса пользователя вида 'Исполнитель — Название'.
-    Поддерживает варианты разделителей: ' -- ', '--', ' — ', '—', ' – ', '–', ' - '.
-    """
-    if not query:
-        return None, None
-    clean_q = clean_unicode_text(query).strip()
-    for pattern in [r'\s*(?:--|—|–)\s*', r'\s+-\s+']:
-        parts = re.split(pattern, clean_q, maxsplit=1)
-        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            return parts[0].strip(), parts[1].strip()
-    return None, None
 
-
-def _parse_candidate_title_artist(
-    raw_title: str,
-    uploader: Optional[str],
-    query_artist: Optional[str] = None,
-    query_title: Optional[str] = None
-) -> tuple[str, str]:
-    """
-    Разделяет строку на исполнителя и название трека с удалением брендинга.
-    YouTube uploader (например, 'Release', '... - Topic', лейблы) НИКОГДА
-    не подменяет реального исполнителя из запроса или названия видео.
-    """
-    cleaned = clean_unicode_text(raw_title).strip()
-    # Удаляем распространенные суффиксы клипов/аудио
-    cleaned = re.sub(
-        r'\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Official\s*Audio|Lyric\s*Video|Video|HQ|HD|Visualizer)[^\)\]]*[\)\]]',
-        '',
-        cleaned,
-        flags=re.IGNORECASE
-    ).strip()
-
-    artist = None
-    title = None
-
-    # 1. Если в самом названии видео есть разделитель "Исполнитель - Название"
-    for sep in [" - ", " — ", " – ", " -- "]:
-        if sep in cleaned:
-            parts = cleaned.split(sep, 1)
-            cand_art = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
-            cand_tit = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
-            if cand_art and not is_generic_artist_name(cand_art):
-                artist = cand_art
-                title = cand_tit
-                break
-
-    # 2. Если в названии видео нет разделителя (или исполнитель generic),
-    # используем исполнителя из запроса пользователя (например: 'Макулатура -- Запястья')
-    if (not artist or is_generic_artist_name(artist)) and query_artist and not is_generic_artist_name(query_artist):
-        artist = _clean_audio_branding(query_artist) or query_artist
-        if not title:
-            title = _clean_audio_branding(cleaned) or query_title or cleaned
-
-    # 3. Если исполнитель всё ещё не определен, проверяем uploader (только если не generic!)
-    if not artist or is_generic_artist_name(artist):
-        raw_uploader = (uploader or "").replace(" - Topic", "").replace("- Topic", "").replace(" – Topic", "").strip()
-        cleaned_up = _clean_audio_branding(raw_uploader) if raw_uploader else ""
-        if cleaned_up and not is_generic_artist_name(cleaned_up):
-            artist = cleaned_up
-
-    # 4. Финальный fallback: гарантируем, что 'Release' или generic имя не вернется
-    if not artist or is_generic_artist_name(artist):
-        artist = query_artist if (query_artist and not is_generic_artist_name(query_artist)) else "Unknown Artist"
-
-    if not title:
-        title = _clean_audio_branding(cleaned) or query_title or cleaned or "Unknown Track"
-
-    return artist, title
 
 
 @router.inline_query()
@@ -335,7 +269,7 @@ async def handle_inline_query(inline_query: InlineQuery):
                     target=item.url,
                     title=title,
                     artist=artist,
-                    album=None,
+                    album=item.album,
                     duration=item.duration,
                     thumbnail_url=thumb_url
                 )
@@ -563,17 +497,17 @@ async def process_inline_download(
                 custom_album=candidate.get("album")
             )
 
-            # 5. Загружаем аудиофайл в Telegram storage (STORAGE_CHANNEL_ID или ADMIN_ID)
-            # ВАЖНО: НИКОГДА не отправлять в ЛС пользователю (from_user.id)
-            storage_chat_id = STORAGE_CHANNEL_ID or ADMIN_ID
-            if not storage_chat_id:
-                raise RuntimeError("STORAGE_CHANNEL_ID или ADMIN_ID не настроены в config.py")
+            # ВАЖНО: Загрузка ТОЛЬКО в канал хранилища STORAGE_CHANNEL_ID!
+            # Запрещено отправлять в ЛС пользователю или администратору!
+            if not STORAGE_CHANNEL_ID:
+                logger.error("STORAGE_CHANNEL_ID не настроен. Inline Mode требует STORAGE_CHANNEL_ID.")
+                raise RuntimeError("STORAGE_CHANNEL_ID не настроен")
 
             thumb_file = FSInputFile(downloaded.thumbnail_path) if downloaded.thumbnail_path and downloaded.thumbnail_path.exists() else None
             audio_file = FSInputFile(downloaded.file_path)
 
             uploaded_msg = await bot.send_audio(
-                chat_id=storage_chat_id,
+                chat_id=STORAGE_CHANNEL_ID,
                 audio=audio_file,
                 title=downloaded.title,
                 performer=downloaded.artist,
@@ -586,13 +520,6 @@ async def process_inline_download(
                 raise RuntimeError("Не удалось получить audio object после загрузки в Telegram")
 
             file_id = uploaded_msg.audio.file_id
-
-            # Если отправка была в ADMIN_ID, удаляем сообщение, чтобы не засорять чат админа
-            if storage_chat_id == ADMIN_ID:
-                try:
-                    await bot.delete_message(chat_id=ADMIN_ID, message_id=uploaded_msg.message_id)
-                except Exception:
-                    pass
 
             # 6. Сохраняем в кэш базы данных
             await save_cached_track_async(
@@ -638,12 +565,16 @@ async def process_inline_download(
             fut.set_exception(err)
         if inline_message_id:
             try:
-                await bot.edit_message_text(
-                    inline_message_id=inline_message_id,
-                    text=(
+                if "STORAGE_CHANNEL_ID" in str(err):
+                    err_text = "⚠️ Не удалось подготовить аудио."
+                else:
+                    err_text = (
                         "⚠️ Не удалось скачать этот трек.\n\n"
                         "Попробуйте другой результат."
-                    ),
+                    )
+                await bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=err_text,
                     parse_mode="HTML"
                 )
             except Exception:
