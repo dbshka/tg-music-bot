@@ -34,6 +34,16 @@ from services.yandex_vk import resolve_yandex_music_track, resolve_vk_music_trac
 
 logger = logging.getLogger(__name__)
 
+UNSUPPORTED_URL_FALLBACK_TEXT = (
+    "⚠️ Не удалось распознать эту ссылку.\n\n"
+    "💡 Отправьте название трека или исполнителя текстом — я найду его на YouTube."
+)
+
+
+class UnsupportedUrlError(ValueError):
+    """Исключение при невозможности распознать или скачать трек по ссылке."""
+    pass
+
 
 @dataclass
 class ExtractedTrack:
@@ -874,52 +884,79 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
         track = await extract_spotify_info(url, session)
         if track:
             return track
+        raise UnsupportedUrlError(UNSUPPORTED_URL_FALLBACK_TEXT)
 
     # 3. Apple Music
     if "apple.com" in domain:
         track = await extract_apple_music_info(url, session)
         if track:
             return track
+        raise UnsupportedUrlError(UNSUPPORTED_URL_FALLBACK_TEXT)
 
     # 4. YouTube / YouTube Music (извлекаем точные метаданные для мгновенного SoundCloud Fallback)
     if "youtube.com" in domain or "youtu.be" in domain:
         yt_track = await extract_youtube_info(url, session)
         if yt_track:
             return yt_track
+        return ExtractedTrack(
+            platform="YouTube / YouTube Music",
+            target=url,
+            is_search=False
+        )
 
     # 5. SoundCloud (извлекаем точные метаданные через oEmbed и очищаем UTM-метки)
     if "soundcloud.com" in domain:
         sc_track = await extract_soundcloud_info(url, session)
         if sc_track:
             return sc_track
+        return ExtractedTrack(
+            platform="SoundCloud",
+            target=url,
+            is_search=False
+        )
 
-    # Прочие сервисы, поддерживаемые yt-dlp напрямую
-    platform_name = "Музыкальный сервис"
-    if "youtube.com" in domain or "youtu.be" in domain:
-        platform_name = "YouTube / YouTube Music"
-    elif "soundcloud.com" in domain:
-        platform_name = "SoundCloud"
-    elif "vk.com" in domain or "vk.ru" in domain:
+    # 6. VK Music / VK Video
+    if "vk.com" in domain or "vk.ru" in domain:
         if "/audio" in url or "/music" in url or "z=audio" in url:
-            res = await resolve_vk_music_track(url, session)
+            try:
+                res = await resolve_vk_music_track(url, session)
+                return ExtractedTrack(
+                    platform=res["platform"],
+                    target=res["target"],
+                    is_search=res["is_search"],
+                    title=res["title"],
+                    artist=res["artist"],
+                    thumbnail_url=res["thumbnail_url"],
+                    duration=res["duration"],
+                    album=res.get("album")
+                )
+            except Exception as e:
+                logger.info("VK music resolution error: %s", e)
+                raise UnsupportedUrlError(UNSUPPORTED_URL_FALLBACK_TEXT) from e
+        elif "/video" in url or "z=video" in url:
             return ExtractedTrack(
-                platform=res["platform"],
-                target=res["target"],
-                is_search=res["is_search"],
-                title=res["title"],
-                artist=res["artist"],
-                thumbnail_url=res["thumbnail_url"],
-                duration=res["duration"],
-                album=res.get("album")
+                platform="VK Видео",
+                target=url,
+                is_search=False
             )
-        platform_name = "VK Видео"
-    elif "bandcamp.com" in domain:
-        platform_name = "Bandcamp"
-    elif "tiktok.com" in domain:
-        platform_name = "TikTok"
+        else:
+            raise UnsupportedUrlError(UNSUPPORTED_URL_FALLBACK_TEXT)
 
-    return ExtractedTrack(
-        platform=platform_name,
-        target=url,
-        is_search=False
-    )
+    # 7. Bandcamp
+    if "bandcamp.com" in domain:
+        return ExtractedTrack(
+            platform="Bandcamp",
+            target=url,
+            is_search=False
+        )
+
+    # 8. TikTok
+    if "tiktok.com" in domain:
+        return ExtractedTrack(
+            platform="TikTok",
+            target=url,
+            is_search=False
+        )
+
+    # Любой другой неподдерживаемый сервис или неизвестный URL
+    raise UnsupportedUrlError(UNSUPPORTED_URL_FALLBACK_TEXT)

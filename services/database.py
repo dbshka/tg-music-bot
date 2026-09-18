@@ -5,10 +5,13 @@ import time
 import threading
 import urllib.parse
 import asyncio
+import logging
 from collections import OrderedDict
 from typing import Optional, List, Dict, Any
 from config import DB_PATH
 from services.identity import clean_unicode_text
+
+logger = logging.getLogger(__name__)
 
 
 class LRUMemoryCache:
@@ -114,10 +117,24 @@ def init_db():
         except Exception:
             pass
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS inline_candidates (
+                id TEXT PRIMARY KEY,
+                target TEXT NOT NULL,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                album TEXT,
+                duration INTEGER,
+                thumbnail_url TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+
         # Создаем индексы для ускорения
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_downloads ON users(downloads_count DESC, tags_edited_count DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_file_id ON tracks_cache(file_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_inline_cand_created ON inline_candidates(created_at)")
         conn.commit()
 
         # Прогрев L1 RAM кэша последними 200 записями
@@ -515,3 +532,109 @@ def get_all_user_ids() -> List[int]:
 async def get_all_user_ids_async() -> List[int]:
     """Асинхронное получение ID пользователей."""
     return await asyncio.to_thread(get_all_user_ids)
+
+
+_INLINE_MEM_CACHE = LRUMemoryCache(maxsize=1000, ttl_seconds=86400)
+
+
+def save_inline_candidate(
+    cand_id: str,
+    target: str,
+    title: str,
+    artist: str,
+    album: Optional[str],
+    duration: int,
+    thumbnail_url: Optional[str]
+):
+    """Сохраняет метаданные кандидата inline-поиска в RAM и SQLite."""
+    data = {
+        "id": cand_id,
+        "target": target,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "duration": duration,
+        "thumbnail_url": thumbnail_url,
+    }
+    _INLINE_MEM_CACHE.set(cand_id, data)
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO inline_candidates (id, target, title, artist, album, duration, thumbnail_url, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (cand_id, target, title, artist, album, duration, thumbnail_url, datetime.datetime.now()))
+            conn.commit()
+    except Exception as e:
+        logger.warning("Не удалось сохранить inline-кандидата в SQLite: %s", e)
+
+
+async def save_inline_candidate_async(
+    cand_id: str,
+    target: str,
+    title: str,
+    artist: str,
+    album: Optional[str],
+    duration: int,
+    thumbnail_url: Optional[str]
+):
+    """Асинхронное сохранение кандидата inline-поиска."""
+    await asyncio.to_thread(save_inline_candidate, cand_id, target, title, artist, album, duration, thumbnail_url)
+
+
+def get_inline_candidate(cand_id: str) -> Optional[Dict[str, Any]]:
+    """Получает метаданные кандидата inline-поиска по ID из RAM или SQLite."""
+    cached = _INLINE_MEM_CACHE.get(cand_id)
+    if cached:
+        return cached
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, target, title, artist, album, duration, thumbnail_url FROM inline_candidates WHERE id = ?",
+                (cand_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                res = dict(row)
+                _INLINE_MEM_CACHE.set(cand_id, res)
+                return res
+    except Exception as e:
+        logger.warning("Ошибка чтения inline-кандидата из SQLite: %s", e)
+    return None
+
+
+async def get_inline_candidate_async(cand_id: str) -> Optional[Dict[str, Any]]:
+    """Асинхронное получение кандидата inline-поиска."""
+    cached = _INLINE_MEM_CACHE.get(cand_id)
+    if cached:
+        return cached
+    return await asyncio.to_thread(get_inline_candidate, cand_id)
+
+
+def search_cached_tracks(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Поиск по названию или артисту в кэше базы данных tracks_cache."""
+    q = query.strip().lower()
+    if not q:
+        return []
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT file_id, title, artist, duration, variant, query_key
+                FROM tracks_cache
+                WHERE (lower(title) LIKE ? OR lower(artist) LIKE ? OR lower(query_key) LIKE ?)
+                  AND variant = 'original'
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (f"%{q}%", f"%{q}%", f"%{q}%", limit))
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("Ошибка поиска в tracks_cache: %s", e)
+        return []
+
+
+async def search_cached_tracks_async(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Асинхронный поиск в tracks_cache."""
+    return await asyncio.to_thread(search_cached_tracks, query, limit)

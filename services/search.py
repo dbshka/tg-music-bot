@@ -144,6 +144,7 @@ def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
         "no_warnings": True,
         "noplaylist": True,
         "ignoreerrors": True,
+        "socket_timeout": 5,
     }
     cookies_info = get_cookies_info()
     if src == "yt" and cookies_info.get("active"):
@@ -189,11 +190,23 @@ def _extract_source_items(src: str, query: str, limit: int) -> List[dict]:
 
 def _search_and_rank(query: str, limit: int = 30) -> List[SearchItem]:
     """Выполняет поиск по источникам и ранжирует так, чтобы оригинал был всегда первым."""
+    yt_req_limit = 8 if limit <= 5 else 20
+    sc_req_limit = 5 if limit <= 5 else 15
+    timeout = 6.0 if limit <= 5 else 12.0
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f_yt = executor.submit(_extract_source_items, "yt", query, 20)
-        f_sc = executor.submit(_extract_source_items, "sc", query, 15)
-        yt_raw = f_yt.result()
-        sc_raw = f_sc.result()
+        f_yt = executor.submit(_extract_source_items, "yt", query, yt_req_limit)
+        f_sc = executor.submit(_extract_source_items, "sc", query, sc_req_limit)
+        done, _ = concurrent.futures.wait([f_yt, f_sc], timeout=timeout)
+        try:
+            yt_raw = f_yt.result() if f_yt in done else []
+        except Exception as ex:
+            logger.warning("YT extraction failed for '%s': %s", query, ex)
+            yt_raw = []
+        try:
+            sc_raw = f_sc.result() if f_sc in done else []
+        except Exception as ex:
+            logger.warning("SC extraction failed for '%s': %s", query, ex)
+            sc_raw = []
 
     seen_signatures = set()
     combined: List[SearchItem] = []

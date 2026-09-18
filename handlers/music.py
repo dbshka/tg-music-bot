@@ -35,6 +35,7 @@ from services.extractor import (
     extract_track_modifiers,
     parse_url_and_modifiers,
     ExtractedTrack,
+    UnsupportedUrlError,
 )
 from services.downloader import download_track
 from services.database import (
@@ -703,6 +704,20 @@ async def _execute_download_and_send(
             await status_msg.delete()
         except Exception:
             pass
+
+    except UnsupportedUrlError as e:
+        logger.info("[MUSIC][request_id=%s] UnsupportedUrlError: %s", req_id, e)
+        user_friendly = str(e)
+        try:
+            if status_msg:
+                await status_msg.edit_text(user_friendly, parse_mode="HTML")
+            else:
+                await message.reply(user_friendly, parse_mode="HTML")
+        except Exception:
+            try:
+                await message.reply(user_friendly, parse_mode="HTML")
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"[MUSIC][request_id={req_id}] ERROR at processing: {e}\n{traceback.format_exc()}", flush=True)
