@@ -29,10 +29,11 @@ from services.database import (
     save_cached_track_async,
 )
 from services.search import search_tracks_async
-from services.downloader import download_track, _clean_audio_branding
+from services.downloader import download_track, _clean_audio_branding, is_generic_artist_name
 from services.extractor import (
     find_first_url,
     resolve_track_url,
+    resolve_canonical_track_info_async,
     UnsupportedUrlError,
     UNSUPPORTED_URL_FALLBACK_TEXT,
     clean_unicode_text,
@@ -77,8 +78,32 @@ def _extract_https_thumbnail(url: str, default_thumb: Optional[str]) -> Optional
     return None
 
 
-def _parse_candidate_title_artist(raw_title: str, uploader: Optional[str]) -> tuple[str, str]:
-    """Разделяет строку на исполнителя и название трека с удалением брендинга."""
+def extract_artist_title_from_query(query: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Извлекает (artist, title) из поискового запроса пользователя вида 'Исполнитель — Название'.
+    Поддерживает варианты разделителей: ' -- ', '--', ' — ', '—', ' – ', '–', ' - '.
+    """
+    if not query:
+        return None, None
+    clean_q = clean_unicode_text(query).strip()
+    for pattern in [r'\s*(?:--|—|–)\s*', r'\s+-\s+']:
+        parts = re.split(pattern, clean_q, maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return parts[0].strip(), parts[1].strip()
+    return None, None
+
+
+def _parse_candidate_title_artist(
+    raw_title: str,
+    uploader: Optional[str],
+    query_artist: Optional[str] = None,
+    query_title: Optional[str] = None
+) -> tuple[str, str]:
+    """
+    Разделяет строку на исполнителя и название трека с удалением брендинга.
+    YouTube uploader (например, 'Release', '... - Topic', лейблы) НИКОГДА
+    не подменяет реального исполнителя из запроса или названия видео.
+    """
     cleaned = clean_unicode_text(raw_title).strip()
     # Удаляем распространенные суффиксы клипов/аудио
     cleaned = re.sub(
@@ -88,18 +113,40 @@ def _parse_candidate_title_artist(raw_title: str, uploader: Optional[str]) -> tu
         flags=re.IGNORECASE
     ).strip()
 
-    if " - " in cleaned:
-        parts = cleaned.split(" - ", 1)
-        artist = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
-        title = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
-    elif " — " in cleaned:
-        parts = cleaned.split(" — ", 1)
-        artist = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
-        title = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
-    else:
-        raw_uploader = (uploader or "").replace(" - Topic", "").replace("- Topic", "").strip()
-        artist = _clean_audio_branding(raw_uploader) if raw_uploader else "Unknown Artist"
-        title = _clean_audio_branding(cleaned) or cleaned
+    artist = None
+    title = None
+
+    # 1. Если в самом названии видео есть разделитель "Исполнитель - Название"
+    for sep in [" - ", " — ", " – ", " -- "]:
+        if sep in cleaned:
+            parts = cleaned.split(sep, 1)
+            cand_art = _clean_audio_branding(parts[0].strip()) or parts[0].strip()
+            cand_tit = _clean_audio_branding(parts[1].strip()) or parts[1].strip()
+            if cand_art and not is_generic_artist_name(cand_art):
+                artist = cand_art
+                title = cand_tit
+                break
+
+    # 2. Если в названии видео нет разделителя (или исполнитель generic),
+    # используем исполнителя из запроса пользователя (например: 'Макулатура -- Запястья')
+    if (not artist or is_generic_artist_name(artist)) and query_artist and not is_generic_artist_name(query_artist):
+        artist = _clean_audio_branding(query_artist) or query_artist
+        if not title:
+            title = _clean_audio_branding(cleaned) or query_title or cleaned
+
+    # 3. Если исполнитель всё ещё не определен, проверяем uploader (только если не generic!)
+    if not artist or is_generic_artist_name(artist):
+        raw_uploader = (uploader or "").replace(" - Topic", "").replace("- Topic", "").replace(" – Topic", "").strip()
+        cleaned_up = _clean_audio_branding(raw_uploader) if raw_uploader else ""
+        if cleaned_up and not is_generic_artist_name(cleaned_up):
+            artist = cleaned_up
+
+    # 4. Финальный fallback: гарантируем, что 'Release' или generic имя не вернется
+    if not artist or is_generic_artist_name(artist):
+        artist = query_artist if (query_artist and not is_generic_artist_name(query_artist)) else "Unknown Artist"
+
+    if not title:
+        title = _clean_audio_branding(cleaned) or query_title or cleaned or "Unknown Track"
 
     return artist, title
 
@@ -255,6 +302,7 @@ async def handle_inline_query(inline_query: InlineQuery):
         logger.warning("Ошибка проверки кэша в inline query: %s", e)
 
     # 5. Если в кэше меньше 5 треков — выполняем плоский поиск кандидатов (extract_flat)
+    q_artist, q_title = extract_artist_title_from_query(query_text)
     remaining_slots = 5 - len(results)
     if remaining_slots > 0:
         try:
@@ -262,9 +310,15 @@ async def handle_inline_query(inline_query: InlineQuery):
             for item in search_items:
                 if len(results) >= 5:
                     break
-                artist, title = _parse_candidate_title_artist(item.title, item.uploader)
+                artist, title = _parse_candidate_title_artist(
+                    item.title,
+                    item.uploader,
+                    query_artist=q_artist,
+                    query_title=q_title
+                )
                 title = title or item.title or "Unknown Track"
-                artist = artist or item.uploader or "Unknown Artist"
+                if not artist or is_generic_artist_name(artist):
+                    artist = q_artist if (q_artist and not is_generic_artist_name(q_artist)) else "Unknown Artist"
                 dur_str = item.formatted_duration or ""
 
                 # Пропускаем, если такой трек уже добавлен из кэша
@@ -485,12 +539,25 @@ async def process_inline_download(
             logger.info("INLINE DOWNLOAD START\nresult_id=art_%s", cand_id)
             print(f"INLINE DOWNLOAD START\nresult_id=art_{cand_id}", flush=True)
 
+            # Приоритет обложек: Authoritative/Studio cover > Canonical cover (Deezer/iTunes) > YouTube fallback
+            thumb_to_use = candidate.get("thumbnail_url")
+            if artist and title and (not thumb_to_use or "ytimg.com" in thumb_to_use):
+                try:
+                    canonical = await asyncio.wait_for(
+                        resolve_canonical_track_info_async(f"{artist} {title}"),
+                        timeout=1.5
+                    )
+                    if canonical and canonical.thumbnail_url:
+                        thumb_to_use = canonical.thumbnail_url
+                except Exception as ex:
+                    logger.debug("Inline canonical art lookup skipped or timed out: %s", ex)
+
             req_id = f"inl_{uuid.uuid4().hex[:6]}"
             downloaded = await download_track(
                 query_or_url=candidate["target"],
                 custom_title=title,
                 custom_artist=artist,
-                thumbnail_url=candidate.get("thumbnail_url"),
+                thumbnail_url=thumb_to_use,
                 expected_duration=candidate.get("duration"),
                 request_id=req_id,
                 custom_album=candidate.get("album")

@@ -19,7 +19,7 @@ import yt_dlp
 if 'yt_dlp.YoutubeDL' in sys.modules:
     sys.modules['yt_dlp.YoutubeDL']._get_system_deprecation = lambda: None
 
-from PIL import Image
+from PIL import Image, ImageOps
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
@@ -74,6 +74,7 @@ class DownloadedAudio:
     invocations: Optional[list] = None
     source_title: Optional[str] = None
     source_modifiers: Optional[set] = None
+    cover_path: Optional[Path] = None
 
     def cleanup(self):
         """Удаляет временную папку загрузки и все файлы внутри."""
@@ -180,16 +181,116 @@ def _restore_studio_speed_and_pitch_if_needed(
     return actual_dur
 
 
+def trim_letterbox_black_bars(im: Image.Image, threshold: int = 15) -> Image.Image:
+    """
+    Удаляет искусственные чёрные полосы леттербоксинга (например, 35-50px сверху и снизу
+    в YouTube 4:3 превью hqdefault.jpg 480x360), чтобы обнажить активную область кадра.
+
+    Защитные правила от ложных срабатываний:
+    1. Квадратные (w <= h) и стандартные обложки релизов (Case B, C, D, E) НЕ обрезаются:
+       Леттербоксинг возможен ТОЛЬКО в формате 4:3 (1.30 <= w / h <= 1.36).
+       Форматы 1:1 (1000x1000), 5:4 (1000x800, w/h=1.25), 16:9 (1280x720) и вертикальные гарантированно защищены.
+    2. Полосы должны быть СИММЕТРИЧНЫМИ сверху и снизу и составлять 8%-20% высоты кадра
+       (стандарт размещения 16:9 видео внутри 4:3 кадра YouTube).
+    """
+    w, h = im.size
+    if w <= h or w < 40 or h < 40:
+        return im
+
+    aspect = w / h
+    # Леттербоксинг существует исключительно в 4:3 контейнерах (YouTube hqdefault/sddefault)
+    if not (1.30 <= aspect <= 1.36):
+        return im
+
+    pix = im.load()
+    max_scan = int(h * 0.20)
+    min_bar = int(h * 0.08)
+
+    # Сканируем верхнюю полосу
+    top = 0
+    for y in range(max_scan):
+        if all(sum(pix[x, y]) <= threshold for x in range(0, w, max(1, w // 20))):
+            top = y + 1
+        else:
+            break
+
+    # Сканируем нижнюю полосу
+    bottom = h
+    for y in range(h - 1, h - max_scan, -1):
+        if all(sum(pix[x, y]) <= threshold for x in range(0, w, max(1, w // 20))):
+            bottom = y
+        else:
+            break
+
+    bot_bar = h - bottom
+
+    # Проверяем, что ОБЕ полосы присутствуют, примерно равны (симметрия) и лежат в диапазоне 8-20% высоты
+    if min_bar <= top <= max_scan and min_bar <= bot_bar <= max_scan and abs(top - bot_bar) <= max(6, int(h * 0.03)):
+        return im.crop((0, top, w, bottom))
+
+    return im
+
+
+def make_square_cover(img: Image.Image, max_side: Optional[int] = 320) -> Image.Image:
+    """
+    Приводит изображение к строго квадратному формату 1:1 по принципу:
+    scale to COVER -> center crop -> квадрат.
+    Гарантирует отсутствие искажения aspect ratio и искусственных черных рамок.
+
+    Telegram Bot API для sendAudio допускает thumbnail шириной и высотой до 320px
+    (JPEG, <200 KB).
+    - Для квадратных студийных обложек (1000x1000): пропорциональный downscale до 320x320.
+    - Для YouTube превью после очистки леттербоксинга (480x270):
+      center-crop с сохранением пропорций 1:1 и безопасное приведение к целевому размеру 320x320
+      без искажения/растяжения пропорций (uniform scale).
+    """
+    cleaned = trim_letterbox_black_bars(img)
+    cw, ch = cleaned.size
+    target_side = min(cw, ch)
+    if max_side:
+        if cw >= max_side or ch >= max_side:
+            target_side = max_side
+        elif target_side > max_side:
+            target_side = max_side
+    return ImageOps.fit(cleaned, (target_side, target_side), Image.Resampling.LANCZOS)
+
+
+def _prepare_embedded_cover(raw_path: Path) -> Optional[Path]:
+    """
+    Подготавливает полноразмерную обложку для вшивания в ID3 APIC / MP4 covr:
+    - Сохраняет максимальное разрешение оригинального арта (например 1000x1000, 1400x1400).
+    - Для YouTube превью с леттербоксингом удаляет искусственные чёрные полосы и
+      кадрирует в квадрат (center crop) БЕЗ сжатия до 320px.
+    - Конвертирует в чистый JPEG максимального качества (quality=95).
+    """
+    if not raw_path or not raw_path.exists():
+        return None
+    try:
+        target_path = raw_path.with_name(f"embedded_{raw_path.stem}.jpg")
+        with Image.open(raw_path) as img:
+            rgb_img = img.convert("RGB")
+            # max_side=None: сохраняет полное исходное разрешение
+            square_img = make_square_cover(rgb_img, max_side=None)
+            square_img.save(target_path, "JPEG", quality=95)
+        return target_path
+    except Exception:
+        return raw_path if raw_path.suffix.lower() in [".jpg", ".jpeg"] else None
+
+
 def _convert_thumbnail_to_jpg(thumb_path: Path) -> Optional[Path]:
-    """Конвертирует обложку в формат JPEG (требование Telegram) и сжимает при необходимости."""
+    """
+    Конвертирует обложку в компактный JPEG с максимальным разрешением до 320x320
+    специально для передачи в Telegram Bot API sendAudio (лимит <= 320x320, < 200 KB)
+    с сохранением исходных пропорций через center crop.
+    """
     if not thumb_path or not thumb_path.exists():
         return None
     try:
-        target_path = thumb_path.with_suffix(".jpg")
+        target_path = thumb_path.with_name(f"thumb_{thumb_path.stem}.jpg")
         with Image.open(thumb_path) as img:
             rgb_img = img.convert("RGB")
-            rgb_img.thumbnail((640, 640))
-            rgb_img.save(target_path, "JPEG", quality=85)
+            square_img = make_square_cover(rgb_img, max_side=320)
+            square_img.save(target_path, "JPEG", quality=85)
         return target_path
     except Exception:
         return thumb_path if thumb_path.suffix.lower() in [".jpg", ".jpeg"] else None
@@ -243,18 +344,20 @@ def _apply_custom_metadata(
             from mutagen.id3 import TALB
             id3["TALB"] = TALB(encoding=3, text=album)
 
-        # Вшиваем обложку в тег ID3 APIC
+        # Вшиваем полноразмерную обложку в тег ID3 APIC
         if cover_path and cover_path.exists():
             try:
                 with open(cover_path, "rb") as albumart:
+                    c_data = albumart.read()
+                    mime_type = "image/png" if cover_path.suffix.lower() == ".png" else "image/jpeg"
                     id3.delall("APIC")
                     id3.add(
                         APIC(
                             encoding=3,
-                            mime="image/jpeg",
+                            mime=mime_type,
                             type=3,  # 3 is for album front cover
                             desc="Cover",
-                            data=albumart.read()
+                            data=c_data
                         )
                     )
             except Exception:
@@ -266,22 +369,28 @@ def _apply_custom_metadata(
         pass
 
 
-async def _download_remote_thumbnail(url: str, target_path: Path) -> Optional[Path]:
-    """Скачивает обложку по URL через shared session, если yt-dlp её не предоставил."""
+async def _download_remote_thumbnail(url: str, target_path: Path) -> tuple[Optional[Path], Optional[Path]]:
+    """
+    Скачивает обложку по URL через shared session.
+    Возвращает кортеж: (telegram_thumbnail_320, embedded_highres_cover).
+    - telegram_thumbnail_320: JPEG <= 320x320 специально для отправки в Telegram sendAudio.
+    - embedded_highres_cover: полноразмерный арт (1000x1000) для ID3 APIC / MP4 covr.
+    """
     try:
         session = get_shared_session()
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 data = await resp.read()
-                raw_thumb = target_path.with_suffix(".temp_img")
+                raw_thumb = target_path.with_suffix(".raw_img")
                 raw_thumb.write_bytes(data)
-                jpg_thumb = await asyncio.to_thread(_convert_thumbnail_to_jpg, raw_thumb)
-                if raw_thumb.exists() and raw_thumb != jpg_thumb:
+                highres_cover = await asyncio.to_thread(_prepare_embedded_cover, raw_thumb)
+                tg_thumb = await asyncio.to_thread(_convert_thumbnail_to_jpg, highres_cover or raw_thumb)
+                if raw_thumb.exists() and raw_thumb not in (highres_cover, tg_thumb):
                     raw_thumb.unlink(missing_ok=True)
-                return jpg_thumb
+                return tg_thumb, highres_cover
     except Exception:
         pass
-    return None
+    return None, None
 
 
 
@@ -1369,11 +1478,55 @@ def _sync_download(
     # Находим обложку
     thumb_candidates = list(output_dir.glob("*.webp")) + list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.png"))
     thumbnail_path = None
+    embedded_cover_path = None
     if thumb_candidates:
-        thumbnail_path = _convert_thumbnail_to_jpg(thumb_candidates[0])
+        embedded_cover_path = _prepare_embedded_cover(thumb_candidates[0])
+        thumbnail_path = _convert_thumbnail_to_jpg(embedded_cover_path or thumb_candidates[0])
 
-    extracted_title = _clean_audio_branding(custom_title or info.get("track") or info.get("title") or "Unknown Track")
-    extracted_artist = _clean_audio_branding(custom_artist or info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist")
+    # 1. Authoritative Title: если передан валидный custom_title, YouTube никогда его не подменяет
+    extracted_title = None
+    if custom_title and custom_title.strip():
+        extracted_title = _clean_audio_branding(custom_title.strip())
+
+    # 2. Authoritative Artist: если передан валидный custom_artist, YouTube никогда его не подменяет
+    extracted_artist = None
+    if custom_artist and custom_artist.strip() and not is_generic_artist_name(custom_artist):
+        extracted_artist = _clean_audio_branding(custom_artist.strip())
+
+    # 3. Если artist или title не были заданы через authoritative metadata:
+    if not extracted_artist or not extracted_title:
+        # Проверяем структурированные теги yt-dlp (YouTube Music structured track/artist)
+        yt_track = info.get("track")
+        yt_artist = info.get("artist") or info.get("creator")
+        if yt_artist and is_generic_artist_name(yt_artist):
+            yt_artist = None
+
+        raw_info_title = unicodedata.normalize("NFKC", info.get("title") or "").strip()
+        cand_art_from_title, cand_tit_from_title = None, None
+        for sep in [" - ", " — ", " – ", " -- "]:
+            if sep in raw_info_title:
+                pts = raw_info_title.split(sep, 1)
+                a_cand = _clean_audio_branding(pts[0].strip())
+                t_cand = _clean_audio_branding(pts[1].strip())
+                if a_cand and not is_generic_artist_name(a_cand):
+                    cand_art_from_title = a_cand
+                    cand_tit_from_title = t_cand
+                    break
+
+        if not extracted_artist:
+            if yt_artist and not is_generic_artist_name(yt_artist):
+                extracted_artist = _clean_audio_branding(yt_artist)
+            elif cand_art_from_title:
+                extracted_artist = cand_art_from_title
+            else:
+                raw_up = (info.get("uploader") or info.get("channel") or "").replace(" - Topic", "").replace("- Topic", "").replace(" – Topic", "").strip()
+                if raw_up and not is_generic_artist_name(raw_up):
+                    extracted_artist = _clean_audio_branding(raw_up)
+                else:
+                    extracted_artist = "Unknown Artist"
+
+        if not extracted_title:
+            extracted_title = _clean_audio_branding(yt_track or cand_tit_from_title or raw_info_title or "Unknown Track")
 
     raw_source_title = info.get("_source_title") or info.get("title") or info.get("track") or extracted_title
     source_title = _clean_audio_branding(raw_source_title) or raw_source_title
@@ -1408,7 +1561,7 @@ def _sync_download(
                 )
 
     t_tag0 = time.perf_counter()
-    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, thumbnail_path, album=custom_album)
+    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, embedded_cover_path or thumbnail_path, album=custom_album)
     perf_timings["tags"] = time.perf_counter() - t_tag0
 
     return DownloadedAudio(
@@ -1422,7 +1575,8 @@ def _sync_download(
         perf_timings=perf_timings,
         invocations=invocations,
         source_title=source_title,
-        source_modifiers=source_modifiers
+        source_modifiers=source_modifiers,
+        cover_path=embedded_cover_path or thumbnail_path
     )
 
 
@@ -1435,6 +1589,40 @@ def _clean_audio_branding(text: Optional[str]) -> Optional[str]:
     text = re.sub(r'\s+(?:on|в|sur|en|auf|su)\s+Apple\s*Music.*$', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s*Apple\s*Music.*$', '', text, flags=re.IGNORECASE)
     return text.strip()
+
+
+GENERIC_ARTIST_NAMES = {
+    "release",
+    "various artists",
+    "various artists - topic",
+    "various artists – topic",
+    "various artists — topic",
+    "release - topic",
+    "release – topic",
+    "release — topic",
+    "top tracks",
+    "vevo",
+    "official audio",
+    "soundcloud",
+    "youtube",
+    "topics",
+    "topic",
+    "тема",
+    "различные исполнители",
+    "unknown artist",
+}
+
+
+def is_generic_artist_name(name: Optional[str]) -> bool:
+    """
+    Проверяет, является ли переданная строка служебным/техническим каналом YouTube/дистрибьютора,
+    который ни при каких обстоятельствах не должен становиться музыкальным исполнителем трека.
+    """
+    if not name:
+        return True
+    cleaned = _clean_audio_branding(name).strip().lower()
+    cleaned = re.sub(r'[-\s–—]+', ' ', cleaned).strip()
+    return cleaned in GENERIC_ARTIST_NAMES or cleaned.endswith(" topic") or cleaned.endswith(" тема")
 
 
 def _build_fallback_queries(
@@ -1556,10 +1744,13 @@ async def download_track(
 
         if thumb_task:
             try:
-                downloaded_thumb = await thumb_task
+                downloaded_thumb, highres_cover = await thumb_task
                 if downloaded_thumb and downloaded_thumb.exists():
                     audio.thumbnail_path = downloaded_thumb
-                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path, album=custom_album)
+                cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
+                if cover_to_embed and cover_to_embed.exists():
+                    audio.cover_path = cover_to_embed
+                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album)
             except Exception:
                 pass
 
@@ -1622,10 +1813,13 @@ async def download_track(
 
                 if thumb_task:
                     try:
-                        downloaded_thumb = await thumb_task
+                        downloaded_thumb, highres_cover = await thumb_task
                         if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                             audio.thumbnail_path = downloaded_thumb
-                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path, album=custom_album)
+                        cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
+                        if cover_to_embed and cover_to_embed.exists():
+                            audio.cover_path = cover_to_embed
+                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album)
                     except Exception:
                         pass
                 if audio.thumbnail_path and not audio.thumbnail_path.exists():
@@ -1668,10 +1862,13 @@ async def download_track(
 
                     if thumb_task:
                         try:
-                            downloaded_thumb = await thumb_task
+                            downloaded_thumb, highres_cover = await thumb_task
                             if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                                 audio.thumbnail_path = downloaded_thumb
-                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path, album=custom_album)
+                            cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
+                            if cover_to_embed and cover_to_embed.exists():
+                                audio.cover_path = cover_to_embed
+                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album)
                         except Exception:
                             pass
                     if audio.thumbnail_path and not audio.thumbnail_path.exists():

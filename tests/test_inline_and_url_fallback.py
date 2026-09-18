@@ -425,7 +425,8 @@ async def test_chosen_inline_result_triggers_download_task():
     mock_dl.cleanup = MagicMock()
     mock_dl.thumbnail_path = None
 
-    with patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)) as dl_mock:
+    with patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)) as dl_mock, \
+         patch("handlers.inline.resolve_canonical_track_info_async", AsyncMock(return_value=None)):
         await handle_chosen_inline_result(chosen, mock_bot)
         # Даем фоновой задаче выполниться
         await asyncio.sleep(0.1)
