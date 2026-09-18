@@ -24,10 +24,17 @@ BOT_VERSION = "3.0.0"
 
 # Настройки прокси или зеркала Telegram Bot API (актуально при блокировках провайдером)
 PROXY = os.getenv("PROXY")
-# Отдельный прокси для YouTube (поддерживает HTTP/HTTPS/SOCKS5), с fallback на общий PROXY
+# Отдельный прокси для YouTube и иностранных сервисов (поддерживает HTTP/HTTPS/SOCKS5), с fallback на общий PROXY
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY") or PROXY
+# Российский прокси для региональных сервисов (Яндекс Музыка, ВКонтакте)
+RUSSIAN_PROXY = os.getenv("RUSSIAN_PROXY")
 # VLESS / Happ VPN ссылка или подписка для автоматического локального SOCKS5-прокси через sing-box
 VLESS_URL = os.getenv("VLESS_URL") or os.getenv("YOUTUBE_VLESS_URL")
+VLESS_RU_URL = os.getenv("VLESS_RU_URL") or os.getenv("RUSSIAN_VLESS_URL")
+
+# Токены авторизации для расширенного доступа к региональным сервисам
+YANDEX_MUSIC_TOKEN = os.getenv("YANDEX_MUSIC_TOKEN")
+VK_TOKEN = os.getenv("VK_TOKEN")
 
 
 def get_sanitized_proxy_info(proxy_url: Optional[str]) -> str:

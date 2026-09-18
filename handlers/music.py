@@ -424,7 +424,7 @@ async def _execute_download_and_send(
             cached = await get_cached_track_async(f"{track_info.artist} - {track_info.title}".lower(), variant=variant)
         t_cache = time.perf_counter() - t_c0
 
-        is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "vk.com", "tiktok.com")))
+        is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "vk.com", "vk.ru", "tiktok.com", "music.yandex.", "ya.cc", "yandex.")))
         has_canonical_dur = bool(track_info.duration and track_info.duration > 35)
         is_apple_music = bool(track_info and track_info.platform in ("Apple Music", "Spotify", "Canonical/Deezer", "Canonical/iTunes"))
         is_text_input = bool(not url)
@@ -700,24 +700,17 @@ async def _execute_download_and_send(
         print(f"[MUSIC][request_id={req_id}] ERROR at processing: {e}\n{traceback.format_exc()}", flush=True)
         logger.exception("Ошибка при обработке запроса %s", url or raw_query)
         err_str = str(e)
-        if "Яндекс Музык" in err_str:
-            user_friendly = (
-                "<b>Прямые ссылки Яндекс Музыки не поддерживаются.</b>\n\n"
-                "Из-за региональных ограничений хостинга загрузка по прямым ссылкам недоступна.\n\n"
-                "Отправьте автора и название трека текстом."
-            )
-        elif "ВК Музык" in err_str or "vk.com" in err_str:
-            user_friendly = (
-                "<b>Прямые ссылки ВКонтакте не поддерживаются.</b>\n\n"
-                "Отправьте автора и название трека текстом."
-            )
-        elif "drm protected" in err_str.lower() or "is drm protected" in err_str.lower():
+        if "drm protected" in err_str.lower() or "is drm protected" in err_str.lower():
             user_friendly = (
                 "<b>Этот трек защищен DRM (SoundCloud Go+).</b>\n\n"
                 "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
             )
+        elif err_str.startswith("⚠️"):
+            # Информативные пользовательские сообщения (превью Яндекс Плюс, отсутствие токена VK и др.)
+            user_friendly = err_str
         else:
             user_friendly = f"<b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
+
         try:
             if status_msg:
                 await status_msg.edit_text(user_friendly, parse_mode="HTML")

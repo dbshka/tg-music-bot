@@ -570,16 +570,35 @@ def _sync_download(
         },
     }
 
-    # Клиенты YouTube:
-    is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
+    # Источники и прокси:
+    is_soundcloud = query_or_url.startswith("scsearch") or "soundcloud.com" in query_or_url
+    is_direct_stream = any(d in query_or_url for d in ("strm.yandex.net", "yandex.net", "vkuser.net", "vkuseraudio.net", "userapi.com"))
+    is_youtube = not is_soundcloud and not is_direct_stream
 
     yt_proxy = get_current_youtube_proxy()
-    if is_youtube and yt_proxy:
-        ydl_opts["proxy"] = yt_proxy
-        print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+    if any(d in query_or_url for d in ("strm.yandex.net", "yandex.net")):
+        dl_src = "yandex"
+    elif any(d in query_or_url for d in ("vkuser.net", "vkuseraudio.net", "userapi.com")):
+        dl_src = "vk"
     elif is_youtube:
+        dl_src = "youtube"
+    elif is_soundcloud:
+        dl_src = "soundcloud"
+    else:
+        dl_src = "direct"
+
+    proxy_dl_label = "FOREIGN" if yt_proxy and (is_youtube or is_direct_stream) else ("NONE" if is_soundcloud else "DIRECT")
+    print(f"{req_tag}[PROXY] source={dl_src} stage=download proxy={proxy_dl_label}", flush=True)
+
+    if (is_youtube or is_direct_stream) and yt_proxy:
+        ydl_opts["proxy"] = yt_proxy
+        srv_name = "CDN stream" if is_direct_stream else "YouTube"
+        print(f"{req_tag}[DOWNLOADER] {srv_name} proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+    elif is_youtube or is_direct_stream:
         ydl_opts.pop("proxy", None)
-        print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
+        srv_name = "CDN stream" if is_direct_stream else "YouTube"
+        print(f"{req_tag}[DOWNLOADER] {srv_name} proxy disabled", flush=True)
+
 
     if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
@@ -596,6 +615,7 @@ def _sync_download(
             }
         }
         print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиент android)", flush=True)
+
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
 
@@ -1242,12 +1262,28 @@ def _sync_download(
             is_direct_yt = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
             if is_direct_yt:
                 yt_proxy = get_current_youtube_proxy()
+                if any(d in query_or_url for d in ("strm.yandex.net", "yandex.net")):
+                    dl_src = "yandex"
+                elif any(d in query_or_url for d in ("vkuser.net", "vkuseraudio.net", "userapi.com")):
+                    dl_src = "vk"
+                elif "youtube.com" in query_or_url or "youtu.be" in query_or_url:
+                    dl_src = "youtube"
+                else:
+                    dl_src = "direct"
+                proxy_label = "FOREIGN" if yt_proxy else "DIRECT"
+                print(f"{req_tag}[PROXY] source={dl_src} stage=download proxy={proxy_label}", flush=True)
+
                 if yt_proxy:
                     dl_opts["proxy"] = yt_proxy
-                    print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+                    print(f"{req_tag}[DOWNLOADER] Direct stream proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
                 else:
                     dl_opts.pop("proxy", None)
-                    print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
+                    print(f"{req_tag}[DOWNLOADER] Direct stream proxy disabled", flush=True)
+                if any(d in query_or_url for d in ("strm.yandex.net", "yandex.net", "vkuser.net", "vkuseraudio.net", "userapi.com")):
+                    dl_opts.pop("cookiefile", None)
+                    dl_opts.pop("extractor_args", None)
+
+
             hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
             def p_hook(d):
                 if cancel_event and cancel_event.is_set():

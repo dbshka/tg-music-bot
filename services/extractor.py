@@ -30,6 +30,7 @@ from services.identity import (
     VariantIdentity
 )
 from services.security import is_safe_url, safe_unshorten_url
+from services.yandex_vk import resolve_yandex_music_track, resolve_vk_music_track
 
 logger = logging.getLogger(__name__)
 
@@ -853,12 +854,17 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
                 "💡 Пожалуйста, отправьте ссылку на конкретный трек."
             )
 
-    # 1. Яндекс Музыка (прямые ссылки отключены из-за геоблока хостинга)
+    # 1. Яндекс Музыка (двухэтапный resolve через российский VLESS-маршрут)
     if "music.yandex." in domain or "ya.cc" in domain or ("yandex." in domain and ("/album" in url or "/track" in url or "/artist" in url or "/playlists" in url)):
-        raise ValueError(
-            "Загрузка по прямым ссылкам Яндекс Музыки отключена из-за региональных ограничений хостинга.\n\n"
-            "💡 Пожалуйста, отправьте название трека или исполнителя текстом (например: Gazan — 67). "
-            "Бот моментально найдёт и пришлёт MP3!"
+        res = await resolve_yandex_music_track(url, session)
+        return ExtractedTrack(
+            platform=res["platform"],
+            target=res["target"],
+            is_search=res["is_search"],
+            title=res["title"],
+            artist=res["artist"],
+            thumbnail_url=res["thumbnail_url"],
+            duration=res["duration"]
         )
 
     # 2. Spotify
@@ -891,12 +897,17 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
         platform_name = "YouTube / YouTube Music"
     elif "soundcloud.com" in domain:
         platform_name = "SoundCloud"
-    elif "vk.com" in domain:
+    elif "vk.com" in domain or "vk.ru" in domain:
         if "/audio" in url or "/music" in url or "z=audio" in url:
-            raise ValueError(
-                "Загрузка по прямым ссылкам ВК Музыки не поддерживается (ВКонтакте закрыл доступ к аудио для внешних серверов без авторизации).\n\n"
-                "💡 Пожалуйста, отправьте название трека или исполнителя текстом (например: MiyaGi — Captain). "
-                "Бот моментально найдёт и пришлёт MP3!"
+            res = await resolve_vk_music_track(url, session)
+            return ExtractedTrack(
+                platform=res["platform"],
+                target=res["target"],
+                is_search=res["is_search"],
+                title=res["title"],
+                artist=res["artist"],
+                thumbnail_url=res["thumbnail_url"],
+                duration=res["duration"]
             )
         platform_name = "VK Видео"
     elif "bandcamp.com" in domain:
@@ -909,4 +920,3 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
         target=url,
         is_search=False
     )
-

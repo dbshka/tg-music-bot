@@ -174,12 +174,13 @@ async def main():
                 "• Spotify\n"
                 "• Apple Music\n"
                 "• YouTube / YouTube Music\n"
-                "• SoundCloud\n\n"
-                "Другие платформы не поддерживаются (Яндекс Музыка и VK недоступны из-за региональных ограничений хостинга)."
+                "• SoundCloud\n"
+                "• Яндекс Музыка\n"
+                "• ВКонтакте (VK Музыка)\n"
             )
             await bot.set_my_description(description=bot_description)
             await bot.set_my_short_description(
-                short_description="Скачивание музыки из Spotify, Apple Music, YouTube и SoundCloud в формате MP3/M4A с редактором тегов."
+                short_description="Скачивание музыки из Spotify, Apple Music, YouTube, SoundCloud, Яндекс Музыки и VK в MP3/M4A."
             )
         except Exception as e:
             logger.debug("Не удалось обновить меню команд и описание: %s", e)
@@ -204,7 +205,7 @@ async def main():
     except Exception as e:
         logger.exception("Непредвиденная ошибка при работе бота: %s", e)
     finally:
-        stop_vless_proxy(vless_proc)
+        stop_vless_proxy()
         if runner:
             await runner.cleanup()
         await close_shared_session()

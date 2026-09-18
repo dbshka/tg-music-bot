@@ -181,6 +181,21 @@ def normalize_cache_key(query: str) -> str:
                 if m_digits:
                     return f"applemusic:{m_digits.group(1)}"
 
+            # Yandex Music track ID
+            elif "music.yandex." in netloc or "yandex." in netloc:
+                m_track = re.search(r'/track/(\d+)', parsed.path)
+                if m_track:
+                    return f"yandex:{m_track.group(1)}"
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "track" in qs and qs["track"]:
+                    return f"yandex:{qs['track'][0]}"
+
+            # VK Music audio ID
+            elif "vk.com" in netloc or "vk.ru" in netloc:
+                m_vk = re.search(r'audio(-?\d+)_(\d+)', parsed.path + "?" + parsed.query)
+                if m_vk:
+                    return f"vk:{m_vk.group(1)}_{m_vk.group(2)}"
+
             # Общий случай для URL: scheme и host в lowercase, путь с сохранением регистра
             clean_url = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}".rstrip("/")
             return clean_url

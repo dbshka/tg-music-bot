@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 SINGBOX_VERSION = "1.10.7"
 DEFAULT_SOCKS_HOST = "127.0.0.1"
-DEFAULT_SOCKS_PORT = 10808
+FOREIGN_SOCKS_PORT = 10808
+RUSSIAN_SOCKS_PORT = 10809
+DEFAULT_SOCKS_PORT = FOREIGN_SOCKS_PORT
 
 
 def is_valid_remote_server(server: str, port: int) -> bool:
@@ -398,32 +400,32 @@ def verify_outbound_connectivity(socks_host: str, socks_port: int, timeout: floa
         return False, str(e)
 
 
+_foreign_process: Optional[subprocess.Popen] = None
+_russian_process: Optional[subprocess.Popen] = None
 _active_process: Optional[subprocess.Popen] = None
 
 
-def start_vless_proxy(
-    vless_input: Optional[str] = None,
+def _start_singbox_instance(
+    name: str,
+    raw_link: str,
     socks_host: str = DEFAULT_SOCKS_HOST,
     socks_port: int = DEFAULT_SOCKS_PORT,
+    config_filename: str = "singbox.json",
     timeout_secs: float = 6.0
 ) -> Optional[subprocess.Popen]:
     """
-    Запускает sing-box SOCKS5 прокси из VLESS ссылки или подписки.
-    Строго проверяет:
-    1. Что сервер ноды не является заглушкой 0.0.0.0 / 127.0.0.1.
-    2. Что процесс sing-box запустился и открыл порт (SOCKS5 listener started).
-    3. Что через туннель проходит реальный трафик в интернет (VLESS outbound connection established).
-    Обновляет config.YOUTUBE_PROXY ТОЛЬКО при успешном прохождении проверок.
+    Запускает отдельный процесс sing-box с указанной конфигурацией и портом.
+    Проверяет:
+    1. Валидность сервера (не заглушка 0.0.0.0 / 127.0.0.1).
+    2. Доступность локального SOCKS5 порта.
+    3. Фактическое соединение с интернетом через данный VLESS outbound.
     """
-    global _active_process
-
-    raw_link = vless_input or getattr(config, "VLESS_URL", None) or os.getenv("VLESS_URL") or os.getenv("YOUTUBE_VLESS_URL")
     if not raw_link:
         return None
 
     bin_path = ensure_singbox_binary()
     if not bin_path:
-        print("[VLESS] ❌ Бинарник sing-box не найден в системе. Прокси VLESS не запущен.", flush=True)
+        print(f"[VLESS-{name}] ❌ Бинарник sing-box не найден в системе. Прокси не запущен.", flush=True)
         return None
 
     try:
@@ -431,25 +433,24 @@ def start_vless_proxy(
         summary = get_sanitized_outbound_summary(outbound)
         server_info = f"{summary['server']}:{summary['server_port']}"
 
-        # Детальная санитизированная сводка конфигурации перед стартом
-        print(f"[VLESS] Конфигурация sing-box outbound:", flush=True)
-        print(f"[VLESS]   * type: {summary['outbound_type']}", flush=True)
-        print(f"[VLESS]   * server: {summary['server']}:{summary['server_port']}", flush=True)
-        print(f"[VLESS]   * security: {summary['security']}", flush=True)
-        print(f"[VLESS]   * transport: {summary['transport_type']}", flush=True)
-        print(f"[VLESS]   * tls_enabled: {summary['tls_enabled']}", flush=True)
-        print(f"[VLESS]   * reality_enabled: {summary['reality_enabled']}", flush=True)
-        print(f"[VLESS]   * flow: {summary['flow']}", flush=True)
+        print(f"[VLESS-{name}] Конфигурация sing-box outbound:", flush=True)
+        print(f"[VLESS-{name}]   * type: {summary['outbound_type']}", flush=True)
+        print(f"[VLESS-{name}]   * server: {summary['server']}:{summary['server_port']}", flush=True)
+        print(f"[VLESS-{name}]   * security: {summary['security']}", flush=True)
+        print(f"[VLESS-{name}]   * transport: {summary['transport_type']}", flush=True)
+        print(f"[VLESS-{name}]   * tls_enabled: {summary['tls_enabled']}", flush=True)
+        print(f"[VLESS-{name}]   * reality_enabled: {summary['reality_enabled']}", flush=True)
+        print(f"[VLESS-{name}]   * flow: {summary['flow']}", flush=True)
 
         sb_config = build_singbox_config(outbound, socks_host=socks_host, socks_port=socks_port)
 
         config_dir = BASE_DIR / ".bin"
         config_dir.mkdir(parents=True, exist_ok=True)
-        config_file = config_dir / "singbox.json"
+        config_file = config_dir / config_filename
         with open(config_file, "w", encoding="utf-8") as f:
             json.dump(sb_config, f, indent=2)
 
-        print(f"[VLESS] Запуск процесса sing-box на {socks_host}:{socks_port}...", flush=True)
+        print(f"[VLESS-{name}] Запуск процесса sing-box на {socks_host}:{socks_port}...", flush=True)
         proc = subprocess.Popen(
             [str(bin_path), "run", "-c", str(config_file)],
             stdout=subprocess.DEVNULL,
@@ -464,7 +465,7 @@ def start_vless_proxy(
         while time.time() - start_t < timeout_secs:
             if proc.poll() is not None:
                 err = proc.stderr.read() if proc.stderr else "unknown error"
-                print(f"[VLESS] ❌ Ошибка: процесс sing-box завершился преждевременно: {err}", flush=True)
+                print(f"[VLESS-{name}] ❌ Ошибка: процесс sing-box завершился преждевременно: {err}", flush=True)
                 return None
             if is_port_open(socks_host, socks_port):
                 listener_ready = True
@@ -472,68 +473,219 @@ def start_vless_proxy(
             time.sleep(0.2)
 
         if not listener_ready:
-            print(f"[VLESS] ⚠️ sing-box не открыл порт SOCKS5 за {timeout_secs}с на {socks_host}:{socks_port}", flush=True)
-            stop_vless_proxy(proc)
+            print(f"[VLESS-{name}] ⚠️ sing-box не открыл порт SOCKS5 за {timeout_secs}с на {socks_host}:{socks_port}", flush=True)
+            _stop_process_internal(proc, config_filename)
             return None
 
-        print(f"[VLESS] SOCKS5 listener started on {socks_host}:{socks_port} (локальный демон готов к приёму соединений)", flush=True)
+        print(f"[VLESS-{name}] SOCKS5 listener started on {socks_host}:{socks_port} (локальный демон готов к приёму соединений)", flush=True)
 
         # 2. Проверка реального outbound-соединения в интернет через VLESS
         outbound_ok, ext_info = verify_outbound_connectivity(socks_host, socks_port, timeout=5.0)
         if outbound_ok:
-            proxy_url = f"socks5://{socks_host}:{socks_port}"
-            config.YOUTUBE_PROXY = proxy_url
-            try:
-                import services.downloader
-                services.downloader.YOUTUBE_PROXY = proxy_url
-            except (ImportError, AttributeError):
-                pass
-            _active_process = proc
-            print(f"[VLESS] ✅ VLESS outbound connection established! Внешний выходной IP: {ext_info} (сервер: {server_info})", flush=True)
+            print(f"[VLESS-{name}] ✅ VLESS outbound connection established! Внешний выходной IP: {ext_info} (сервер: {server_info})", flush=True)
             return proc
         else:
-            print(f"[VLESS] ⚠️ VLESS outbound connection NOT established ({ext_info}). Удалённый сервер {server_info} не отвечает.", flush=True)
-            print("[VLESS] Отключение неработающего прокси во избежание сбоев скачивания.", flush=True)
-            stop_vless_proxy(proc)
+            print(f"[VLESS-{name}] ⚠️ VLESS outbound connection NOT established ({ext_info}). Удалённый сервер {server_info} не отвечает.", flush=True)
+            print(f"[VLESS-{name}] Отключение неработающего прокси во избежание сбоев.", flush=True)
+            _stop_process_internal(proc, config_filename)
             return None
 
     except Exception as e:
-        print(f"[VLESS] ❌ Ошибка инициализации VLESS: {e}", flush=True)
+        print(f"[VLESS-{name}] ❌ Ошибка инициализации: {e}", flush=True)
         return None
 
 
-def stop_vless_proxy(proc: Optional[subprocess.Popen] = None) -> None:
-    """Корректно останавливает процесс sing-box и удаляет временный конфиг."""
-    global _active_process
-    target = proc or _active_process
-    if target and target.poll() is None:
-        print("[VLESS] Остановка sing-box процесса...", flush=True)
+def _stop_process_internal(proc: Optional[subprocess.Popen], config_filename: Optional[str] = None) -> None:
+    """Вспомогательная функция для корректной остановки процесса и удаления его конфига."""
+    if proc and proc.poll() is None:
         try:
-            target.terminate()
-            target.wait(timeout=3)
+            proc.terminate()
+            proc.wait(timeout=3)
         except Exception:
             try:
-                target.kill()
+                proc.kill()
             except Exception:
                 pass
-    if target == _active_process:
-        _active_process = None
+    if config_filename:
+        try:
+            cfg_file = BASE_DIR / ".bin" / config_filename
+            cfg_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-    # Сброс прокси в config и downloader
-    config.YOUTUBE_PROXY = None
+
+def start_foreign_vless_proxy(
+    vless_input: Optional[str] = None,
+    socks_host: str = DEFAULT_SOCKS_HOST,
+    socks_port: int = FOREIGN_SOCKS_PORT,
+    timeout_secs: float = 6.0
+) -> Optional[subprocess.Popen]:
+    """Запускает Foreign sing-box инстанс для YouTube/зарубежных сервисов."""
+    global _foreign_process, _active_process
+
+    raw_link = vless_input or getattr(config, "VLESS_URL", None) or os.getenv("VLESS_URL") or os.getenv("YOUTUBE_VLESS_URL")
+    if not raw_link:
+        return None
+
+    proc = _start_singbox_instance(
+        name="Foreign",
+        raw_link=raw_link,
+        socks_host=socks_host,
+        socks_port=socks_port,
+        config_filename="singbox.json",
+        timeout_secs=timeout_secs
+    )
+    if proc:
+        proxy_url = f"socks5://{socks_host}:{socks_port}"
+        config.YOUTUBE_PROXY = proxy_url
+        try:
+            import services.downloader
+            services.downloader.YOUTUBE_PROXY = proxy_url
+        except (ImportError, AttributeError):
+            pass
+        _foreign_process = proc
+        _active_process = proc
+    return proc
+
+
+def start_russian_vless_proxy(
+    vless_input: Optional[str] = None,
+    socks_host: str = DEFAULT_SOCKS_HOST,
+    socks_port: int = RUSSIAN_SOCKS_PORT,
+    timeout_secs: float = 6.0
+) -> Optional[subprocess.Popen]:
+    """Запускает Russian sing-box инстанс для разрешения метаданных Яндекс Музыки и VK."""
+    global _russian_process
+
+    raw_link = vless_input or getattr(config, "VLESS_RU_URL", None) or os.getenv("VLESS_RU_URL") or os.getenv("RUSSIAN_VLESS_URL")
+    if not raw_link:
+        return None
+
+    proc = _start_singbox_instance(
+        name="Russian",
+        raw_link=raw_link,
+        socks_host=socks_host,
+        socks_port=socks_port,
+        config_filename="singbox_russian.json",
+        timeout_secs=timeout_secs
+    )
+    if proc:
+        proxy_url = f"socks5://{socks_host}:{socks_port}"
+        config.RUSSIAN_PROXY = proxy_url
+        _russian_process = proc
+    return proc
+
+
+def start_vless_proxy(
+    vless_input: Optional[str] = None,
+    socks_host: str = DEFAULT_SOCKS_HOST,
+    socks_port: int = DEFAULT_SOCKS_PORT,
+    timeout_secs: float = 6.0
+) -> Optional[subprocess.Popen]:
+    """
+    Запускает VLESS прокси (Foreign для YouTube и, при наличии VLESS_RU_URL, Russian для Yandex/VK).
+    Возвращает процесс основного (Foreign) инстанса sing-box.
+    """
+    foreign_proc = start_foreign_vless_proxy(
+        vless_input=vless_input,
+        socks_host=socks_host,
+        socks_port=socks_port,
+        timeout_secs=timeout_secs
+    )
+
+    # При штатном запуске бота (без явного vless_input) также запускаем российский VLESS, если задан
+    if vless_input is None:
+        ru_link = getattr(config, "VLESS_RU_URL", None) or os.getenv("VLESS_RU_URL") or os.getenv("RUSSIAN_VLESS_URL")
+        if ru_link:
+            try:
+                start_russian_vless_proxy(socks_host=socks_host, socks_port=RUSSIAN_SOCKS_PORT, timeout_secs=timeout_secs)
+            except Exception as e:
+                print(f"[VLESS-Russian] ⚠️ Ошибка автозапуска российского VLESS: {e}", flush=True)
+
+    return foreign_proc
+
+
+def stop_vless_proxy(proc: Optional[subprocess.Popen] = None) -> None:
+    """Корректно останавливает указанный или все запущенные sing-box процессы."""
+    global _foreign_process, _russian_process, _active_process
+
+    # Если передан конкретный процесс
+    if proc is not None:
+        if proc == _foreign_process or proc == _active_process:
+            print("[VLESS-Foreign] Остановка sing-box процесса...", flush=True)
+            _stop_process_internal(proc, "singbox.json")
+            _foreign_process = None
+            _active_process = None
+            config.YOUTUBE_PROXY = None
+            try:
+                import services.downloader
+                services.downloader.YOUTUBE_PROXY = None
+            except (ImportError, AttributeError):
+                pass
+        elif proc == _russian_process:
+            print("[VLESS-Russian] Остановка sing-box процесса...", flush=True)
+            _stop_process_internal(proc, "singbox_russian.json")
+            _russian_process = None
+            config.RUSSIAN_PROXY = None
+        else:
+            _stop_process_internal(proc)
+        return
+
+    # Если proc не передан — останавливаем все активные инстансы
+    if _foreign_process:
+        print("[VLESS-Foreign] Остановка sing-box процесса...", flush=True)
+        _stop_process_internal(_foreign_process, "singbox.json")
+        _foreign_process = None
+        _active_process = None
+        config.YOUTUBE_PROXY = None
+        try:
+            import services.downloader
+            services.downloader.YOUTUBE_PROXY = None
+        except (ImportError, AttributeError):
+            pass
+
+    if _russian_process:
+        print("[VLESS-Russian] Остановка sing-box процесса...", flush=True)
+        _stop_process_internal(_russian_process, "singbox_russian.json")
+        _russian_process = None
+        config.RUSSIAN_PROXY = None
+
+
+def get_foreign_proxy() -> Optional[str]:
+    """Возвращает актуальный Foreign прокси для YouTube, Spotify, Apple, SoundCloud и скачивания медиа."""
+    cfg = getattr(config, "YOUTUBE_PROXY", None)
+    if cfg:
+        return cfg
     try:
         import services.downloader
-        services.downloader.YOUTUBE_PROXY = None
-    except (ImportError, AttributeError):
-        pass
-
-    # Очистка временного файла конфигурации sing-box
-    try:
-        cfg_file = BASE_DIR / ".bin" / "singbox.json"
-        cfg_file.unlink(missing_ok=True)
+        return getattr(services.downloader, "YOUTUBE_PROXY", None)
     except Exception:
-        pass
+        return None
 
 
-# Автоматическая очистка процесса при завершении работы интерпретатора Python
+def get_russian_proxy() -> Optional[str]:
+    """Возвращает актуальный Russian прокси для разрешения метаданных Яндекс Музыки и VK."""
+    return getattr(config, "RUSSIAN_PROXY", None)
+
+
+def get_proxy_for_source(source: str, stage: str = "download") -> Optional[str]:
+    """
+    Интеллектуальная маршрутизация прокси по источнику и фазе запроса:
+    - stage="resolve":
+        * Яндекс Музыка и VK -> Russian proxy (локальный порт 10809 или RUSSIAN_PROXY)
+        * YouTube, Spotify, Apple, SoundCloud -> Foreign proxy
+    - stage="download":
+        * Все источники (включая стриминг треков Яндекс Музыки и VK с CDN) -> Foreign proxy
+    """
+    src = (source or "").lower()
+    if stage == "resolve":
+        if any(k in src for k in ("yandex", "ya.cc", "vk")):
+            return get_russian_proxy()
+        return get_foreign_proxy()
+    elif stage == "download":
+        return get_foreign_proxy()
+    return None
+
+
+# Автоматическая очистка процессов при завершении работы интерпретатора Python
 atexit.register(stop_vless_proxy)
