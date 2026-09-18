@@ -10,7 +10,7 @@ from services.extractor import (
 from handlers.inline import (
     _parse_candidate_title_artist,
     handle_inline_query,
-    handle_inline_download,
+    process_inline_download,
     _in_flight_downloads,
     _in_flight_lock,
 )
@@ -200,7 +200,8 @@ async def test_inline_query_never_downloads_audio():
         assert "Daft Punk" in art.description
         assert art.reply_markup is not None
         btn = art.reply_markup.inline_keyboard[0][0]
-        assert btn.callback_data.startswith("inldl:")
+        assert btn.callback_data.startswith("inl_status:")
+        assert btn.text == "⏳ Подготавливается..."
 
 
 # ============================================================================
@@ -211,23 +212,32 @@ async def test_inline_query_never_downloads_audio():
 async def test_inline_download_deduplication():
     """
     Проверяет защиту от дублирующих загрузок:
-    Множественные быстрые клики по одной и той же кнопке вызывают download_track ровно 1 раз.
+    Параллельный выбор одного и того же трека вызывает download_track ровно 1 раз,
+    а оба inline-сообщения получают готовый file_id через edit_message_media.
     """
+    from handlers.inline import process_inline_download
+    import uuid
     init_db()
-    cand_id = "dedup_test_cand"
+    unique_suffix = uuid.uuid4().hex[:8]
+    cand_id = f"dedup_{unique_suffix}"
+    target_url = f"https://www.youtube.com/watch?v=dedup_{unique_suffix}"
+    title_str = f"Dedup Track {unique_suffix}"
+    artist_str = f"Dedup Artist {unique_suffix}"
+
     save_inline_candidate(
         cand_id=cand_id,
-        target="https://www.youtube.com/watch?v=deduptest",
-        title="Dedup Track",
-        artist="Dedup Artist",
+        target=target_url,
+        title=title_str,
+        artist=artist_str,
         album=None,
         duration=180,
         thumbnail_url=None
     )
 
     mock_downloaded = MagicMock()
-    mock_downloaded.title = "Dedup Track"
-    mock_downloaded.artist = "Dedup Artist"
+    mock_downloaded.title = title_str
+    mock_downloaded.artist = artist_str
+    mock_downloaded.duration = 180
     mock_downloaded.file_path = MagicMock()
     mock_downloaded.file_path.exists.return_value = True
     mock_downloaded.cleanup = MagicMock()
@@ -245,37 +255,39 @@ async def test_inline_download_deduplication():
     mock_bot.edit_message_text = AsyncMock()
     mock_bot.edit_message_media = AsyncMock()
     mock_msg = MagicMock()
-    mock_msg.audio.file_id = "file_id_dedup_123"
+    mock_msg.audio.file_id = "CQACAgIAAxkBAAIBZ2f1234567890abcdefghijklmnopqrstuvwxyz"
+    mock_msg.message_id = 777
     mock_bot.send_audio = AsyncMock(return_value=mock_msg)
-
-    # Клиент 1 (первый клик)
-    cb1 = MagicMock()
-    cb1.data = f"inldl:{cand_id}"
-    cb1.inline_message_id = "inline_msg_123"
-    cb1.message = None
-    cb1.from_user.id = 111111
-    cb1.answer = AsyncMock()
-
-    # Клиент 2 (быстрый повторный клик в той же группе)
-    cb2 = MagicMock()
-    cb2.data = f"inldl:{cand_id}"
-    cb2.inline_message_id = "inline_msg_123"
-    cb2.message = None
-    cb2.from_user.id = 222222
-    cb2.answer = AsyncMock()
+    mock_bot.delete_message = AsyncMock()
 
     with patch("handlers.inline.download_track", side_effect=slow_download):
-        # Запускаем два параллельных клика одновременно
-        task1 = asyncio.create_task(handle_inline_download(cb1, mock_bot))
-        await asyncio.sleep(0.02) # Небольшая фора первому клику
-        task2 = asyncio.create_task(handle_inline_download(cb2, mock_bot))
+        task1 = asyncio.create_task(
+            process_inline_download(
+                cand_id=cand_id,
+                inline_message_id="inline_msg_1",
+                bot=mock_bot
+            )
+        )
+        await asyncio.sleep(0.02) # Небольшая фора первому запросу
+        task2 = asyncio.create_task(
+            process_inline_download(
+                cand_id=cand_id,
+                inline_message_id="inline_msg_2",
+                bot=mock_bot
+            )
+        )
 
-        await asyncio.gather(task1, task2)
+        res1, res2 = await asyncio.gather(task1, task2)
 
         # download_track должен быть вызван РОВНО 1 раз!
         assert dl_call_count == 1
-        # Второму клику должно быть показано предупреждение об уже идущей загрузке
-        cb2.answer.assert_called_with("⏳ Этот трек уже скачивается, пожалуйста подождите...", show_alert=False)
+        assert res1 == "CQACAgIAAxkBAAIBZ2f1234567890abcdefghijklmnopqrstuvwxyz"
+        assert res2 == "CQACAgIAAxkBAAIBZ2f1234567890abcdefghijklmnopqrstuvwxyz"
+
+        # Проверяем, что edit_message_media вызван для обоих сообщений
+        edited_inline_ids = [call.kwargs.get("inline_message_id") for call in mock_bot.edit_message_media.call_args_list]
+        assert "inline_msg_1" in edited_inline_ids
+        assert "inline_msg_2" in edited_inline_ids
 
 
 # ============================================================================
@@ -364,17 +376,92 @@ async def test_search_failure_produces_empty_results_ux_not_exception():
 
 
 @pytest.mark.asyncio
-async def test_chosen_inline_result_handler():
-    """Проверяет обработчик chosen_inline_result."""
+async def test_chosen_inline_result_triggers_download_task():
+    """
+    Проверяет, что ChosenInlineResult запускает фоновую загрузку,
+    редактирует inline-сообщение и НЕ отправляет аудио в ЛС пользователю.
+    """
     from handlers.inline import handle_chosen_inline_result
     from aiogram.types import ChosenInlineResult
 
+    import uuid
+    unique_suffix = uuid.uuid4().hex[:8]
+    cand_id = f"chosen_{unique_suffix}"
+    target_url = f"https://www.youtube.com/watch?v=chosen_{unique_suffix}"
+    title_str = f"Chosen Track {unique_suffix}"
+    artist_str = f"Chosen Artist {unique_suffix}"
+
+    save_inline_candidate(
+        cand_id=cand_id,
+        target=target_url,
+        title=title_str,
+        artist=artist_str,
+        album=None,
+        duration=200,
+        thumbnail_url=None
+    )
+
     chosen = MagicMock(spec=ChosenInlineResult)
-    chosen.result_id = "art_123"
-    chosen.from_user = MagicMock(id=999)
-    chosen.query = "test query"
-    chosen.inline_message_id = "inl_msg_999"
+    chosen.result_id = f"art_{cand_id}"
+    chosen.from_user = MagicMock(id=987654321)
+    chosen.query = f"{artist_str} {title_str}"
+    chosen.inline_message_id = "inl_msg_chosen_123"
 
-    # Не должен падать
-    await handle_chosen_inline_result(chosen)
+    mock_bot = MagicMock()
+    mock_bot.edit_message_text = AsyncMock()
+    mock_bot.edit_message_media = AsyncMock()
+    mock_msg = MagicMock()
+    mock_msg.audio.file_id = "BQACAgQAAxkBAAICaW_valid_length_telegram_file_id_123456"
+    mock_msg.message_id = 888
+    mock_bot.send_audio = AsyncMock(return_value=mock_msg)
+    mock_bot.delete_message = AsyncMock()
 
+    mock_dl = MagicMock()
+    mock_dl.title = title_str
+    mock_dl.artist = artist_str
+    mock_dl.duration = 200
+    mock_dl.file_path = MagicMock()
+    mock_dl.file_path.exists.return_value = True
+    mock_dl.cleanup = MagicMock()
+    mock_dl.thumbnail_path = None
+
+    with patch("handlers.inline.download_track", AsyncMock(return_value=mock_dl)) as dl_mock:
+        await handle_chosen_inline_result(chosen, mock_bot)
+        # Даем фоновой задаче выполниться
+        await asyncio.sleep(0.1)
+
+        # 1. download_track был вызван ровно 1 раз
+        assert dl_mock.called
+
+        # 2. КРИТИЧНО: bot.send_audio НЕ отправлял файл пользователю (from_user.id = 987654321)
+        for call in mock_bot.send_audio.call_args_list:
+            chat_id = call.kwargs.get("chat_id") or call.args[0]
+            assert chat_id != 987654321, "Запрещено отправлять аудио в ЛС пользователя!"
+
+        # 3. Сообщение в чате было отредактировано через edit_message_media
+        assert mock_bot.edit_message_media.called
+        call_media = mock_bot.edit_message_media.call_args
+        assert call_media.kwargs.get("inline_message_id") == "inl_msg_chosen_123"
+        media_obj = call_media.kwargs.get("media")
+        assert media_obj.media == "BQACAgQAAxkBAAICaW_valid_length_telegram_file_id_123456"
+
+
+@pytest.mark.asyncio
+async def test_inline_query_with_unsupported_url():
+    """Проверяет, что при вводе неподдерживаемой ссылки в inline поиске возвращается понятная подсказка без кнопок."""
+    mock_query = MagicMock()
+    mock_query.query = "https://unknown.domain/track/123"
+    mock_query.answer = AsyncMock()
+
+    with patch("handlers.inline.resolve_track_url", side_effect=UnsupportedUrlError(UNSUPPORTED_URL_FALLBACK_TEXT)):
+        await handle_inline_query(mock_query)
+
+        assert mock_query.answer.called
+        call_args = mock_query.answer.call_args
+        results = call_args.kwargs.get("results") or call_args.args[0]
+        assert len(results) == 1
+        art = results[0]
+        assert art.id == "unsupported_url_result"
+        assert "Не удалось распознать" in art.title
+        assert "Отправьте название трека" in art.description
+        assert art.reply_markup is None # Не содержит кнопок скачивания!

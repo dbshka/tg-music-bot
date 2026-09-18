@@ -30,7 +30,13 @@ from services.database import (
 )
 from services.search import search_tracks_async
 from services.downloader import download_track, _clean_audio_branding
-from services.extractor import clean_unicode_text
+from services.extractor import (
+    find_first_url,
+    resolve_track_url,
+    UnsupportedUrlError,
+    UNSUPPORTED_URL_FALLBACK_TEXT,
+    clean_unicode_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,7 @@ router = Router(name="inline")
 # Реестр активных загрузок для предотвращения дублирования при быстрых повторных кликах
 _in_flight_downloads: Dict[str, asyncio.Future] = {}
 _in_flight_lock = asyncio.Lock()
+_active_tasks: set = set()
 
 
 def is_valid_telegram_file_id(file_id: Optional[str]) -> bool:
@@ -105,8 +112,6 @@ async def handle_inline_query(inline_query: InlineQuery):
     Возвращает до 5 легковесных результатов для быстрого отклика Telegram.
     """
     query_text = inline_query.query.strip()
-    logger.info("INLINE QUERY RECEIVED\nquery=%s", query_text)
-    print(f"INLINE QUERY RECEIVED\nquery={query_text}", flush=True)
 
     # 1. Пустой запрос — выводим обучающую подсказку
     if not query_text:
@@ -123,11 +128,12 @@ async def handle_inline_query(inline_query: InlineQuery):
                 parse_mode="HTML"
             )
         )
+        logger.info("INLINE QUERY\nquery=%s\nresults_count=1", query_text)
+        print(f"INLINE QUERY\nquery={query_text}\nresults_count=1", flush=True)
         try:
-            ans = await inline_query.answer(results=[prompt_article], cache_time=1, is_personal=True)
-            logger.info("TELEGRAM answer_inline_query (empty) SUCCESS: %s", ans)
+            await inline_query.answer(results=[prompt_article], cache_time=1, is_personal=True)
         except Exception as err:
-            logger.error("TELEGRAM answer_inline_query (empty) ERROR (%s): %s", type(err).__name__, err)
+            logger.error("TELEGRAM answer_inline_query (empty) ERROR: %s", err)
         return
 
     # 2. Диагностический запрос: "test", "тест", "ping"
@@ -141,18 +147,86 @@ async def handle_inline_query(inline_query: InlineQuery):
                 parse_mode="HTML"
             )
         )
-        logger.info("DIAGNOSTIC TEST QUERY MATCHED -> Returning minimal article")
+        logger.info("INLINE QUERY\nquery=%s\nresults_count=1", query_text)
+        print(f"INLINE QUERY\nquery={query_text}\nresults_count=1", flush=True)
         try:
-            ans = await inline_query.answer(results=[test_article], cache_time=1, is_personal=True)
-            logger.info("TELEGRAM answer_inline_query (test) SUCCESS: %s", ans)
+            await inline_query.answer(results=[test_article], cache_time=1, is_personal=True)
         except Exception as err:
-            logger.error("TELEGRAM answer_inline_query (test) ERROR (%s): %s", type(err).__name__, err)
+            logger.error("TELEGRAM answer_inline_query (test) ERROR: %s", err)
+        return
+
+    # 3. Проверка на ввод прямой URL-ссылки
+    url_found = find_first_url(query_text)
+    if url_found:
+        url_results: List[Any] = []
+        try:
+            track = await resolve_track_url(url_found)
+            cand_id = uuid.uuid4().hex[:10]
+            thumb_url = track.thumbnail_url or ""
+            dur_str = ""
+            if track.duration:
+                m, s = divmod(int(track.duration), 60)
+                dur_str = f"{m}:{s:02d}"
+
+            save_inline_candidate(
+                cand_id=cand_id,
+                target=track.target,
+                title=track.title or "Unknown Track",
+                artist=track.artist or "Unknown Artist",
+                album=track.album,
+                duration=track.duration,
+                thumbnail_url=thumb_url
+            )
+
+            desc = f"{track.artist} • {dur_str}" if dur_str else (track.artist or "")
+            url_article = InlineQueryResultArticle(
+                id=f"art_{cand_id}",
+                title=track.title or "Unknown Track",
+                description=desc,
+                thumbnail_url=thumb_url or None,
+                input_message_content=InputTextMessageContent(
+                    message_text=(
+                        f"🎵 <b>{html.escape(track.artist or 'Unknown Artist')} — {html.escape(track.title or 'Unknown Track')}</b>\n"
+                        f"⏱ <b>Длительность:</b> {dur_str or '—'}\n\n"
+                        f"⏳ <i>Подготовка к загрузке...</i>"
+                    ),
+                    parse_mode="HTML"
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⏳ Подготавливается...",
+                            callback_data=f"inl_status:{cand_id}"
+                        )
+                    ]]
+                )
+            )
+            url_results.append(url_article)
+        except Exception as url_err:
+            logger.info("Unsupported or unresolvable URL in inline query: %s (%s)", url_found, url_err)
+            fallback_article = InlineQueryResultArticle(
+                id="unsupported_url_result",
+                title="⚠️ Не удалось распознать эту ссылку",
+                description="Отправьте название трека или исполнителя текстом",
+                input_message_content=InputTextMessageContent(
+                    message_text=UNSUPPORTED_URL_FALLBACK_TEXT,
+                    parse_mode="HTML"
+                )
+            )
+            url_results.append(fallback_article)
+
+        logger.info("INLINE QUERY\nquery=%s\nresults_count=%d", query_text, len(url_results))
+        print(f"INLINE QUERY\nquery={query_text}\nresults_count={len(url_results)}", flush=True)
+        try:
+            await inline_query.answer(results=url_results, cache_time=1, is_personal=True)
+        except Exception as err:
+            logger.error("TELEGRAM answer_inline_query (url) ERROR: %s", err)
         return
 
     results: List[Any] = []
     seen_keys = set()
 
-    # 3. Быстрая проверка базы данных: уже сохраненные треки отдаем мгновенно через валидный file_id
+    # 4. Быстрая проверка базы данных: уже сохраненные треки отдаем мгновенно через валидный file_id
     try:
         cached_tracks = await search_cached_tracks_async(query_text, limit=5)
         for c in cached_tracks:
@@ -180,7 +254,7 @@ async def handle_inline_query(inline_query: InlineQuery):
     except Exception as e:
         logger.warning("Ошибка проверки кэша в inline query: %s", e)
 
-    # 4. Если в кэше меньше 5 треков — выполняем плоский поиск кандидатов (extract_flat)
+    # 5. Если в кэше меньше 5 треков — выполняем плоский поиск кандидатов (extract_flat)
     remaining_slots = 5 - len(results)
     if remaining_slots > 0:
         try:
@@ -213,7 +287,6 @@ async def handle_inline_query(inline_query: InlineQuery):
                 )
 
                 desc = f"{artist} • {dur_str}" if dur_str else artist
-                btn_text = f"⬇️ Скачать MP3 ({dur_str})" if dur_str else "⬇️ Скачать MP3"
 
                 article = InlineQueryResultArticle(
                     id=f"art_{cand_id}",
@@ -224,15 +297,15 @@ async def handle_inline_query(inline_query: InlineQuery):
                         message_text=(
                             f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
                             f"⏱ <b>Длительность:</b> {dur_str or '—'}\n\n"
-                            f"<i>Нажмите кнопку ниже, чтобы скачать MP3:</i>"
+                            f"⏳ <i>Подготовка к загрузке...</i>"
                         ),
                         parse_mode="HTML"
                     ),
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[[
                             InlineKeyboardButton(
-                                text=btn_text,
-                                callback_data=f"inldl:{cand_id}"
+                                text="⏳ Подготавливается...",
+                                callback_data=f"inl_status:{cand_id}"
                             )
                         ]]
                     )
@@ -241,7 +314,7 @@ async def handle_inline_query(inline_query: InlineQuery):
         except Exception as search_err:
             logger.warning("Ошибка поиска YouTube/SoundCloud в inline query: %s", search_err)
 
-    # 5. Если ничего не найдено — возвращаем заглушку
+    # 6. Если ничего не найдено — возвращаем заглушку
     if not results:
         results.append(
             InlineQueryResultArticle(
@@ -258,274 +331,279 @@ async def handle_inline_query(inline_query: InlineQuery):
             )
         )
 
-    # Логирование сформированных результатов в требуемом формате
-    logger.info("SEARCH RESULT COUNT=%d", len(results))
-    print(f"SEARCH RESULT COUNT={len(results)}", flush=True)
-    for idx, r in enumerate(results[:5], start=1):
-        r_type = getattr(r, "type", type(r).__name__)
-        r_id = getattr(r, "id", "")
-        r_title = getattr(r, "title", "")
-        r_performer = getattr(r, "performer", "")
-        r_desc = getattr(r, "description", "")
-        r_thumb = getattr(r, "thumbnail_url", "")
-        r_file_id = getattr(r, "audio_file_id", "")
-        r_log = (
-            f"RESULT #{idx}:\n"
-            f"type={r_type}\n"
-            f"id={r_id}\n"
-            f"title={r_title}\n"
-            f"performer={r_performer}\n"
-            f"description={r_desc}\n"
-            f"thumbnail_url={r_thumb}\n"
-            f"audio_file_id={r_file_id}"
-        )
-        logger.info(r_log)
-        print(r_log, flush=True)
+    logger.info("INLINE QUERY\nquery=%s\nresults_count=%d", query_text, len(results))
+    print(f"INLINE QUERY\nquery={query_text}\nresults_count={len(results)}", flush=True)
 
     try:
-        ans_res = await inline_query.answer(results=results[:5], cache_time=1, is_personal=True)
-        logger.info("TELEGRAM answer_inline_query SUCCESS: %s", ans_res)
-        print(f"TELEGRAM answer_inline_query SUCCESS: {ans_res}", flush=True)
+        await inline_query.answer(results=results[:5], cache_time=1, is_personal=True)
     except Exception as api_err:
         logger.error("TELEGRAM answer_inline_query ERROR (%s): %s", type(api_err).__name__, api_err)
-        print(f"TELEGRAM answer_inline_query ERROR ({type(api_err).__name__}): {api_err}", flush=True)
+
+
+def _start_inline_download(
+    cand_id: str,
+    inline_message_id: Optional[str],
+    bot: Bot,
+    query: Optional[str] = None
+) -> asyncio.Task:
+    """Создает и отслеживает фоновую задачу скачивания для выбранного inline-трека."""
+    task = asyncio.create_task(
+        process_inline_download(
+            cand_id=cand_id,
+            inline_message_id=inline_message_id,
+            bot=bot,
+            query=query
+        )
+    )
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return task
 
 
 @router.chosen_inline_result()
-async def handle_chosen_inline_result(chosen: ChosenInlineResult):
-    """Логирует выбор пользователем конкретного inline-результата (Telegram feedback)."""
+async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot):
+    """
+    Обработчик выбора конкретного inline-результата пользователем.
+    Служит основным триггером старта скачивания (1-клик flow).
+    """
     logger.info(
-        "CHOSEN INLINE RESULT: result_id=%s from_user=%s query='%s' inline_message_id=%s",
+        "INLINE SELECTED\nresult_id=%s\ninline_message_id=%s\nquery=%s",
         chosen.result_id,
-        chosen.from_user.id if chosen.from_user else None,
-        chosen.query,
-        chosen.inline_message_id
+        chosen.inline_message_id,
+        chosen.query
     )
     print(
-        f"CHOSEN INLINE RESULT: result_id={chosen.result_id} from_user={chosen.from_user.id if chosen.from_user else None} query='{chosen.query}'",
+        f"INLINE SELECTED\nresult_id={chosen.result_id}\ninline_message_id={chosen.inline_message_id}\nquery={chosen.query}",
         flush=True
     )
 
-
-@router.callback_query(F.data.startswith("inldl:"))
-async def handle_inline_download(callback: CallbackQuery, bot: Bot):
-    """
-    Обработчик нажатия кнопки «⬇️ Скачать MP3» под inline-сообщением.
-    Запускает скачивание через существующий пайплайн download_track()
-    с защитой от множественных повторных кликов (дедупликация).
-    """
-    cand_id = callback.data.split(":", 1)[1]
-    candidate = await get_inline_candidate_async(cand_id)
-    if not candidate:
-        await callback.answer(
-            "⚠️ Срок действия этой ссылки истёк. Пожалуйста, выполните поиск заново.",
-            show_alert=True
-        )
+    if not chosen.result_id or not chosen.result_id.startswith("art_"):
         return
 
-    # Защита от дубликатов при быстрых кликах нескольких пользователей или одного пользователя
+    cand_id = chosen.result_id[4:]
+    _start_inline_download(
+        cand_id=cand_id,
+        inline_message_id=chosen.inline_message_id,
+        bot=bot,
+        query=chosen.query
+    )
+
+
+async def process_inline_download(
+    cand_id: str,
+    inline_message_id: Optional[str],
+    bot: Bot,
+    query: Optional[str] = None
+) -> Optional[str]:
+    """
+    Выполняет загрузку выбранного трека, конвертацию, получение file_id
+    и замену inline-сообщения на аудиоплеер через edit_message_media.
+    Возвращает Telegram file_id (или None при ошибке).
+    """
+    candidate = await get_inline_candidate_async(cand_id)
+    if not candidate:
+        if inline_message_id:
+            try:
+                await bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text="⚠️ Срок действия этой ссылки истёк. Пожалуйста, выполните поиск заново."
+                )
+            except Exception:
+                pass
+        return None
+
+    artist = candidate.get("artist") or "Unknown Artist"
+    title = candidate.get("title") or "Unknown Track"
+    target = candidate.get("target") or f"{artist} - {title}"
+    dedup_key = target.strip()
+
+    # 1. Сразу переводим сообщение в состояние DOWNLOADING и удаляем техническую клавиатуру
+    if inline_message_id:
+        try:
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=(
+                    f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n\n"
+                    f"⏳ Скачиваю..."
+                ),
+                parse_mode="HTML",
+                reply_markup=None
+            )
+        except Exception as edit_status_err:
+            logger.debug("Не удалось обновить статус inline сообщения: %s", edit_status_err)
+
+    # 2. Дедупликация: проверяем реестр активных загрузок
     async with _in_flight_lock:
-        if cand_id in _in_flight_downloads:
-            fut = _in_flight_downloads[cand_id]
+        if dedup_key in _in_flight_downloads:
+            fut = _in_flight_downloads[dedup_key]
             is_first = False
         else:
             loop = asyncio.get_running_loop()
             fut = loop.create_future()
-            _in_flight_downloads[cand_id] = fut
+            _in_flight_downloads[dedup_key] = fut
             is_first = True
 
     if not is_first:
-        await callback.answer("⏳ Этот трек уже скачивается, пожалуйста подождите...", show_alert=False)
+        logger.info("INLINE JOIN IN-FLIGHT: dedup_key=%s", dedup_key)
         try:
-            await fut
+            file_id = await fut
         except Exception:
-            pass
-        return
+            file_id = None
 
+        if file_id and inline_message_id:
+            try:
+                await bot.edit_message_media(
+                    inline_message_id=inline_message_id,
+                    media=InputMediaAudio(
+                        media=file_id,
+                        title=title,
+                        performer=artist,
+                        duration=candidate.get("duration") or 0
+                    )
+                )
+                logger.info("INLINE MESSAGE EDITED\nresult_id=art_%s\nsuccess=true", cand_id)
+                print(f"INLINE MESSAGE EDITED\nresult_id=art_{cand_id}\nsuccess=true", flush=True)
+            except Exception as e:
+                logger.warning("edit_message_media failed for joined in-flight: %s", e)
+        return file_id
+
+    # Первый поток выполняет загрузку
     downloaded = None
+    file_id = None
     try:
-        await callback.answer("⏳ Скачивание начато...")
+        # 3. Проверка кэша базы данных: возможно, файл уже загружен
+        cached = await get_cached_track_async(target)
+        if not cached and artist and title:
+            cached = await get_cached_track_async(f"{artist} - {title}")
 
-        # Обновляем текст сообщения, показывая статус скачивания
-        if callback.inline_message_id:
+        cached_file_id = cached.get("file_id") if cached else None
+        if is_valid_telegram_file_id(cached_file_id):
+            file_id = cached_file_id
+
+        # 4. Если в кэше нет — скачиваем через существующий download_track()
+        if not file_id:
+            logger.info("INLINE DOWNLOAD START\nresult_id=art_%s", cand_id)
+            print(f"INLINE DOWNLOAD START\nresult_id=art_{cand_id}", flush=True)
+
+            req_id = f"inl_{uuid.uuid4().hex[:6]}"
+            downloaded = await download_track(
+                query_or_url=candidate["target"],
+                custom_title=title,
+                custom_artist=artist,
+                thumbnail_url=candidate.get("thumbnail_url"),
+                expected_duration=candidate.get("duration"),
+                request_id=req_id,
+                custom_album=candidate.get("album")
+            )
+
+            # 5. Загружаем аудиофайл в Telegram storage (STORAGE_CHANNEL_ID или ADMIN_ID)
+            # ВАЖНО: НИКОГДА не отправлять в ЛС пользователю (from_user.id)
+            storage_chat_id = STORAGE_CHANNEL_ID or ADMIN_ID
+            if not storage_chat_id:
+                raise RuntimeError("STORAGE_CHANNEL_ID или ADMIN_ID не настроены в config.py")
+
+            thumb_file = FSInputFile(downloaded.thumbnail_path) if downloaded.thumbnail_path and downloaded.thumbnail_path.exists() else None
+            audio_file = FSInputFile(downloaded.file_path)
+
+            uploaded_msg = await bot.send_audio(
+                chat_id=storage_chat_id,
+                audio=audio_file,
+                title=downloaded.title,
+                performer=downloaded.artist,
+                duration=downloaded.duration,
+                thumbnail=thumb_file,
+                disable_notification=True
+            )
+
+            if not uploaded_msg or not uploaded_msg.audio:
+                raise RuntimeError("Не удалось получить audio object после загрузки в Telegram")
+
+            file_id = uploaded_msg.audio.file_id
+
+            # Если отправка была в ADMIN_ID, удаляем сообщение, чтобы не засорять чат админа
+            if storage_chat_id == ADMIN_ID:
+                try:
+                    await bot.delete_message(chat_id=ADMIN_ID, message_id=uploaded_msg.message_id)
+                except Exception:
+                    pass
+
+            # 6. Сохраняем в кэш базы данных
+            await save_cached_track_async(
+                query=candidate["target"],
+                file_id=file_id,
+                title=downloaded.title,
+                artist=downloaded.artist,
+                duration=downloaded.duration
+            )
+            await save_cached_track_async(
+                query=f"{downloaded.artist} - {downloaded.title}",
+                file_id=file_id,
+                title=downloaded.title,
+                artist=downloaded.artist,
+                duration=downloaded.duration
+            )
+
+            logger.info("INLINE DOWNLOAD COMPLETE\nresult_id=art_%s\ntelegram_file_id_saved=true", cand_id)
+            print(f"INLINE DOWNLOAD COMPLETE\nresult_id=art_{cand_id}\ntelegram_file_id_saved=true", flush=True)
+
+        if not fut.done():
+            fut.set_result(file_id)
+
+        # 7. Заменяем inline-сообщение в чате на аудиоплеер через edit_message_media
+        if inline_message_id and file_id:
+            await bot.edit_message_media(
+                inline_message_id=inline_message_id,
+                media=InputMediaAudio(
+                    media=file_id,
+                    title=downloaded.title if downloaded else title,
+                    performer=downloaded.artist if downloaded else artist,
+                    duration=downloaded.duration if downloaded else (candidate.get("duration") or 0)
+                )
+            )
+            logger.info("INLINE MESSAGE EDITED\nresult_id=art_%s\nsuccess=true", cand_id)
+            print(f"INLINE MESSAGE EDITED\nresult_id=art_{cand_id}\nsuccess=true", flush=True)
+
+        return file_id
+
+    except Exception as err:
+        logger.error("Ошибка при обработке inline download: %s", err)
+        if not fut.done():
+            fut.set_exception(err)
+        if inline_message_id:
             try:
                 await bot.edit_message_text(
-                    inline_message_id=callback.inline_message_id,
+                    inline_message_id=inline_message_id,
                     text=(
-                        f"⏳ <b>Скачиваю:</b> {html.escape(candidate['artist'])} — {html.escape(candidate['title'])}...\n"
-                        f"<i>Загрузка аудиопотока и сохранение тегов...</i>"
+                        "⚠️ Не удалось скачать этот трек.\n\n"
+                        "Попробуйте другой результат."
                     ),
                     parse_mode="HTML"
                 )
             except Exception:
                 pass
+        return None
 
-        # 1. Проверяем кэш базы данных: возможно, файл уже есть
-        cached = await get_cached_track_async(candidate["target"])
-        if not cached and candidate.get("artist") and candidate.get("title"):
-            cached = await get_cached_track_async(f"{candidate['artist']} - {candidate['title']}")
-
-        file_id = cached.get("file_id") if cached else None
-        if file_id and not is_valid_telegram_file_id(file_id):
-            file_id = None
-
-        # 2. Если в кэше нет — скачиваем через download_track()
-        if not file_id:
-            req_id = f"inl_{uuid.uuid4().hex[:6]}"
-            try:
-                downloaded = await download_track(
-                    query_or_url=candidate["target"],
-                    custom_title=candidate["title"],
-                    custom_artist=candidate["artist"],
-                    thumbnail_url=candidate.get("thumbnail_url"),
-                    expected_duration=candidate.get("duration"),
-                    request_id=req_id,
-                    custom_album=candidate.get("album")
-                )
-            except Exception as dl_err:
-                logger.error("Inline download_track failed: %s", dl_err)
-                err_text = (
-                    f"⚠️ Не удалось скачать трек «{html.escape(candidate['artist'])} — {html.escape(candidate['title'])}».\n\n"
-                    f"💡 Попробуйте отправить название трека в личный чат с ботом."
-                )
-                if callback.inline_message_id:
-                    try:
-                        await bot.edit_message_text(
-                            inline_message_id=callback.inline_message_id,
-                            text=err_text,
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-                if not fut.done():
-                    fut.set_exception(dl_err)
-                return
-
-        # 3. Отправка и обновление в чате
-        if file_id:
-            if callback.inline_message_id:
-                try:
-                    await bot.edit_message_media(
-                        inline_message_id=callback.inline_message_id,
-                        media=InputMediaAudio(
-                            media=file_id,
-                            title=candidate["title"],
-                            performer=candidate["artist"],
-                            duration=candidate.get("duration") or 0
-                        )
-                    )
-                except Exception as e:
-                    logger.warning("edit_message_media с кэшированным file_id не удался: %s", e)
-            elif callback.message:
-                await callback.message.answer_audio(
-                    audio=file_id,
-                    title=candidate["title"],
-                    performer=candidate["artist"],
-                    duration=candidate.get("duration") or 0
-                )
-            if not fut.done():
-                fut.set_result(file_id)
-            return
-
-        # Если файл только что скачан
-        if downloaded and downloaded.file_path and downloaded.file_path.exists():
-            thumb_file = FSInputFile(downloaded.thumbnail_path) if downloaded.thumbnail_path and downloaded.thumbnail_path.exists() else None
-            audio_file = FSInputFile(downloaded.file_path)
-
-            uploaded_msg = None
-            dest_chat_id = STORAGE_CHANNEL_ID or callback.from_user.id or ADMIN_ID
-            try:
-                uploaded_msg = await bot.send_audio(
-                    chat_id=dest_chat_id,
-                    audio=audio_file,
-                    title=downloaded.title,
-                    performer=downloaded.artist,
-                    duration=downloaded.duration,
-                    thumbnail=thumb_file
-                )
-            except Exception as up_err:
-                logger.info("Upload to dest_chat_id=%s failed (%s), trying ADMIN_ID...", dest_chat_id, up_err)
-                if ADMIN_ID and dest_chat_id != ADMIN_ID:
-                    try:
-                        uploaded_msg = await bot.send_audio(
-                            chat_id=ADMIN_ID,
-                            audio=audio_file,
-                            title=downloaded.title,
-                            performer=downloaded.artist,
-                            duration=downloaded.duration,
-                            thumbnail=thumb_file
-                        )
-                    except Exception:
-                        pass
-
-            if uploaded_msg and uploaded_msg.audio:
-                file_id = uploaded_msg.audio.file_id
-                # Сохраняем в кэш для будущих запросов
-                await save_cached_track_async(
-                    query=candidate["target"],
-                    file_id=file_id,
-                    title=downloaded.title,
-                    artist=downloaded.artist,
-                    duration=downloaded.duration
-                )
-                await save_cached_track_async(
-                    query=f"{downloaded.artist} - {downloaded.title}",
-                    file_id=file_id,
-                    title=downloaded.title,
-                    artist=downloaded.artist,
-                    duration=downloaded.duration
-                )
-
-                if callback.inline_message_id:
-                    try:
-                        await bot.edit_message_media(
-                            inline_message_id=callback.inline_message_id,
-                            media=InputMediaAudio(
-                                media=file_id,
-                                title=downloaded.title,
-                                performer=downloaded.artist,
-                                duration=downloaded.duration
-                            )
-                        )
-                    except Exception as edit_err:
-                        logger.warning("edit_message_media failed: %s", edit_err)
-                elif callback.message:
-                    try:
-                        await callback.message.answer_audio(
-                            audio=file_id,
-                            title=downloaded.title,
-                            performer=downloaded.artist,
-                            duration=downloaded.duration,
-                            thumbnail=thumb_file
-                        )
-                    except Exception:
-                        pass
-                if not fut.done():
-                    fut.set_result(file_id)
-            else:
-                if callback.inline_message_id:
-                    try:
-                        await bot.edit_message_text(
-                            inline_message_id=callback.inline_message_id,
-                            text=(
-                                f"✅ Трек <b>{html.escape(downloaded.artist)} — {html.escape(downloaded.title)}</b> готов!\n\n"
-                                f"💡 Откройте диалог с ботом для получения аудиофайла."
-                            ),
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-                if not fut.done():
-                    fut.set_result(None)
-
-    except Exception as e:
-        logger.exception("Ошибка при обработке inline-скачивания: %s", e)
-        if not fut.done():
-            fut.set_exception(e)
     finally:
         if not fut.done():
             fut.set_result(None)
         if downloaded:
             downloaded.cleanup()
         async with _in_flight_lock:
-            _in_flight_downloads.pop(cand_id, None)
+            _in_flight_downloads.pop(dedup_key, None)
+
+
+@router.callback_query(F.data.startswith("inl_status:"))
+async def handle_inline_status_callback(callback: CallbackQuery, bot: Bot):
+    """
+    Failsafe-обработчик клика по технической кнопке '⏳ Подготавливается...'.
+    Если ChosenInlineResult уже отработал, просто уведомляет пользователя.
+    Если feedback задержался, запускает скачивание.
+    """
+    cand_id = callback.data.split(":", 1)[1]
+    await callback.answer("⏳ Скачивание уже идёт...", show_alert=False)
+    if callback.inline_message_id:
+        _start_inline_download(
+            cand_id=cand_id,
+            inline_message_id=callback.inline_message_id,
+            bot=bot
+        )
