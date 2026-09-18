@@ -424,9 +424,9 @@ async def _execute_download_and_send(
             cached = await get_cached_track_async(f"{track_info.artist} - {track_info.title}".lower(), variant=variant)
         t_cache = time.perf_counter() - t_c0
 
-        is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "vk.com", "vk.ru", "tiktok.com", "music.yandex.", "ya.cc", "yandex.")))
+        is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "tiktok.com")))
         has_canonical_dur = bool(track_info.duration and track_info.duration > 35)
-        is_apple_music = bool(track_info and track_info.platform in ("Apple Music", "Spotify", "Canonical/Deezer", "Canonical/iTunes"))
+        is_apple_music = bool(track_info and track_info.platform in ("Apple Music", "Spotify", "Canonical/Deezer", "Canonical/iTunes", "Yandex Music", "VK Music"))
         is_text_input = bool(not url)
 
         if cached:
@@ -521,7 +521,8 @@ async def _execute_download_and_send(
                         request_id=req_id,
                         is_apple_music=is_apple_music,
                         is_text_input=is_text_input,
-                        requested_variant=variant
+                        requested_variant=variant,
+                        custom_album=getattr(track_info, "album", None)
                     )
         except Exception as dl_err:
             is_direct_url = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com")))
@@ -561,7 +562,8 @@ async def _execute_download_and_send(
                             request_id=f"{req_id}_fb",
                             is_apple_music=is_apple_music,
                             is_text_input=is_text_input,
-                            requested_variant=variant
+                            requested_variant=variant,
+                            custom_album=getattr(track_info, "album", None)
                         )
             else:
                 raise dl_err
@@ -584,9 +586,15 @@ async def _execute_download_and_send(
                 max_final_diff = max(4, min(7, int(track_info.duration * 0.02)))
                 if final_diff > max_final_diff:
                     print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s for студийного оригинала). Refusing to send to Telegram.", flush=True)
-                    await status_msg.edit_text(
-                        f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности студийного оригинала (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
-                    )
+                    if track_info and track_info.platform in ("Yandex Music", "VK Music"):
+                        msg_text = (
+                            f"⚠️ На YouTube не удалось найти точную версию трека «{html.escape(track_info.display_name)}» "
+                            f"(найденный ролик отличается по длительности от оригинала на {final_diff} сек во избежание подмены).\n\n"
+                            f"💡 Попробуйте отправить название трека или исполнителя текстом для поиска."
+                        )
+                    else:
+                        msg_text = f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности студийного оригинала (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
+                    await status_msg.edit_text(msg_text)
                     downloaded_audio.cleanup()
                     return
             elif variant != "original":
@@ -706,8 +714,15 @@ async def _execute_download_and_send(
                 "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
             )
         elif err_str.startswith("⚠️"):
-            # Информативные пользовательские сообщения (превью Яндекс Плюс, отсутствие токена VK и др.)
+            # Информативные пользовательские сообщения (Яндекс Плюс, отсутствие токена VK и др.)
             user_friendly = err_str
+        elif track_info and track_info.platform in ("Yandex Music", "VK Music") and (
+            "не найден" in err_str.lower() or "не подошел" in err_str.lower() or "кандидат" in err_str.lower() or "not found" in err_str.lower()
+        ):
+            user_friendly = (
+                f"⚠️ Не удалось найти подходящий трек на YouTube для «{html.escape(track_info.display_name)}».\n\n"
+                f"💡 Попробуйте отправить название трека или исполнителя текстом для более точного поиска."
+            )
         else:
             user_friendly = f"<b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
 

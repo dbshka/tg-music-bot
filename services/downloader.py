@@ -531,7 +531,8 @@ def _sync_download(
     cancel_event: Optional[threading.Event] = None,
     is_apple_music: bool = False,
     is_text_input: bool = False,
-    requested_variant: Optional[str] = None
+    requested_variant: Optional[str] = None,
+    custom_album: Optional[str] = None
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
@@ -570,34 +571,16 @@ def _sync_download(
         },
     }
 
-    # Источники и прокси:
-    is_soundcloud = query_or_url.startswith("scsearch") or "soundcloud.com" in query_or_url
-    is_direct_stream = any(d in query_or_url for d in ("strm.yandex.net", "yandex.net", "vkuser.net", "vkuseraudio.net", "userapi.com"))
-    is_youtube = not is_soundcloud and not is_direct_stream
+    # Клиенты YouTube:
+    is_youtube = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
 
     yt_proxy = get_current_youtube_proxy()
-    if any(d in query_or_url for d in ("strm.yandex.net", "yandex.net")):
-        dl_src = "yandex"
-    elif any(d in query_or_url for d in ("vkuser.net", "vkuseraudio.net", "userapi.com")):
-        dl_src = "vk"
-    elif is_youtube:
-        dl_src = "youtube"
-    elif is_soundcloud:
-        dl_src = "soundcloud"
-    else:
-        dl_src = "direct"
-
-    proxy_dl_label = "FOREIGN" if yt_proxy and (is_youtube or is_direct_stream) else ("NONE" if is_soundcloud else "DIRECT")
-    print(f"{req_tag}[PROXY] source={dl_src} stage=download proxy={proxy_dl_label}", flush=True)
-
-    if (is_youtube or is_direct_stream) and yt_proxy:
+    if is_youtube and yt_proxy:
         ydl_opts["proxy"] = yt_proxy
-        srv_name = "CDN stream" if is_direct_stream else "YouTube"
-        print(f"{req_tag}[DOWNLOADER] {srv_name} proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
-    elif is_youtube or is_direct_stream:
+        print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+    elif is_youtube:
         ydl_opts.pop("proxy", None)
-        srv_name = "CDN stream" if is_direct_stream else "YouTube"
-        print(f"{req_tag}[DOWNLOADER] {srv_name} proxy disabled", flush=True)
+        print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
 
 
     if is_youtube and cookies_info["active"]:
@@ -1262,26 +1245,12 @@ def _sync_download(
             is_direct_yt = not query_or_url.startswith("scsearch") and "soundcloud.com" not in query_or_url
             if is_direct_yt:
                 yt_proxy = get_current_youtube_proxy()
-                if any(d in query_or_url for d in ("strm.yandex.net", "yandex.net")):
-                    dl_src = "yandex"
-                elif any(d in query_or_url for d in ("vkuser.net", "vkuseraudio.net", "userapi.com")):
-                    dl_src = "vk"
-                elif "youtube.com" in query_or_url or "youtu.be" in query_or_url:
-                    dl_src = "youtube"
-                else:
-                    dl_src = "direct"
-                proxy_label = "FOREIGN" if yt_proxy else "DIRECT"
-                print(f"{req_tag}[PROXY] source={dl_src} stage=download proxy={proxy_label}", flush=True)
-
                 if yt_proxy:
                     dl_opts["proxy"] = yt_proxy
-                    print(f"{req_tag}[DOWNLOADER] Direct stream proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
+                    print(f"{req_tag}[DOWNLOADER] YouTube proxy enabled: {get_sanitized_proxy_info(yt_proxy)}", flush=True)
                 else:
                     dl_opts.pop("proxy", None)
-                    print(f"{req_tag}[DOWNLOADER] Direct stream proxy disabled", flush=True)
-                if any(d in query_or_url for d in ("strm.yandex.net", "yandex.net", "vkuser.net", "vkuseraudio.net", "userapi.com")):
-                    dl_opts.pop("cookiefile", None)
-                    dl_opts.pop("extractor_args", None)
+                    print(f"{req_tag}[DOWNLOADER] YouTube proxy disabled", flush=True)
 
 
             hook_times = {"dl_start": 0, "dl_end": 0, "pp_start": 0, "pp_end": 0}
@@ -1408,7 +1377,7 @@ def _sync_download(
         pass
 
     # Финальная валидация хронометража перед отдачей DownloadedAudio (Apple Music, Spotify, Deezer, Text search)
-    is_direct_media_url = bool(not query_or_url.startswith(("ytsearch", "scsearch")) and any(d in query_or_url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com", "bandcamp.com", "vk.com", "tiktok.com")))
+    is_direct_media_url = bool(not query_or_url.startswith(("ytsearch", "scsearch")) and any(d in query_or_url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com", "bandcamp.com", "tiktok.com")))
     if not is_direct_media_url and expected_duration and expected_duration > 35:
         all_req_mods = extract_modifiers(f"{custom_artist or ''} {custom_title or ''} {query_or_url} {requested_variant or ''}")
         if not all_req_mods and (not requested_variant or requested_variant == "original") and duration > 0:
@@ -1421,7 +1390,7 @@ def _sync_download(
                 )
 
     t_tag0 = time.perf_counter()
-    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, thumbnail_path)
+    _apply_custom_metadata(audio_path, extracted_title, extracted_artist, thumbnail_path, album=custom_album)
     perf_timings["tags"] = time.perf_counter() - t_tag0
 
     return DownloadedAudio(
@@ -1525,7 +1494,8 @@ async def download_track(
     request_id: Optional[str] = None,
     is_apple_music: bool = False,
     is_text_input: bool = False,
-    requested_variant: Optional[str] = None
+    requested_variant: Optional[str] = None,
+    custom_album: Optional[str] = None
 ) -> DownloadedAudio:
     """
     Асинхронная функция загрузки трека в MP3.
@@ -1558,7 +1528,8 @@ async def download_track(
             cancel_event,
             is_apple_music,
             is_text_input,
-            requested_variant
+            requested_variant,
+            custom_album
         )
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
@@ -1570,7 +1541,7 @@ async def download_track(
                 downloaded_thumb = await thumb_task
                 if downloaded_thumb and downloaded_thumb.exists():
                     audio.thumbnail_path = downloaded_thumb
-                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                    _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path, album=custom_album)
             except Exception:
                 pass
 
@@ -1624,7 +1595,9 @@ async def download_track(
                     request_id,
                     cancel_event,
                     is_apple_music,
-                    is_text_input
+                    is_text_input,
+                    None,
+                    custom_album
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
                     raise ValueError(f"Fallback YouTube вернул превью ({audio.duration}s)")
@@ -1634,7 +1607,7 @@ async def download_track(
                         downloaded_thumb = await thumb_task
                         if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                             audio.thumbnail_path = downloaded_thumb
-                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path, album=custom_album)
                     except Exception:
                         pass
                 if audio.thumbnail_path and not audio.thumbnail_path.exists():
@@ -1668,7 +1641,9 @@ async def download_track(
                         request_id,
                         cancel_event,
                         is_apple_music,
-                        is_text_input
+                        is_text_input,
+                        None,
+                        custom_album
                     )
                     if expected_duration and expected_duration > 60 and audio.duration <= 35:
                         raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
@@ -1678,7 +1653,7 @@ async def download_track(
                             downloaded_thumb = await thumb_task
                             if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
                                 audio.thumbnail_path = downloaded_thumb
-                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path)
+                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, audio.thumbnail_path, album=custom_album)
                         except Exception:
                             pass
                     if audio.thumbnail_path and not audio.thumbnail_path.exists():

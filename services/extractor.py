@@ -45,6 +45,7 @@ class ExtractedTrack:
     artist: Optional[str] = None
     thumbnail_url: Optional[str] = None
     duration: Optional[int] = None
+    album: Optional[str] = None
 
     @property
     def display_name(self) -> str:
@@ -864,7 +865,8 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
             title=res["title"],
             artist=res["artist"],
             thumbnail_url=res["thumbnail_url"],
-            duration=res["duration"]
+            duration=res["duration"],
+            album=res.get("album")
         )
 
     # 2. Spotify
@@ -907,7 +909,8 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
                 title=res["title"],
                 artist=res["artist"],
                 thumbnail_url=res["thumbnail_url"],
-                duration=res["duration"]
+                duration=res["duration"],
+                album=res.get("album")
             )
         platform_name = "VK Видео"
     elif "bandcamp.com" in domain:

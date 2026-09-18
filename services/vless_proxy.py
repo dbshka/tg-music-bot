@@ -675,7 +675,7 @@ def get_proxy_for_source(source: str, stage: str = "download") -> Optional[str]:
         * Яндекс Музыка и VK -> Russian proxy (локальный порт 10809 или RUSSIAN_PROXY)
         * YouTube, Spotify, Apple, SoundCloud -> Foreign proxy
     - stage="download":
-        * Все источники (включая стриминг треков Яндекс Музыки и VK с CDN) -> Foreign proxy
+        * Все источники (YouTube и др.) -> Foreign proxy
     """
     src = (source or "").lower()
     if stage == "resolve":
