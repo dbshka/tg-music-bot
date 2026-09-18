@@ -5,4 +5,4 @@ python-dotenv>=1.0.0
 mutagen>=1.47.0
 pillow>=10.0.0
 aiohttp-socks>=0.10.0
-
+requests>=2.31.0,<3
