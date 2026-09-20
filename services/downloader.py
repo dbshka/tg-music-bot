@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Optional, Union, Dict, List, Tuple
 
 import aiohttp
-import psutil
 import sys
 import yt_dlp
 
@@ -43,15 +42,40 @@ class _DownloadCounter:
 
 def get_process_rss_mb(pid: Optional[int] = None) -> float:
     """Возвращает RSS память процесса в мегабайтах (MB)."""
+    target_pid = pid if pid else "self"
+    # 1. На Linux (Docker / Render) через нативный /proc/self/status (без внешних зависимостей)
     try:
+        proc_file = f"/proc/{target_pid}/status"
+        if os.path.exists(proc_file):
+            with open(proc_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return round(float(parts[1]) / 1024.0, 2)
+    except Exception:
+        pass
+
+    # 2. Через стандартный модуль Unix resource
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform != "darwin":
+            return round(ru / 1024.0, 2)
+        else:
+            return round(ru / (1024.0 * 1024.0), 2)
+    except Exception:
+        pass
+
+    # 3. Через psutil (если модуль установлен в окружении)
+    try:
+        import psutil
         proc = psutil.Process(pid or os.getpid())
         return round(proc.memory_info().rss / (1024 * 1024), 2)
     except Exception:
-        try:
-            import resource
-            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2)
-        except Exception:
-            return 0.0
+        pass
+
+    return 0.0
 
 
 def log_memory_stage(
