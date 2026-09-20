@@ -37,24 +37,32 @@ from services.extractor import (
     ExtractedTrack,
     UnsupportedUrlError,
 )
-from services.downloader import download_track
+from services.downloader import (
+    download_track,
+    DOWNLOAD_SEMAPHORE,
+    log_memory_stage,
+)
 from services.database import (
     log_user_activity_async,
     increment_user_download_async,
     get_cached_track_async,
     save_cached_track_async,
-    delete_cached_track_async,
-    invalidate_cached_file_id_async,
+    invalidate_cached_file_id_async
 )
 from services.identity import extract_modifiers, is_candidate_matching_modifiers
+from services.persistent_cache import (
+    build_source_key,
+    get_persistent_track_async,
+    save_persistent_track_async,
+    invalidate_persistent_track_async,
+    check_metadata_match,
+)
+from handlers.inline import is_valid_telegram_file_id
 from handlers.tag_editor import get_audio_edit_keyboard
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="music_router")
-
-# Семафор: 3 одновременных задачи (измеренный peak RSS = 133.5 MB при лимите 512 MB, сокращает время очереди на 30% по сравнению с 2)
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(3)
 
 
 class SearchFSM(StatesGroup):
@@ -317,6 +325,75 @@ async def handle_music_request(message: Message, state: FSMContext):
     )
 
 
+def format_download_error(e: Exception, track_info: Optional[ExtractedTrack] = None) -> str:
+    """
+    Преобразует внутренние ошибки и исключения yt-dlp/сети в понятные,
+    лаконичные сообщения для пользователя без многострочных технических трейсов.
+    """
+    err_str = str(e)
+    err_lower = err_str.lower()
+    if "drm protected" in err_lower or "is drm protected" in err_lower:
+        return (
+            "<b>Этот трек защищен DRM (SoundCloud Go+).</b>\n\n"
+            "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
+        )
+    if err_str.startswith("⚠️"):
+        return err_str
+    if track_info and track_info.platform in ("Yandex Music", "VK Music") and (
+        "не найден" in err_lower or "не подошел" in err_lower or "кандидат" in err_lower or "not found" in err_lower
+    ):
+        return (
+            f"⚠️ Не удалось найти подходящий трек на YouTube для «{html.escape(track_info.display_name)}».\n\n"
+            f"💡 Попробуйте отправить название трека или исполнителя текстом для более точного поиска."
+        )
+    if any(k in err_lower for k in ("private video", "this video is private", "video is private")):
+        return (
+            "⚠️ <b>Видео приватно</b>\n\n"
+            "Это видео доступно только по приглашению или закрыто автором. Скачивание аудио невозможно."
+        )
+    if any(k in err_lower for k in ("confirm your age", "age-restricted", "age restricted", "content warning", "requires authentication")):
+        return (
+            "⚠️ <b>Возрастное ограничение</b>\n\n"
+            "YouTube требует авторизацию для доступа к этому видео. Скачивание аудио невозможно без входа в аккаунт."
+        )
+    if any(k in err_lower for k in ("not available in your country", "uploader has not made this video available", "geo-restricted", "georestricted", "blocked in your country")):
+        return (
+            "⚠️ <b>Региональное ограничение</b>\n\n"
+            "Автор видео или правообладатель ограничил доступ в регионе расположения сервера."
+        )
+    if any(k in err_lower for k in ("confirm you're not a bot", "automated queries", "too many requests", "http error 429", "bot-check", "bot check")):
+        return (
+            "⚠️ <b>Временное ограничение YouTube</b>\n\n"
+            "YouTube временно ограничил запросы (проверка на бота). Пожалуйста, повторите попытку через пару минут."
+        )
+    if any(k in err_lower for k in ("format is not available", "requested format", "no audio stream", "format not available")):
+        return (
+            "⚠️ <b>Аудиопоток недоступен</b>\n\n"
+            "Не удалось извлечь аудиопоток для этого видео. Попробуйте другую ссылку или текстовый поиск."
+        )
+    if any(k in err_lower for k in ("timed out", "timeout", "timedout", "connection reset", "network is unreachable", "temporary failure in name resolution")):
+        return (
+            "⚠️ <b>Превышено время ожидания</b>\n\n"
+            "Превышено время ожидания ответа от видеохостинга. Попробуйте повторить запрос ещё раз."
+        )
+    if any(k in err_lower for k in ("ffmpeg", "ffprobe", "conversion failed", "postprocessing")):
+        return (
+            "⚠️ <b>Ошибка конвертации аудио</b>\n\n"
+            "Не удалось обработать аудиопоток через FFmpeg. Попробуйте другую ссылку."
+        )
+    if any(k in err_lower for k in ("video unavailable", "this video is unavailable", "has been removed", "deleted", "does not exist")):
+        return (
+            "⚠️ <b>Видео недоступно или удалено</b>\n\n"
+            "Видео по указанной ссылке не найдено или было удалено с YouTube."
+        )
+
+    first_line = err_str.split("\n")[0].strip()
+    first_line = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", first_line).strip()
+    if len(first_line) > 150:
+        first_line = first_line[:147] + "..."
+    return f"<b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(first_line)}</i>"
+
+
 async def _execute_download_and_send(
     message: Message,
     raw_query: str,
@@ -418,11 +495,41 @@ async def _execute_download_and_send(
         t_metadata = time.perf_counter() - t_m0
         print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}' duration={track_info.duration}s", flush=True)
 
+        source_key, source_type, source_id = build_source_key(url or track_info.target)
+
         # ⚡ Шаг 0: Проверка в двух-уровневом кэше L1 (RAM) / L2 (SQLite) с проверкой точности хронометража и изоляцией вариантов
         t_c0 = time.perf_counter()
         cached = await get_cached_track_async(cache_key, variant=variant)
         if not cached and track_info.artist and track_info.title:
             cached = await get_cached_track_async(f"{track_info.artist} - {track_info.title}".lower(), variant=variant)
+
+        # Persistent Cache (Cloudflare D1 + L1 RAM) для YouTube-источников
+        if source_type == "youtube" and variant == "original":
+            cached_persistent = await get_persistent_track_async(source_key)
+            if cached_persistent and is_valid_telegram_file_id(cached_persistent.telegram_file_id):
+                is_match, cached_hash, current_hash = check_metadata_match(
+                    cached_persistent,
+                    artist=track_info.artist,
+                    title=track_info.title,
+                    album=getattr(track_info, "album", None),
+                    duration=track_info.duration
+                )
+                if is_match:
+                    cached = {
+                        "file_id": cached_persistent.telegram_file_id,
+                        "title": cached_persistent.title,
+                        "artist": cached_persistent.artist,
+                        "duration": cached_persistent.duration,
+                        "variant": "original"
+                    }
+                    print(f"[MUSIC][request_id={req_id}] Persistent cache HIT: {source_key}", flush=True)
+                else:
+                    print(
+                        f"[MUSIC][request_id={req_id}] Persistent cache metadata mismatch for {source_key}: "
+                        f"cached_hash={cached_hash} current_hash={current_hash}. Cache MISS.",
+                        flush=True
+                    )
+                    cached = None
         t_cache = time.perf_counter() - t_c0
 
         is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "tiktok.com")))
@@ -451,7 +558,7 @@ async def _execute_download_and_send(
                 target_mods = extract_modifiers(variant)
                 cached_var = cached.get("variant")
                 cached_var_mods = extract_modifiers(cached_var) if cached_var else set()
-                combined_cached_mods = cached_mods | cached_var_mods
+                combined_cached_mods = set(cached_mods) | cached_var_mods
                 if not is_candidate_matching_modifiers(target_mods, combined_cached_mods):
                     print(f"[MUSIC][request_id={req_id}] Variant cache INVALIDATED: cached track '{cached_title}' does not match variant '{variant}'. Purging.", flush=True)
                     should_invalidate = True
@@ -496,6 +603,8 @@ async def _execute_download_and_send(
                     logger.warning("Кэшированный file_id устарел или недоступен: %s", cache_err)
                     if cached.get("file_id"):
                         await invalidate_cached_file_id_async(cached["file_id"])
+                        if source_type == "youtube":
+                            await invalidate_persistent_track_async(source_key, cached["file_id"])
                     cached = None
                 except Exception as cache_err:
                     print(f"[MUSIC][request_id={req_id}] cache send failed: {cache_err}. Falling back to live download.", flush=True)
@@ -633,6 +742,7 @@ async def _execute_download_and_send(
         owner_id = message.from_user.id if message.from_user else None
         t_u0 = time.perf_counter()
         print(f"[MUSIC][request_id={req_id}] send_audio START", flush=True)
+        log_memory_stage("before Telegram upload", req_id=req_id, source=source_type, file_path=downloaded_audio.file_path)
         try:
             sent_msg = await message.answer_audio(
                 audio=audio_file,
@@ -655,6 +765,7 @@ async def _execute_download_and_send(
                 )
             else:
                 raise
+        log_memory_stage("after Telegram upload", req_id=req_id, source=source_type, file_path=downloaded_audio.file_path)
         t_telegram = time.perf_counter() - t_u0
         print(f"[MUSIC][request_id={req_id}] send_audio SUCCESS in {t_telegram:.2f}s", flush=True)
 
@@ -676,6 +787,19 @@ async def _execute_download_and_send(
                     artist=downloaded_audio.artist,
                     duration=downloaded_audio.duration,
                     variant=variant
+                )
+            if source_type == "youtube" and variant == "original":
+                asyncio.create_task(
+                    save_persistent_track_async(
+                        source_key=source_key,
+                        source_type=source_type,
+                        source_id=source_id,
+                        artist=downloaded_audio.artist or track_info.artist or "Unknown Artist",
+                        title=downloaded_audio.title or track_info.title or "Unknown Track",
+                        album=downloaded_audio.album or getattr(track_info, "album", None),
+                        duration=downloaded_audio.duration or track_info.duration or 0,
+                        telegram_file_id=sent_msg.audio.file_id
+                    )
                 )
             print(f"[MUSIC][request_id={req_id}] cache save SUCCESS", flush=True)
 
@@ -722,24 +846,7 @@ async def _execute_download_and_send(
     except Exception as e:
         print(f"[MUSIC][request_id={req_id}] ERROR at processing: {e}\n{traceback.format_exc()}", flush=True)
         logger.exception("Ошибка при обработке запроса %s", url or raw_query)
-        err_str = str(e)
-        if "drm protected" in err_str.lower() or "is drm protected" in err_str.lower():
-            user_friendly = (
-                "<b>Этот трек защищен DRM (SoundCloud Go+).</b>\n\n"
-                "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
-            )
-        elif err_str.startswith("⚠️"):
-            # Информативные пользовательские сообщения (Яндекс Плюс, отсутствие токена VK и др.)
-            user_friendly = err_str
-        elif track_info and track_info.platform in ("Yandex Music", "VK Music") and (
-            "не найден" in err_str.lower() or "не подошел" in err_str.lower() or "кандидат" in err_str.lower() or "not found" in err_str.lower()
-        ):
-            user_friendly = (
-                f"⚠️ Не удалось найти подходящий трек на YouTube для «{html.escape(track_info.display_name)}».\n\n"
-                f"💡 Попробуйте отправить название трека или исполнителя текстом для более точного поиска."
-            )
-        else:
-            user_friendly = f"<b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(err_str[:250])}</i>"
+        user_friendly = format_download_error(e, track_info)
 
         try:
             if status_msg:

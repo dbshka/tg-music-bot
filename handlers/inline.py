@@ -35,7 +35,13 @@ from services.search import (
     _parse_candidate_title_artist,
     resolve_canonical_candidate_metadata,
 )
-from services.downloader import download_track, _clean_audio_branding, is_generic_artist_name
+from services.downloader import (
+    download_track,
+    _clean_audio_branding,
+    is_generic_artist_name,
+    DOWNLOAD_SEMAPHORE,
+    log_memory_stage,
+)
 from services.extractor import (
     find_first_url,
     resolve_track_url,
@@ -626,15 +632,16 @@ async def process_inline_download(
             req_id = f"inl_{uuid.uuid4().hex[:6]}"
             custom_art = artist if (artist and not is_generic_artist_name(artist)) else None
             custom_tit = title if (title and title.lower() != "unknown track") else None
-            downloaded = await download_track(
-                query_or_url=candidate["target"],
-                custom_title=custom_tit,
-                custom_artist=custom_art,
-                thumbnail_url=thumb_to_use,
-                expected_duration=candidate.get("duration"),
-                request_id=req_id,
-                custom_album=candidate.get("album")
-            )
+            async with DOWNLOAD_SEMAPHORE:
+                downloaded = await download_track(
+                    query_or_url=candidate["target"],
+                    custom_title=custom_tit,
+                    custom_artist=custom_art,
+                    thumbnail_url=thumb_to_use,
+                    expected_duration=candidate.get("duration"),
+                    request_id=req_id,
+                    custom_album=candidate.get("album")
+                )
 
             logger.info(
                 "INLINE DOWNLOAD SUCCESS:\n"
@@ -667,6 +674,7 @@ async def process_inline_download(
                 cand_id, effective_storage_id, downloaded.file_path, bool(thumb_file)
             )
 
+            log_memory_stage("before Telegram upload", req_id=req_id, source="inline", file_path=downloaded.file_path)
             uploaded_msg = await bot.send_audio(
                 chat_id=effective_storage_id,
                 audio=audio_file,
@@ -676,6 +684,7 @@ async def process_inline_download(
                 thumbnail=thumb_file,
                 disable_notification=True
             )
+            log_memory_stage("after Telegram upload", req_id=req_id, source="inline", file_path=downloaded.file_path)
 
             if not uploaded_msg or not uploaded_msg.audio:
                 raise RuntimeError("Не удалось получить audio object после загрузки в Telegram")

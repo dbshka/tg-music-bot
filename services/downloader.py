@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -9,11 +10,85 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union, Dict, List, Tuple
 
 import aiohttp
+import psutil
 import sys
 import yt_dlp
+
+logger = logging.getLogger(__name__)
+
+# Глобальный семафор ограничения одновременных загрузок для предотвращения OOM (Render 512 MB)
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
+
+_active_download_count = 0
+_download_count_lock = threading.Lock()
+
+
+class _DownloadCounter:
+    """Контекстный менеджер безопасного отслеживания количества одновременных загрузок."""
+    def __enter__(self):
+        global _active_download_count
+        with _download_count_lock:
+            _active_download_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _active_download_count
+        with _download_count_lock:
+            _active_download_count = max(0, _active_download_count - 1)
+
+
+
+def get_process_rss_mb(pid: Optional[int] = None) -> float:
+    """Возвращает RSS память процесса в мегабайтах (MB)."""
+    try:
+        proc = psutil.Process(pid or os.getpid())
+        return round(proc.memory_info().rss / (1024 * 1024), 2)
+    except Exception:
+        try:
+            import resource
+            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2)
+        except Exception:
+            return 0.0
+
+
+def log_memory_stage(
+    stage: str,
+    req_id: Optional[str] = None,
+    source: Optional[str] = None,
+    file_path: Optional[Union[str, Path]] = None,
+    extra: Optional[str] = None
+) -> None:
+    """
+    Логирует аккуратную диагностику RSS процесса перед/после каждого ключевого этапа
+    без логирования секретов, токенов, cookies или чувствительных параметров.
+    """
+    pid = os.getpid()
+    rss_mb = get_process_rss_mb(pid)
+    with _download_count_lock:
+        concurrent = _active_download_count
+
+    file_size_str = "none"
+    if file_path:
+        try:
+            p = Path(file_path)
+            if p.exists() and p.is_file():
+                size_bytes = p.stat().st_size
+                file_size_str = f"{size_bytes}B ({size_bytes / (1024 * 1024):.2f}MB)"
+        except Exception:
+            pass
+
+    msg = (
+        f"MEMORY [{stage}] RSS={rss_mb}MB PID={pid} job_id={req_id or 'unknown'} "
+        f"source={source or 'unknown'} concurrent={concurrent} file_size={file_size_str}"
+    )
+    if extra:
+        msg += f" {extra}"
+    print(msg, flush=True)
+    logger.info(msg)
+
 
 # Отключаем предупреждение yt-dlp об устаревании Python 3.10 в консоли
 if 'yt_dlp.YoutubeDL' in sys.modules:
@@ -161,8 +236,11 @@ def _restore_studio_speed_and_pitch_if_needed(
                 "ffmpeg", "-y", "-i", str(audio_path),
                 "-filter:a", f"asetrate={in_sr}*{ratio:.6f},aresample={in_sr}",
                 "-vn"
-            ] + codec_args + ["-threads", "0", str(temp_out)]
+            ] + codec_args + ["-threads", "1", str(temp_out)]
+            job_tag = req_tag.strip("[] ").replace("MUSIC", "").replace("request_id=", "").strip()
+            log_memory_stage("before FFmpeg", req_id=job_tag, source="audio_modifier", file_path=audio_path)
             res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log_memory_stage("after FFmpeg", req_id=job_tag, source="audio_modifier", file_path=temp_out)
             if res.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 1000:
                 shutil.move(temp_out, audio_path)
                 try:
@@ -629,6 +707,17 @@ def compute_candidate_penalty(
     return penalty
 
 
+def _track_download_concurrency(func):
+    """Декоратор для безопасного инкремента/декремента счетчика активных задач загрузки."""
+    import functools
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with _DownloadCounter():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+@_track_download_concurrency
 def _sync_download(
     query_or_url: str,
     output_dir: Path,
@@ -654,16 +743,16 @@ def _sync_download(
         # Максимальный допустимый размер файла для предотвращения переполнения диска
         "max_filesize": MAX_FILE_SIZE_BYTES,
         # Приоритет отдаем прямому M4A (AAC) аудиопотоку: без долгой перекодировки FFmpeg в MP3 (-3..5 сек)
-        # Если прямого M4A нет, берем лучший аудиопоток (webm/opus) либо видео+аудио поток для извлечения звука
-        "format": "ba[ext=m4a]/ba[ext=mp3]/ba/bv*+ba/b/best",
+        # Исключительно чистые аудиопотоки! Скачивание видеодорожек строго запрещено.
+        "format": "ba[ext=m4a]/ba[ext=mp3]/ba",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "writethumbnail": not skip_thumbnail,
         "quiet": True,
         "no_warnings": True,
-        # Ультра-быстрая сеть: увеличенный буфер и параллельная загрузка фрагментов потока
+        # Ультра-быстрая сеть: увеличенный буфер и последовательная загрузка фрагментов потока
         "buffersize": 256 * 1024,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 1,
         "socket_timeout": 5,
         "retries": 1,
         "postprocessors": [
@@ -672,10 +761,10 @@ def _sync_download(
                 "preferredcodec": "m4a",
             }
         ],
-        # Быстрая конфигурация: все доступные потоки CPU, без лишнего пережатия
+        # Энергоэффективная конфигурация: строго 1 поток для исключения OOM на многоядерных хостах Render (512 MB)
         "postprocessor_args": {
             "FFmpegExtractAudio": [
-                "-threads", "0",
+                "-threads", "1",
                 "-vn"
             ]
         },
@@ -695,19 +784,9 @@ def _sync_download(
 
     if is_youtube and cookies_info["active"]:
         ydl_opts["cookiefile"] = cookies_info["path"]
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android"],
-            }
-        }
         print(f"{req_tag}[DOWNLOADER] Быстрый режим с cookies: {cookies_info['path']}", flush=True)
     elif is_youtube:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android"],
-            }
-        }
-        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиент android)", flush=True)
+        print(f"{req_tag}[DOWNLOADER] Режим без cookies (клиенты по умолчанию)", flush=True)
 
 
     is_search = query_or_url.startswith("ytsearch") or query_or_url.startswith("scsearch")
@@ -1192,11 +1271,7 @@ def _sync_download(
                             selected_entry["_retried"] = True
                             retry_cand_opts = dict(cand_dl_opts)
                             retry_cand_opts.pop("cookiefile", None)
-                            retry_cand_opts["extractor_args"] = {
-                                "youtube": {
-                                    "player_client": ["android"]
-                                }
-                            }
+                            retry_cand_opts.pop("extractor_args", None)
                             try:
                                 with yt_dlp.YoutubeDL(retry_cand_opts) as ydl_retry:
                                     res_info = ydl_retry.extract_info(target_url, download=True)
@@ -1391,10 +1466,15 @@ def _sync_download(
                     hook_times["dl_end"] = time.perf_counter()
 
             def pp_hook(d):
-                if d.get("status") == "started" and not hook_times["pp_start"]:
-                    hook_times["pp_start"] = time.perf_counter()
+                if d.get("status") == "started":
+                    if not hook_times["pp_start"]:
+                        hook_times["pp_start"] = time.perf_counter()
+                    in_f = d.get("info_dict", {}).get("filepath")
+                    log_memory_stage("before FFmpeg", req_id=request_id, source=source, file_path=in_f)
                 elif d.get("status") == "finished":
                     hook_times["pp_end"] = time.perf_counter()
+                    out_f = d.get("info_dict", {}).get("filepath")
+                    log_memory_stage("after FFmpeg", req_id=request_id, source=source, file_path=out_f)
 
             dl_opts["progress_hooks"] = [p_hook]
             dl_opts["postprocessor_hooks"] = [pp_hook]
@@ -1432,37 +1512,36 @@ def _sync_download(
             res_info["_source_modifiers"] = extract_modifiers(direct_text)
             return res_info
 
+    log_memory_stage("before yt-dlp", req_id=request_id, source="youtube" if is_youtube else "soundcloud")
     try:
         info = _execute_extraction(ydl_opts)
     except Exception as extract_err:
         err_msg = str(extract_err).lower()
-        should_retry_no_cookies = "cookiefile" in ydl_opts and any(
-            m in err_msg for m in [
-                "sign in", "bot", "cookie", "reload", "403",
-                "requested format", "format", "not available", "unavailable"
-            ]
-        )
         def _fallback_direct_search(last_err):
             # Точная прямая ссылка не должна молча заменяться другим треком (Section 11, 15)
             print(f"[DOWNLOADER] Прямая ссылка недоступна: {last_err}", flush=True)
             raise last_err
 
-        if should_retry_no_cookies:
-            print(f"[DOWNLOADER] Сессия cookies вызвала ошибку ({extract_err}). Пробуем чистый запуск без cookies с клиентами android/ios...", flush=True)
+        is_retryable_yt = is_youtube and any(
+            m in err_msg for m in [
+                "sign in", "bot", "cookie", "reload", "403",
+                "requested format", "format", "not available", "unavailable"
+            ]
+        )
+
+        if is_retryable_yt:
+            print(f"[DOWNLOADER] Первичный запуск YouTube вызвал ошибку ({extract_err}). Пробуем чистый запуск без cookies...", flush=True)
             ydl_opts_retry = dict(ydl_opts)
             ydl_opts_retry.pop("cookiefile", None)
-            ydl_opts_retry["format"] = "ba[ext=m4a]/ba[ext=mp3]/ba/bv*+ba/b/best"
-            ydl_opts_retry["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["android", "mweb", "ios"],
-                }
-            }
+            ydl_opts_retry.pop("extractor_args", None)
+            ydl_opts_retry["format"] = "ba[ext=m4a]/ba[ext=mp3]/ba"
             try:
                 info = _execute_extraction(ydl_opts_retry)
             except Exception as retry_err:
                 return _fallback_direct_search(retry_err)
         else:
             return _fallback_direct_search(extract_err)
+    log_memory_stage("after yt-dlp", req_id=request_id, source="youtube" if is_youtube else "soundcloud")
 
     if "entries" in info:
         if not info["entries"]:
@@ -1471,7 +1550,25 @@ def _sync_download(
 
     audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"]]
     if not audio_files:
-        raise FileNotFoundError("Аудиофайл не был создан после обработки.")
+        existing = [f.name for f in output_dir.iterdir() if f.is_file()]
+        print(f"{req_tag}[DOWNLOADER] ERROR: Аудиофайл не найден среди файлов в {output_dir}: {existing}", flush=True)
+        # Аварийная проверка: возможно yt-dlp сохранил аудио (.webm, .opus, .ogg), но постпроцессор не завершился
+        alt_audio = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".webm", ".opus", ".ogg", ".flac", ".wav"]]
+        if alt_audio:
+            print(f"{req_tag}[DOWNLOADER] Обнаружен альтернативный аудиопоток {alt_audio[0].name}. Запускаем аварийное извлечение M4A через FFmpeg (-threads 1)...", flush=True)
+            emergency_out = output_dir / f"{alt_audio[0].stem}.m4a"
+            try:
+                import subprocess
+                cmd = ["ffmpeg", "-y", "-i", str(alt_audio[0]), "-c:a", "aac", "-b:a", "192k", "-threads", "1", "-vn", str(emergency_out)]
+                res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0 and emergency_out.exists() and emergency_out.stat().st_size > 1000:
+                    audio_files = [emergency_out]
+                    alt_audio[0].unlink(missing_ok=True)
+            except Exception as em_err:
+                print(f"{req_tag}[DOWNLOADER] Аварийная конвертация не удалась: {em_err}", flush=True)
+
+        if not audio_files:
+            raise FileNotFoundError(f"Аудиофайл не был создан после обработки. (найдены файлы: {existing})")
 
     audio_path = audio_files[0]
     filesize = audio_path.stat().st_size
@@ -1569,9 +1666,11 @@ def _sync_download(
                     f"при эталоне {expected_duration}с (разница {final_dl_diff}с > {max_final_gate}с)."
                 )
 
+    log_memory_stage("before metadata", req_id=request_id, source=source_title or "track", file_path=audio_path)
     t_tag0 = time.perf_counter()
     _apply_custom_metadata(audio_path, extracted_title, extracted_artist, embedded_cover_path or thumbnail_path, album=extracted_album)
     perf_timings["tags"] = time.perf_counter() - t_tag0
+    log_memory_stage("after metadata", req_id=request_id, source=source_title or "track", file_path=audio_path)
 
     return DownloadedAudio(
         file_path=audio_path,
