@@ -149,6 +149,9 @@ from services.identity import (
     extract_core_title_words,
     compute_title_match_ratio,
     validate_artist_match,
+    validate_candidate_artist,
+    is_artist_in_title_inversion,
+    parse_query_artist_title,
     parse_speed_multiplier,
     TRACK_MODIFIERS,
     PERFORMANCE_MODIFIERS,
@@ -158,6 +161,7 @@ from services.identity import (
     SUPER_SLOWED_GROUP,
     SLOWED_GROUP
 )
+
 
 
 @dataclass
@@ -523,10 +527,36 @@ def compute_candidate_penalty(
     penalty = 0.0
     cand_text = f"{cand_title} {cand_uploader} {cand_channel}"
 
+    # Если артист и название не переданы явно, но есть поисковый запрос (например "Tribal Church - Pt.02"):
+    if not custom_artist and not custom_title and clean_search:
+        p_art, p_tit = parse_query_artist_title(clean_search)
+        if p_art and p_tit:
+            custom_artist = p_art
+            custom_title = p_tit
+
     # 0. Строгая валидация исполнителя (Artist Validation)
     if custom_artist:
-        if not validate_artist_match(custom_artist, cand_text):
-            penalty += 4000.0
+        is_cand_art_valid = validate_candidate_artist(
+            expected_artist=custom_artist,
+            candidate_title=cand_title,
+            candidate_uploader=cand_uploader,
+            candidate_channel=cand_channel,
+            expected_title=custom_title,
+            candidate_artist=e.get("artist") or e.get("creator")
+        )
+        if not is_cand_art_valid:
+            if is_artist_in_title_inversion(
+                expected_artist=custom_artist,
+                candidate_title=cand_title,
+                expected_title=custom_title,
+                candidate_uploader=cand_uploader,
+                candidate_channel=cand_channel
+            ):
+                # Исполнитель из запроса оказался названием песни другого артиста (например Joe Inferno - Tribal Church)
+                penalty += 20000.0
+            else:
+                # Чужой исполнитель не совпадает
+                penalty += 12000.0
         else:
             penalty -= 80.0
 
@@ -538,12 +568,22 @@ def compute_candidate_penalty(
             penalty -= 120.0
         elif match_ratio >= 0.5:
             penalty -= 30.0
+        elif match_ratio >= 0.25:
+            penalty += 6000.0
         else:
-            penalty += 4000.0
+            # 0% совпадение названия трека: чужая песня другого названия!
+            penalty += 15000.0
+
 
     ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
     cand_modifiers = extract_modifiers(cand_text, ignore_words=ignore_cand_words)
     req_mods = requested_modifiers or set()
+
+    # Деприоритет очевидных DJ-сетов, подкастов и длинных миксов для одиночных треков
+    cand_lower = cand_text.lower()
+    if not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "set", "сет", "podcast", "подкаст", "1 hour", "час"]):
+        if any(k in cand_lower for k in ["dj set", "continuous mix", "podcast", "подкаст", "full set", "radio show"]):
+            penalty += 5000.0
 
     cookies_info = get_cookies_info()
 
@@ -581,7 +621,11 @@ def compute_candidate_penalty(
                 else:
                     penalty += 300.0 + (diff * 10.0)
         elif dur > 0:
-            if dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
+            if dur > 1800 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час", "podcast", "сет", "set"]):
+                penalty += 8000.0
+            elif dur > 1200 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час", "podcast", "сет", "set"]):
+                penalty += 4500.0
+            elif dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
                 penalty += 2500.0
             elif dur >= 45:
                 penalty += 0.0
@@ -645,7 +689,11 @@ def compute_candidate_penalty(
                 else:
                     penalty += 200.0 + (diff * 5.0)
         elif dur > 0:
-            if dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
+            if dur > 1800 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час", "podcast", "сет", "set"]):
+                penalty += 8000.0
+            elif dur > 1200 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час", "podcast", "сет", "set"]):
+                penalty += 4500.0
+            elif dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
                 penalty += 2500.0
             elif dur >= 45:
                 penalty += 0.0
@@ -706,7 +754,11 @@ def compute_candidate_penalty(
                 else:
                     penalty += 300.0 + (diff * 10.0)
         elif dur > 0:
-            if dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
+            if dur > 1800 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час", "podcast", "сет", "set"]):
+                penalty += 8000.0
+            elif dur > 1200 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час", "podcast", "сет", "set"]):
+                penalty += 4500.0
+            elif dur > 900 and not any(k in clean_search.lower() for k in ["mix", "микс", "album", "альбом", "1 hour", "час"]):
                 penalty += 2500.0
             elif dur >= 45:
                 penalty += 0.0
@@ -729,6 +781,46 @@ def compute_candidate_penalty(
                     penalty -= 50.0
 
     return penalty
+
+
+def _find_or_convert_candidate_audio(
+    output_dir: Path,
+    cand_idx: int = 0,
+    cand_title: str = "",
+    req_tag: str = ""
+) -> list[Path]:
+    """
+    Находит скачанный аудиофайл в директории кандидата.
+    Если yt-dlp сохранил альтернативный поток (.webm, .opus, .ogg, .flac, .wav),
+    выполняет аварийную перекодировку в .m4a через FFmpeg (-threads 1 -vn).
+    """
+    audio_files = [
+        f for f in output_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")
+    ]
+    if audio_files:
+        return audio_files
+
+    alt_audio = [
+        f for f in output_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in [".webm", ".opus", ".ogg", ".flac", ".wav"] and not f.name.startswith("backup_")
+    ]
+    if alt_audio:
+        cand_label = f"Кандидат #{cand_idx+1}: " if cand_title else ""
+        print(f"{req_tag}[DOWNLOADER] {cand_label}обнаружен альтернативный аудиопоток {alt_audio[0].name}. Запускаем конвертацию в M4A (-threads 1)...", flush=True)
+        emergency_out = output_dir / f"{alt_audio[0].stem}.m4a"
+        try:
+            import subprocess
+            cmd = ["ffmpeg", "-y", "-i", str(alt_audio[0]), "-c:a", "aac", "-b:a", "192k", "-threads", "1", "-vn", str(emergency_out)]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and emergency_out.exists() and emergency_out.stat().st_size > 1000:
+                alt_audio[0].unlink(missing_ok=True)
+                print(f"{req_tag}[DOWNLOADER] {cand_label}успешная конвертация в {emergency_out.name} ({emergency_out.stat().st_size} байт)", flush=True)
+                return [emergency_out]
+        except Exception as em_err:
+            print(f"{req_tag}[DOWNLOADER] {cand_label}конвертация не удалась: {em_err}", flush=True)
+
+    return []
 
 
 def _track_download_concurrency(func):
@@ -826,6 +918,7 @@ def _sync_download(
     t_start_all = time.perf_counter()
 
     def _execute_extraction(options):
+        nonlocal custom_artist, custom_title
         source = "soundcloud" if (query_or_url.startswith("scsearch") or "soundcloud.com" in query_or_url) else "youtube"
         if is_search:
             # 1. Параллельный опрос YouTube + SoundCloud для мгновенного нахождения лучшего трека
@@ -876,6 +969,16 @@ def _sync_download(
                     print(f"{req_tag}[SEARCH] Ошибка поиска {src_name}: {ex}", flush=True)
                     return []
 
+            clean_artist_str = (custom_artist or "").strip()
+            clean_title_str = (custom_title or "").strip()
+            if not clean_artist_str and not clean_title_str and clean_search:
+                p_art, p_tit = parse_query_artist_title(clean_search)
+                if p_art and p_tit:
+                    clean_artist_str = p_art
+                    clean_title_str = p_tit
+                    custom_artist = p_art
+                    custom_title = p_tit
+
             # Анализируем, запрашивал ли пользователь явно модификаторы (slowed, sped up, remix, cover и т.д.)
             req_context = f"{custom_artist or ''} {custom_title or ''} {clean_search} {requested_variant or ''}".lower()
             requested_modifiers = extract_modifiers(req_context) or set()
@@ -885,9 +988,8 @@ def _sync_download(
             if not core_title_words and custom_title:
                 core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
 
-            clean_artist_str = (custom_artist or "").strip()
-            clean_title_str = (custom_title or "").strip()
             clean_q_simple = f"{clean_artist_str} {clean_title_str}".strip() if (clean_artist_str and clean_title_str) else clean_search
+
 
             import concurrent.futures
             if is_apple_music or is_text_input:
@@ -1044,7 +1146,30 @@ def _sync_download(
 
                 cand_title = selected_entry.get("title") or target_url
                 cand_dur = selected_entry.get("duration") or 0
-                print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1} ({cand_source}): '{cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
+
+                # 0) Предварительная валидация кандидата ДО скачивания потока:
+                if is_artist_in_title_inversion(
+                    expected_artist=custom_artist,
+                    candidate_title=cand_title,
+                    expected_title=custom_title,
+                    candidate_uploader=selected_entry.get("uploader"),
+                    candidate_channel=selected_entry.get("channel")
+                ):
+                    print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' отклонён до загрузки (инверсия: артист '{custom_artist}' в названии чужой песни).", flush=True)
+                    continue
+
+                if core_title_words:
+                    pre_title_ratio = compute_title_match_ratio(cand_title, core_title_words)
+                    if pre_title_ratio < 0.25:
+                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' отклонён до загрузки (название имеет совпадение {pre_title_ratio:.2f} < 0.25 с '{custom_title}').", flush=True)
+                        continue
+
+                try:
+                    print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1} ({cand_source}): '{cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
+                except UnicodeEncodeError:
+                    safe_cand_title = cand_title.encode("ascii", errors="replace").decode("ascii")
+                    print(f"{req_tag}[YTDLP] Попытка загрузки кандидата #{cand_idx+1} ({cand_source}): '{safe_cand_title}' ({cand_dur}s) url='{target_url}'", flush=True)
+
 
                 cand_dl_opts = dict(options)
                 cand_dl_opts["extract_flat"] = False
@@ -1089,10 +1214,24 @@ def _sync_download(
                     t_d1 = time.perf_counter()
                     dur_dl_all = t_d1 - t_d0
 
-                    # Проверяем появление готового аудиофайла (M4A или MP3)
-                    audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
+                    # Проверяем появление готового аудиофайла (M4A или MP3, либо альтернативный поток)
+                    audio_files = _find_or_convert_candidate_audio(output_dir, cand_idx, cand_title, req_tag=req_tag)
                     if not audio_files:
-                        raise FileNotFoundError("Аудиофайл не был создан после обработки кандидата.")
+                        existing_files = [f.name for f in output_dir.iterdir() if f.is_file() and not f.name.startswith("backup_")]
+                        is_likely_filesize = bool(cand_dur and cand_dur > 1200)
+                        print(
+                            f"{req_tag}[DOWNLOADER] Кандидат #{cand_idx+1} '{cand_title}' ({cand_dur}s) не создал аудиопоток "
+                            f"(файлы на диске: {existing_files}, max_filesize_abort={is_likely_filesize}). Пропускаем кандидата.",
+                            flush=True
+                        )
+                        for temp_f in output_dir.iterdir():
+                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                try:
+                                    temp_f.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                        last_cand_error = ValueError(f"Кандидат #{cand_idx+1} '{cand_title}' не предоставил доступного аудиопотока.")
+                        continue
 
                     actual_dur = int(res_info.get("duration") or 0)
                     if not actual_dur and audio_files:
@@ -1111,6 +1250,27 @@ def _sync_download(
                     # а кандидат имеет менее 50% совпадения, ЭТО ЧУЖАЯ ПЕСНЯ! Немедленно отклоняем.
                     if core_title_words and cand_match_ratio < 0.5:
                         print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' недостаточно соответствует названию ({cand_match_ratio:.2f} < 0.5, words={core_title_words}). Отклоняем как неаутентичный.", flush=True)
+                        for temp_f in output_dir.iterdir():
+                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                try:
+                                    temp_f.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                        continue
+
+                    # 1b. Жесткая валидация исполнителя: кандидат должен принадлежать ожидаемому артисту!
+                    cand_uploader_val = res_info.get("uploader") or selected_entry.get("uploader")
+                    cand_channel_val = res_info.get("channel") or selected_entry.get("channel")
+                    cand_artist_val = res_info.get("artist") or selected_entry.get("artist") or res_info.get("creator") or selected_entry.get("creator")
+                    if custom_artist and not validate_candidate_artist(
+                        expected_artist=custom_artist,
+                        candidate_title=cand_entry_title,
+                        candidate_uploader=cand_uploader_val,
+                        candidate_channel=cand_channel_val,
+                        expected_title=custom_title,
+                        candidate_artist=cand_artist_val
+                    ):
+                        print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не принадлежит исполнителю '{custom_artist}'. Отклоняем как неаутентичный.", flush=True)
                         for temp_f in output_dir.iterdir():
                             if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                                 try:
@@ -1299,12 +1459,28 @@ def _sync_download(
                             try:
                                 with yt_dlp.YoutubeDL(retry_cand_opts) as ydl_retry:
                                     res_info = ydl_retry.extract_info(target_url, download=True)
-                                audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
+                                audio_files = _find_or_convert_candidate_audio(output_dir, cand_idx, cand_title, req_tag=req_tag)
                                 if audio_files:
                                     retry_title = unicodedata.normalize("NFKC", res_info.get("title") or cand_title or "")
                                     retry_match_ratio = compute_title_match_ratio(retry_title, core_title_words)
                                     if core_title_words and retry_match_ratio < 0.5:
                                         print(f"{req_tag}[AUTHENTICITY] Резервный запуск: кандидат '{retry_title}' не соответствует названию ({retry_match_ratio:.2f} < 0.5). Отклоняем.", flush=True)
+                                        for temp_f in output_dir.iterdir():
+                                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
+                                                try:
+                                                    temp_f.unlink(missing_ok=True)
+                                                except Exception:
+                                                    pass
+                                        continue
+
+                                    if custom_artist and not validate_candidate_artist(
+                                        expected_artist=custom_artist,
+                                        candidate_title=retry_title,
+                                        candidate_uploader=res_info.get("uploader") or selected_entry.get("uploader"),
+                                        candidate_channel=res_info.get("channel") or selected_entry.get("channel"),
+                                        expected_title=custom_title
+                                    ):
+                                        print(f"{req_tag}[AUTHENTICITY] Резервный запуск: кандидат '{retry_title}' не принадлежит исполнителю '{custom_artist}'. Отклоняем.", flush=True)
                                         for temp_f in output_dir.iterdir():
                                             if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
                                                 try:
@@ -1391,6 +1567,8 @@ def _sync_download(
                     sc_opts["extract_flat"] = True
                     sc_opts["noplaylist"] = True
                     sc_opts["ignoreerrors"] = True
+                    sc_opts["socket_timeout"] = 12
+                    sc_opts["retries"] = 2
                     with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
                         sc_raw = ydl_sc.extract_info(f"scsearch4:{clean_search}", download=False)
                         sc_entries = [e for e in sc_raw.get("entries", []) if e]
@@ -1430,31 +1608,70 @@ def _sync_download(
                                 max_sc_diff = 45 if requested_modifiers else (4 if (is_apple_music or is_text_input) else 35)
                                 if expected_duration and not requested_modifiers and s_diff > max_sc_diff:
                                     continue
+
+                                if custom_artist and is_artist_in_title_inversion(
+                                    expected_artist=custom_artist,
+                                    candidate_title=s_title,
+                                    expected_title=custom_title,
+                                    candidate_uploader=s_cand.get("uploader"),
+                                    candidate_channel=s_cand.get("channel")
+                                ):
+                                    print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{s_title}' отклонён до загрузки (инверсия: артист '{custom_artist}' в названии чужой песни).", flush=True)
+                                    continue
+
+                                if core_title_words:
+                                    s_title_ratio = compute_title_match_ratio(s_title, core_title_words)
+                                    if s_title_ratio < 0.25:
+                                        print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{s_title}' отклонён до загрузки (название имеет совпадение {s_title_ratio:.2f} < 0.25 с '{custom_title}').", flush=True)
+                                        continue
+
                                 if s_url:
                                     sc_opts_dl = dict(options)
                                     sc_opts_dl.pop("cookiefile", None)
                                     sc_opts_dl.pop("extractor_args", None)
                                     sc_opts_dl.pop("proxy", None)  # Прокси только для YouTube
                                     sc_opts_dl["extract_flat"] = False
+                                    sc_opts_dl["socket_timeout"] = 12
+                                    sc_opts_dl["retries"] = 2
                                     try:
                                         with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
-                                            res_cand = ydl_sc_dl.extract_info(s_url, download=True)
-                                            audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"] and not f.name.startswith("backup_")]
-                                            if audio_files:
-                                                sc_dur = int(res_cand.get("duration") or 0)
-                                                sc_diff = abs(sc_dur - expected_duration) if (expected_duration and expected_duration > 35 and sc_dur > 0) else 0
-                                                if (is_apple_music or is_text_input) and expected_duration and not requested_modifiers and sc_diff > 4:
-                                                    print(f"{req_tag}[DOWNLOADER] SoundCloud track '{s_title}' diff={sc_diff}s > 4s. Rejecting.", flush=True)
-                                                    for temp_f in output_dir.iterdir():
-                                                        if temp_f.is_file() and not temp_f.name.startswith("cover"):
-                                                            temp_f.unlink(missing_ok=True)
-                                                    continue
-                                                new_sc_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, s_mods, req_tag, req_query=clean_search)
-                                                if new_sc_dur > 0:
-                                                    res_cand["duration"] = new_sc_dur
-                                                res_cand["_source_title"] = s_title
-                                                res_cand["_source_modifiers"] = s_mods
-                                                return res_cand
+                                             res_cand = ydl_sc_dl.extract_info(s_url, download=True)
+                                             audio_files = _find_or_convert_candidate_audio(output_dir, cand_idx=0, cand_title=s_title, req_tag=req_tag)
+                                             if audio_files:
+                                                 sc_entry_title = unicodedata.normalize("NFKC", res_cand.get("title") or s_title or "")
+                                                 sc_match_ratio = compute_title_match_ratio(sc_entry_title, core_title_words)
+                                                 if core_title_words and sc_match_ratio < 0.5:
+                                                     print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{sc_entry_title}' недостаточно соответствует названию ({sc_match_ratio:.2f} < 0.5). Отклоняем.", flush=True)
+                                                     for temp_f in output_dir.iterdir():
+                                                         if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                                                             temp_f.unlink(missing_ok=True)
+                                                     continue
+                                                 if custom_artist and not validate_candidate_artist(
+                                                     expected_artist=custom_artist,
+                                                     candidate_title=sc_entry_title,
+                                                     candidate_uploader=res_cand.get("uploader") or s_cand.get("uploader"),
+                                                     candidate_channel=res_cand.get("channel") or s_cand.get("channel"),
+                                                     expected_title=custom_title
+                                                 ):
+                                                     print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{sc_entry_title}' не принадлежит исполнителю '{custom_artist}'. Отклоняем.", flush=True)
+                                                     for temp_f in output_dir.iterdir():
+                                                         if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                                                             temp_f.unlink(missing_ok=True)
+                                                     continue
+                                                 sc_dur = int(res_cand.get("duration") or 0)
+                                                 sc_diff = abs(sc_dur - expected_duration) if (expected_duration and expected_duration > 35 and sc_dur > 0) else 0
+                                                 if (is_apple_music or is_text_input) and expected_duration and not requested_modifiers and sc_diff > 4:
+                                                     print(f"{req_tag}[DOWNLOADER] SoundCloud track '{s_title}' diff={sc_diff}s > 4s. Rejecting.", flush=True)
+                                                     for temp_f in output_dir.iterdir():
+                                                         if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                                                             temp_f.unlink(missing_ok=True)
+                                                     continue
+                                                 new_sc_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, s_mods, req_tag, req_query=clean_search)
+                                                 if new_sc_dur > 0:
+                                                     res_cand["duration"] = new_sc_dur
+                                                 res_cand["_source_title"] = s_title
+                                                 res_cand["_source_modifiers"] = s_mods
+                                                 return res_cand
                                     except Exception as s_err:
                                         print(f"{req_tag}[DOWNLOADER] SoundCloud fallback candidate '{s_url}' не удался: {s_err}", flush=True)
                                         continue
@@ -1463,6 +1680,8 @@ def _sync_download(
                 if last_cand_error:
                     if any(k in str(last_cand_error).lower() for k in ["drm protected", "drm"]):
                         raise ValueError("Трек защищён DRM на найденных источниках. Попробуйте другой запрос или ссылку.")
+                    if any(k in str(last_cand_error).lower() for k in ["не был создан", "не предоставил доступного аудиопотока", "превышен max_filesize"]):
+                        raise ValueError("Ни один подходящий аудиопоток не найден для данного трека.")
                     raise last_cand_error
             raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
         else:
@@ -1927,8 +2146,13 @@ async def download_track(
 
         # 1. Fallback в YouTube Search (поиск аудиорелиза из 5 кандидатов)
         # Пропускаем, если YouTube заблокировал IP проверкой на бота или ошибкой 429
-        if fallback_queries and not query_or_url.startswith("ytsearch") and not is_bot_blocked:
-            yt_query = fallback_queries[0]
+        clean_init_q = query_or_url.split(":", 1)[1].strip() if ":" in query_or_url else query_or_url.strip()
+        available_yt_fallbacks = [
+            q for q in fallback_queries
+            if q.strip().lower() != clean_init_q.lower()
+        ]
+        if available_yt_fallbacks and not is_bot_blocked:
+            yt_query = available_yt_fallbacks[0]
             try:
                 print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch5:{yt_query}", flush=True)
                 audio = await asyncio.to_thread(
@@ -1975,8 +2199,9 @@ async def download_track(
             raise primary_error
 
         # 2. Fallback в SoundCloud (выбирает полный трек среди лучших вариантов запроса)
-        # Применяется только если исходный запрос был ссылкой на сторонний сервис, а не прямым YouTube или поиском
-        if not query_or_url.startswith(("ytsearch", "scsearch")) and not is_direct_yt:
+        # Применяется для сторонних каталогов (Spotify, Apple Music и др.) либо если исходный запрос не был прямым YouTube
+        can_try_sc = not is_direct_yt and (is_apple_music or not query_or_url.startswith(("ytsearch", "scsearch")))
+        if can_try_sc:
             for fb_q in fallback_queries[:2]:
                 try:
                     print(f"{req_tag}[DOWNLOADER] Попытка Fallback через SoundCloud: scsearch5:{fb_q}", flush=True)

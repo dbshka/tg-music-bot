@@ -336,4 +336,591 @@ def test_emergency_recovery_when_alternative_audio_exists(tmp_path):
     assert not raw_audio.exists()
 
 
+def test_candidate_penalty_deprioritizes_multihour_dj_sets():
+    from services.downloader import compute_candidate_penalty
+
+    query = "Tribal Church - Pt.02"
+
+    # Candidate 1: Short track (216s), title matches
+    cand_short = {
+        "title": "Tribal Church - Pt.02",
+        "duration": 216,
+        "uploader": "Tribal Church - Topic",
+    }
+    # Candidate 2: 1-hour DJ set (3577s) with keyword
+    cand_dj_set = {
+        "title": "Dj Carter - DJ Set @ Tribal Church 28.01.2012",
+        "duration": 3577,
+        "uploader": "DJ Carter",
+    }
+    # Candidate 3: Continuous mix (1500s)
+    cand_mix = {
+        "title": "Tribal Church Continuous Mix 2020",
+        "duration": 1500,
+        "uploader": "Various",
+    }
+    # Candidate 4: Long audio without keyword (3577s)
+    cand_long_only = {
+        "title": "Tribal Church Pt.02",
+        "duration": 3577,
+        "uploader": "Tribal Church - Topic",
+    }
+
+    pen_short = compute_candidate_penalty(cand_short, clean_search=query, is_apple_music=False)
+    pen_dj = compute_candidate_penalty(cand_dj_set, clean_search=query, is_apple_music=False)
+    pen_mix = compute_candidate_penalty(cand_mix, clean_search=query, is_apple_music=False)
+    pen_long = compute_candidate_penalty(cand_long_only, clean_search=query, is_apple_music=False)
+
+    assert pen_dj >= 13000.0  # 8000 (dur>1800) + 5000 (dj set keyword)
+    assert pen_mix >= 9500.0  # 4500 (dur>1200) + 5000 (continuous mix keyword)
+    assert pen_long >= 7500.0  # 8000 (dur>1800) with topic bonus
+    assert pen_short < 100.0
+    assert pen_dj > pen_short + 12000.0
+
+
+def test_find_or_convert_candidate_audio_direct_and_transcode(tmp_path):
+    from pathlib import Path
+    from services.downloader import _find_or_convert_candidate_audio
+    from unittest.mock import patch, MagicMock
+
+    # Case 1: M4A already exists -> direct return, no conversion
+    cand_dir1 = tmp_path / "cand1"
+    cand_dir1.mkdir()
+    m4a_file = cand_dir1 / "track.m4a"
+    m4a_file.write_bytes(b"AAC audio content" * 10)
+
+    res1 = _find_or_convert_candidate_audio(cand_dir1, cand_idx=0, cand_title="Test Track")
+    assert len(res1) == 1
+    assert res1[0] == m4a_file
+
+    # Case 2: Only WebM Opus exists -> transcoded via ffmpeg with -threads 1
+    cand_dir2 = tmp_path / "cand2"
+    cand_dir2.mkdir()
+    webm_file = cand_dir2 / "audio_opus.webm"
+    webm_file.write_bytes(b"WEBM audio content" * 100)
+
+    with patch("subprocess.run") as mock_sub:
+        def fake_ffmpeg(cmd, **kwargs):
+            assert "-threads" in cmd and cmd[cmd.index("-threads") + 1] == "1"
+            assert "-vn" in cmd
+            out_file = Path(cmd[-1])
+            out_file.write_bytes(b"transcoded AAC" * 100)
+            return MagicMock(returncode=0)
+
+        mock_sub.side_effect = fake_ffmpeg
+        res2 = _find_or_convert_candidate_audio(cand_dir2, cand_idx=1, cand_title="Opus Track")
+        assert len(res2) == 1
+        assert res2[0].suffix.lower() == ".m4a"
+        assert res2[0].name == "audio_opus.m4a"
+        assert not webm_file.exists()
+
+    # Case 3: Only thumbnail / no audio file exists -> returns empty list []
+    cand_dir3 = tmp_path / "cand3"
+    cand_dir3.mkdir()
+    thumb_file = cand_dir3 / "cover.webp"
+    thumb_file.write_bytes(b"image data" * 10)
+
+    res3 = _find_or_convert_candidate_audio(cand_dir3, cand_idx=2, cand_title="Empty Audio")
+    assert res3 == []
+
+
+def test_candidate_advances_when_audio_file_missing(tmp_path):
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    cand1_called = False
+    cand2_called = False
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            nonlocal cand1_called, cand2_called
+            if not download:
+                return {
+                    "entries": [
+                        {
+                            "id": "cand_missing_stream",
+                            "title": "Tribal Church - Pt.02 (Official Audio)",
+                            "uploader": "Tribal Church - Topic",
+                            "channel": "Tribal Church - Topic",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_missing_stream",
+                            "_source": "youtube",
+                        },
+                        {
+                            "id": "cand_valid",
+                            "title": "Tribal Church - Pt.02",
+                            "uploader": "Tribal Church",
+                            "channel": "Tribal Church",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_valid",
+                            "_source": "youtube",
+                        },
+                    ]
+                }
+            # download=True:
+            if "cand_missing_stream" in url:
+                cand1_called = True
+                # Simulates yt-dlp aborting download due to max_filesize or missing stream:
+                # only thumbnail written, no audio files (.m4a/.mp3/.webm)
+                (tmp_path / "cover.jpg").write_bytes(b"thumbnail bytes")
+                return {
+                    "id": "cand_missing_stream",
+                    "title": "Tribal Church - Pt.02 (Official Audio)",
+                    "duration": 216,
+                }
+            elif "cand_valid" in url:
+                cand2_called = True
+                audio_f = tmp_path / "valid_track.m4a"
+                audio_f.write_bytes(b"valid audio bytes" * 100)
+                return {
+                    "id": "cand_valid",
+                    "title": "Tribal Church - Pt.02",
+                    "duration": 216,
+                }
+            return {}
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL):
+        res = _sync_download(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            output_dir=tmp_path,
+            custom_title="Pt.02",
+            custom_artist="Tribal Church",
+            expected_duration=216,
+            is_apple_music=True,
+        )
+
+        assert cand1_called is True
+        assert cand2_called is True
+        assert res is not None
+        assert res.file_path.exists()
+        assert res.file_path.name == "valid_track.m4a"
+
+
+@pytest.mark.asyncio
+async def test_fallback_queries_allowed_for_catalog_ytsearch():
+    from unittest.mock import patch
+    from services.downloader import download_track, DownloadedAudio
+    from pathlib import Path
+
+    calls = []
+
+    def fake_sync_download(query, *args, **kwargs):
+        calls.append(query)
+        if len(calls) == 1:
+            raise ValueError("Ни один подходящий аудиопоток не найден для данного трека.")
+        fake_path = Path("/tmp/fake_track.m4a")
+        return DownloadedAudio(
+            file_path=fake_path,
+            title="Pt.02",
+            artist="Tribal Church",
+            duration=216,
+            thumbnail_path=None,
+            filesize=1000,
+            folder_path=Path("/tmp"),
+        )
+
+    with patch("services.downloader._sync_download", side_effect=fake_sync_download):
+
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True,
+        )
+
+        assert len(calls) >= 2
+        assert calls[0] == "ytsearch5:Tribal Church - Pt.02"
+        assert "ytsearch5:" in calls[1]
+        assert result is not None
+        assert result.title == "Pt.02"
+
+
+def test_candidate_penalty_rejects_artist_inversion_and_wrong_title():
+    from services.downloader import compute_candidate_penalty
+
+    query = "Tribal Church - Pt.02"
+    artist = "Tribal Church"
+    title = "Pt.02"
+
+    # Candidate 1: Joe Inferno (artist inversion: Tribal Church is song title, Joe Inferno is artist)
+    cand_joe_inferno = {
+        "title": "Joe Inferno - Tribal Church Feat Dye Witness (X Ray Bootleg)",
+        "duration": 216,
+        "uploader": "Joe Inferno",
+        "_source": "youtube",
+    }
+    # Candidate 2: Wrong title (Tribal Church - 1993 Remix)
+    cand_wrong_title = {
+        "title": "Tribal Church - 1993 Remix",
+        "duration": 216,
+        "uploader": "Tribal Church",
+        "_source": "youtube",
+    }
+    # Candidate 3: Authentic track
+    cand_authentic = {
+        "title": "Tribal Church - Pt.02",
+        "duration": 216,
+        "uploader": "Tribal Church - Topic",
+        "channel": "Tribal Church - Topic",
+        "_source": "youtube",
+    }
+    # Candidate 4: Multi-hour DJ set
+    cand_dj_set = {
+        "title": "Dj Carter - DJ Set @ Tribal Church 28.01.2012",
+        "duration": 3577,
+        "uploader": "DJ Carter",
+        "_source": "youtube",
+    }
+
+    pen_joe = compute_candidate_penalty(cand_joe_inferno, custom_artist=artist, custom_title=title, expected_duration=216, clean_search=query)
+    pen_wrong = compute_candidate_penalty(cand_wrong_title, custom_artist=artist, custom_title=title, expected_duration=216, clean_search=query)
+    pen_auth = compute_candidate_penalty(cand_authentic, custom_artist=artist, custom_title=title, expected_duration=216, clean_search=query)
+    pen_dj = compute_candidate_penalty(cand_dj_set, custom_artist=artist, custom_title=title, expected_duration=216, clean_search=query)
+
+    # Joe Inferno has artist inversion (+20000) and title mismatch (+15000) -> penalty >= 35000
+    assert pen_joe >= 35000.0
+    # Wrong title has title mismatch (+15000)
+    assert pen_wrong >= 14000.0
+    # DJ set has duration penalty (+8000) and keyword (+5000)
+    assert pen_dj >= 13000.0
+    # Authentic track has lowest penalty
+    assert pen_auth < 0.0
+    assert pen_wrong > pen_auth
+    assert pen_dj > pen_auth
+    assert pen_joe > pen_wrong
+
+
+def test_sync_download_rejects_artist_inversion_and_selects_valid_track(tmp_path):
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    downloaded_urls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {
+                    "entries": [
+                        {
+                            "id": "cand_joe",
+                            "title": "Joe Inferno - Tribal Church Feat Dye Witness",
+                            "uploader": "Joe Inferno",
+                            "channel": "Joe Inferno",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_joe",
+                            "_source": "youtube",
+                        },
+                        {
+                            "id": "cand_wrong_title",
+                            "title": "Tribal Church - 1993 Remix",
+                            "uploader": "Tribal Church",
+                            "channel": "Tribal Church",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_wrong_title",
+                            "_source": "youtube",
+                        },
+                        {
+                            "id": "cand_authentic",
+                            "title": "Tribal Church - Pt.02",
+                            "uploader": "Tribal Church - Topic",
+                            "channel": "Tribal Church - Topic",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_authentic",
+                            "_source": "youtube",
+                        },
+                    ]
+                }
+            downloaded_urls.append(url)
+            if "cand_wrong_title" in url:
+                audio_f = tmp_path / "wrong_track.m4a"
+                audio_f.write_bytes(b"audio" * 100)
+                return {
+                    "id": "cand_wrong_title",
+                    "title": "Tribal Church - 1993 Remix",
+                    "uploader": "Tribal Church",
+                    "duration": 216,
+                }
+            elif "cand_authentic" in url:
+                audio_f = tmp_path / "auth_track.m4a"
+                audio_f.write_bytes(b"audio" * 100)
+                return {
+                    "id": "cand_authentic",
+                    "title": "Tribal Church - Pt.02",
+                    "uploader": "Tribal Church - Topic",
+                    "channel": "Tribal Church - Topic",
+                    "duration": 216,
+                }
+            return {}
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL):
+        res = _sync_download(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            output_dir=tmp_path,
+            custom_title="Pt.02",
+            custom_artist="Tribal Church",
+            expected_duration=216,
+            is_apple_music=True,
+        )
+
+        # Joe Inferno should never even be downloaded (skipped pre-download due to inversion)
+        assert not any("cand_joe" in u for u in downloaded_urls)
+        assert res is not None
+        assert res.file_path.name == "auth_track.m4a"
+        assert res.title == "Pt.02"
+
+
+def test_validate_candidate_artist_and_inversion():
+    from services.identity import validate_candidate_artist, is_artist_in_title_inversion
+
+    # Case 1: Inversion (Joe Inferno - Tribal Church)
+    assert is_artist_in_title_inversion(
+        expected_artist="Tribal Church",
+        candidate_title="Joe Inferno - Tribal Church Feat Dye Witness",
+        expected_title="Pt.02",
+        candidate_uploader="Joe Inferno",
+        candidate_channel="Joe Inferno"
+    ) is True
+
+    assert validate_candidate_artist(
+        expected_artist="Tribal Church",
+        candidate_title="Joe Inferno - Tribal Church Feat Dye Witness",
+        candidate_uploader="Joe Inferno",
+        candidate_channel="Joe Inferno",
+        expected_title="Pt.02"
+    ) is False
+
+    # Case 2: Direct match (Tribal Church - Pt.02)
+    assert is_artist_in_title_inversion(
+        expected_artist="Tribal Church",
+        candidate_title="Tribal Church - Pt.02",
+        expected_title="Pt.02",
+        candidate_uploader="Tribal Church - Topic"
+    ) is False
+
+    assert validate_candidate_artist(
+        expected_artist="Tribal Church",
+        candidate_title="Tribal Church - Pt.02",
+        candidate_uploader="Tribal Church - Topic",
+        expected_title="Pt.02"
+    ) is True
+
+    # Case 3: Topic channel without artist in title
+    assert validate_candidate_artist(
+        expected_artist="The Weeknd",
+        candidate_title="Blinding Lights (Official Audio)",
+        candidate_uploader="The Weeknd - Topic",
+        candidate_channel="The Weeknd - Topic",
+        expected_title="Blinding Lights"
+    ) is True
+
+    # Case 4: Reversed query "Title - Artist"
+    assert is_artist_in_title_inversion(
+        expected_artist="Tribal Church",
+        candidate_title="Pt.02 - Tribal Church",
+        expected_title="Pt.02",
+        candidate_uploader="Tribal Church"
+    ) is False
+
+    assert validate_candidate_artist(
+        expected_artist="Tribal Church",
+        candidate_title="Pt.02 - Tribal Church",
+        candidate_uploader="Tribal Church",
+        expected_title="Pt.02"
+    ) is True
+
+    # Case 5: Featuring / Multiple artists
+    assert validate_candidate_artist(
+        expected_artist="Drake",
+        candidate_title="Drake feat. 21 Savage - Rich Flex",
+        candidate_uploader="Drake",
+        expected_title="Rich Flex"
+    ) is True
+
+    # Case 6: Substring safety: "Eve" vs "Steve Aoki"
+    assert validate_candidate_artist(
+        expected_artist="Eve",
+        candidate_title="Steve Aoki - Just Hold On",
+        candidate_uploader="Steve Aoki",
+        candidate_channel="Steve Aoki",
+        expected_title="Tambourine"
+    ) is False
+
+
+def test_spotify_pipeline_rejects_unrelated_candidate_even_if_phrase_matches(tmp_path):
+    """
+    Spotify-трек 'Tribal Church - Pt.02' НЕ должен скачивать чужой трек
+    'Joe Inferno - Tribal Church Feat Dye Witness' только из-за совпадения фразы 'Tribal Church'.
+    Если подходящий трек отсутствует, пайплайн должен вызывать ошибку, а не подменять аудио.
+    """
+    from unittest.mock import patch
+    from services.downloader import _sync_download
+
+    download_called = False
+
+    class FakeYDLOnlyFake:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            nonlocal download_called
+            if not download:
+                return {
+                    "entries": [
+                        {
+                            "id": "cand_joe",
+                            "title": "Joe Inferno - Tribal Church Feat Dye Witness",
+                            "uploader": "Joe Inferno",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_joe",
+                            "_source": "youtube",
+                        }
+                    ]
+                }
+            download_called = True
+            f = tmp_path / "fake_audio.m4a"
+            f.write_bytes(b"\x00" * 2000)
+            return {
+                "id": "cand_joe",
+                "title": "Joe Inferno - Tribal Church Feat Dye Witness",
+                "uploader": "Joe Inferno",
+                "duration": 216,
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=FakeYDLOnlyFake):
+        with pytest.raises(ValueError) as exc:
+            _sync_download(
+                query_or_url="ytsearch5:Tribal Church - Pt.02",
+                output_dir=tmp_path,
+                custom_title="Pt.02",
+                custom_artist="Tribal Church",
+                expected_duration=216,
+                is_apple_music=True,
+            )
+        assert download_called is False  # Rejected pre-download!
+        assert any(k in str(exc.value).lower() for k in ["не подошел", "не найден", "ни один"])
+
+
+def test_validate_candidate_artist_and_inversion_extreme_cases():
+    """
+    Экстремальные регрессионные кейсы для защиты от инверсии и валидации артиста:
+    1. Artist = The XX, Title = The XX (eponymous)
+    2. Artist = Steve Aoki, кандидат содержит Eve Aoki
+    3. Artist = Tribal Church, Title = Tribal Church Pt.02, кандидат = Tribal Church - Pt.02
+    4. Artist = Dr. Dre, Title = Still D.R.E., кандидат = Still D.R.E. - Dr. Dre (Reversed query)
+    5. Artist = ABBA, Title = ABBA, кандидат = Some Other Artist - ABBA (Inversion of self-titled track)
+    """
+    from services.identity import is_artist_in_title_inversion, validate_candidate_artist
+
+    # 1. Artist = The XX, Title = The XX
+    assert is_artist_in_title_inversion("The XX", "The XX - The XX", "The XX") is False
+    assert validate_candidate_artist("The XX", "The XX - The XX", expected_title="The XX") is True
+
+    # 2. Artist = Steve Aoki, кандидат содержит Eve Aoki
+    assert is_artist_in_title_inversion("Steve Aoki", "Eve Aoki - Pursuit of Happiness", "Pursuit of Happiness") is False
+    assert validate_candidate_artist("Steve Aoki", "Eve Aoki - Pursuit of Happiness", expected_title="Pursuit of Happiness") is False
+    assert validate_candidate_artist("Steve Aoki", "Eve Aoki - No Idea", expected_title="No Idea") is False
+
+    # 3. Artist = Tribal Church, Title = Tribal Church Pt.02, кандидат = Tribal Church - Pt.02
+    assert is_artist_in_title_inversion("Tribal Church", "Tribal Church - Pt.02", "Tribal Church Pt.02") is False
+    assert validate_candidate_artist("Tribal Church", "Tribal Church - Pt.02", expected_title="Tribal Church Pt.02") is True
+
+    # 4. Artist = Dr. Dre, Title = Still D.R.E., кандидат = Still D.R.E. - Dr. Dre (Reversed)
+    assert is_artist_in_title_inversion("Dr. Dre", "Still D.R.E. - Dr. Dre", "Still D.R.E.") is False
+    assert validate_candidate_artist("Dr. Dre", "Still D.R.E. - Dr. Dre", expected_title="Still D.R.E.") is True
+
+    # 5. Artist = ABBA, Title = ABBA, кандидат = Some Other Artist - ABBA (Inversion)
+    assert is_artist_in_title_inversion("ABBA", "Some Other Artist - ABBA", "ABBA") is True
+    assert validate_candidate_artist("ABBA", "Some Other Artist - ABBA", expected_title="ABBA") is False
+
+
+@pytest.mark.asyncio
+async def test_integration_fake_candidate_skipped_and_valid_candidate_downloaded(tmp_path):
+    """
+    Интеграционный E2E тест полного пайплайна:
+    - Кандидат 1: ложный (Joe Inferno - Tribal Church Feat Dye Witness) -> отсекается ДО скачивания.
+    - Кандидат 2: валидный (Tribal Church - Pt.02) -> скачивается и валидируется post-download.
+    - Итог: возвращается именно аутентичный аудиофайл валидного кандидата.
+    """
+    from unittest.mock import patch
+    from pathlib import Path
+    from services.downloader import download_track
+
+    downloaded_urls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {
+                    "entries": [
+                        {
+                            "id": "cand_fake_joe",
+                            "title": "Joe Inferno - Tribal Church Feat Dye Witness",
+                            "uploader": "Joe Inferno",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_fake_joe",
+                            "_source": "youtube",
+                        },
+                        {
+                            "id": "cand_valid_pt02",
+                            "title": "Tribal Church - Pt.02",
+                            "uploader": "Tribal Church - Topic",
+                            "duration": 216,
+                            "webpage_url": "https://www.youtube.com/watch?v=cand_valid_pt02",
+                            "_source": "youtube",
+                        }
+                    ]
+                }
+            downloaded_urls.append(url)
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "valid_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "cand_valid_pt02",
+                "title": "Tribal Church - Pt.02",
+                "uploader": "Tribal Church - Topic",
+                "duration": 216,
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True
+        )
+
+        # Ложный кандидат Joe Inferno даже не пытался скачиваться
+        assert not any("cand_fake_joe" in u for u in downloaded_urls)
+        # Валидный кандидат был скачан
+        assert any("cand_valid_pt02" in u for u in downloaded_urls)
+        assert result is not None
+        assert result.artist == "Tribal Church"
+        assert result.title == "Pt.02"
+        assert result.file_path.exists()
+
+
 

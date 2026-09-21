@@ -588,3 +588,138 @@ def parse_query_artist_title(query: str) -> Tuple[Optional[str], str]:
         return by_match[1].strip(), by_match[0].strip()
 
     return None, cleaned
+
+
+def is_artist_in_title_inversion(
+    expected_artist: Optional[str],
+    candidate_title: Optional[str],
+    expected_title: Optional[str] = None,
+    candidate_uploader: Optional[str] = None,
+    candidate_channel: Optional[str] = None
+) -> bool:
+    """
+    Проверяет, не является ли кандидат чужим треком другого артиста,
+    где имя expected_artist ошибочно находится на позиции названия песни (Song Title),
+    а не исполнителя (Artist):
+    Например:
+      expected_artist = "Tribal Church", expected_title = "Pt.02"
+      candidate_title = "Joe Inferno - Tribal Church Feat Dye Witness"
+      -> 'Joe Inferno' - реальный артист кандидата (не совпадает с Tribal Church и не совпадает с Pt.02).
+      -> 'Tribal Church' - название песни чужого артиста (не совпадает с Pt.02).
+      -> uploader/channel не принадлежат 'Tribal Church'.
+      -> Это 100% инверсия подмены артиста (чужой трек)!
+    """
+    if not expected_artist or not candidate_title:
+        return False
+
+    # 1. Если uploader или channel явно принадлежат ожидаемому исполнителю,
+    # это официальный канал/топик, никакой подмены нет.
+    if candidate_uploader and validate_artist_match(expected_artist, candidate_uploader):
+        return False
+    if candidate_channel and validate_artist_match(expected_artist, candidate_channel):
+        return False
+
+    # 2. Ищем разделитель "Артист - Название" в названии кандидата
+    cand_artist_part, cand_title_part = parse_query_artist_title(candidate_title)
+    if not cand_artist_part or not cand_title_part:
+        return False
+
+    # Проверяем, совпадает ли левая часть (cand_artist_part) с expected_artist
+    cand_artist_matches_expected = validate_artist_match(expected_artist, cand_artist_part)
+    if cand_artist_matches_expected:
+        return False
+
+    # Проверяем, содержит ли правая часть (cand_title_part) имя expected_artist
+    expected_artist_in_title_part = validate_artist_match(expected_artist, cand_title_part)
+    if not expected_artist_in_title_part:
+        return False
+
+    # Здесь: expected_artist находится в правой части (в названии песни),
+    # а в левой части (на позиции исполнителя) указан ДРУГОЙ исполнитель!
+    # Исключение 1: обратный формат "Название - Исполнитель" (Reversed Query):
+    # Если левая часть совпадает с expected_title, то это валидный обратный формат.
+    if expected_title:
+        # Для eponymous-треков (где название песни совпадает с именем артиста, например ABBA - ABBA):
+        # Если левая часть cand_artist_part не совпадает с expected_artist, то кандидат вида "Some Other Artist - ABBA"
+        # является 100% инверсией чужого артиста.
+        if clean_unicode_text(expected_artist).lower() == clean_unicode_text(expected_title).lower():
+            return True
+
+        core_title = extract_core_title_words(expected_title, expected_artist)
+        if core_title and compute_title_match_ratio(cand_artist_part, core_title) >= 0.5:
+            return False  # Это "Title - Artist", не инверсия чужого артиста!
+
+    return True
+
+
+def validate_candidate_artist(
+    expected_artist: Optional[str],
+    candidate_title: Optional[str],
+    candidate_uploader: Optional[str] = None,
+    candidate_channel: Optional[str] = None,
+    expected_title: Optional[str] = None,
+    candidate_artist: Optional[str] = None
+) -> bool:
+    """
+    Комплексная проверка соответствия исполнителя кандидата:
+    - проверяет candidate_artist из метаданных трека (yt-dlp artist/creator);
+    - проверяет uploader / channel (включая Topic, VEVO, официальные каналы);
+    - проверяет позицию артиста в названии ("Artist - Title" или "Title - Artist");
+    - отсекает случаи подмены артиста (is_artist_in_title_inversion);
+    - поддерживает официальные каналы-агрегаторы дистрибуции (Release - Topic, Various Artists - Topic);
+    - проверяет вхождения составных имен (мульти-артисты, feat, ft, &, транслит).
+    """
+    if not expected_artist:
+        return True
+
+    # 1. Если это инверсия (чужой трек другого артиста с названием = имени нашего артиста) -> False!
+    if is_artist_in_title_inversion(
+        expected_artist=expected_artist,
+        candidate_title=candidate_title,
+        expected_title=expected_title,
+        candidate_uploader=candidate_uploader,
+        candidate_channel=candidate_channel
+    ):
+        return False
+
+    # 2. Проверяем метаданные артиста от yt-dlp (artist / creator), если доступны
+    if candidate_artist and validate_artist_match(expected_artist, candidate_artist):
+        return True
+
+    # 3. Проверяем uploader / channel
+    if candidate_uploader and validate_artist_match(expected_artist, candidate_uploader):
+        return True
+    if candidate_channel and validate_artist_match(expected_artist, candidate_channel):
+        return True
+
+    # 4. Проверяем название кандидата
+    if candidate_title:
+        cand_artist_part, cand_title_part = parse_query_artist_title(candidate_title)
+        if cand_artist_part and cand_title_part:
+            # Прямой формат: "Artist - Title"
+            if validate_artist_match(expected_artist, cand_artist_part):
+                return True
+            # Обратный формат: "Title - Artist" (если левая часть похожа на title)
+            if expected_title:
+                core_title = extract_core_title_words(expected_title, expected_artist)
+                if core_title and compute_title_match_ratio(cand_artist_part, core_title) >= 0.5:
+                    if validate_artist_match(expected_artist, cand_title_part):
+                        return True
+        else:
+            # Название без разделителя (например "Tribal Church Pt.02"):
+            if validate_artist_match(expected_artist, candidate_title):
+                return True
+
+    # 5. Проверяем официальные каналы-агрегаторы релизов YouTube Music (Release - Topic, Various Artists - Topic)
+    uploader_clean = clean_unicode_text(candidate_uploader or "").lower().strip()
+    channel_clean = clean_unicode_text(candidate_channel or "").lower().strip()
+    is_universal_release_topic = (
+        uploader_clean in {"release - topic", "various artists - topic", "release", "various artists"} or
+        channel_clean in {"release - topic", "various artists - topic", "release", "various artists"}
+    )
+    if is_universal_release_topic and expected_title and candidate_title:
+        core_title = extract_core_title_words(expected_title, expected_artist)
+        if core_title and compute_title_match_ratio(candidate_title, core_title) >= 0.5:
+            return True
+
+    return False
