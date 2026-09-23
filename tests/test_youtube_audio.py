@@ -923,4 +923,111 @@ async def test_integration_fake_candidate_skipped_and_valid_candidate_downloaded
         assert result.file_path.exists()
 
 
+def test_spotify_case2_psychea_transliteration_regression():
+    """
+    Регрессионный тест для Spotify ID 3m3iy4vWeXFx4HTyo15mEz (Psychea - Бесконечный стук шагов):
+    1. Исполнитель Spotify в латинице ('Psychea') должен валидироваться с кириллицей ('ПСИХЕЯ').
+    2. Валидный кандидат 'ПСИХЕЯ - Бесконечный стук шагов' признается аутентичным и ранжируется без штрафа.
+    3. Кавер 'Деревянные киты - Бесконечный стук шагов (Психея Cover)' определяется как инверсия и отсекается.
+    4. Кандидат без указания исполнителя ('Бесконечный стук шагов') получает штраф неаутентичности.
+    """
+    from services.identity import (
+        validate_artist_match,
+        validate_candidate_artist,
+        is_artist_in_title_inversion,
+        extract_core_title_words,
+        compute_title_match_ratio
+    )
+    from services.downloader import compute_candidate_penalty
+
+    expected_artist = "Psychea"
+    expected_title = "Бесконечный стук шагов"
+
+    # 1. Валидация совпадения артиста (латиница <-> кириллица)
+    assert validate_artist_match(expected_artist, "ПСИХЕЯ - Бесконечный стук шагов") is True
+    assert validate_artist_match(expected_artist, "Психея") is True
+    assert validate_artist_match("Психея", "Psychea") is True
+
+    # 2. Валидный кандидат (ПСИХЕЯ)
+    cand_valid = {
+        "title": "ПСИХЕЯ - Бесконечный стук шагов",
+        "uploader": "DemonsMusic",
+        "channel": "DemonsMusic",
+        "duration": 257.0,
+        "_source": "youtube"
+    }
+    assert is_artist_in_title_inversion(expected_artist, cand_valid["title"], expected_title) is False
+    assert validate_candidate_artist(
+        expected_artist=expected_artist,
+        candidate_title=cand_valid["title"],
+        candidate_uploader=cand_valid["uploader"],
+        candidate_channel=cand_valid["channel"],
+        expected_title=expected_title
+    ) is True
+
+    pen_valid = compute_candidate_penalty(
+        candidate=cand_valid,
+        custom_artist=expected_artist,
+        custom_title=expected_title,
+        expected_duration=None,
+        clean_search="Psychea - Бесконечный стук шагов",
+        is_apple_music=False
+    )
+    assert pen_valid < 1000.0, f"Expected low penalty for authentic candidate, got {pen_valid}"
+
+    # 3. Чужой кавер (Деревянные киты)
+    cand_cover = {
+        "title": "Деревянные киты - Бесконечный стук шагов (Психея Cover) Live @ DTH Studios",
+        "uploader": "Firecat Films / В ОГНЕ",
+        "channel": "Firecat Films / В ОГНЕ",
+        "duration": 286.0,
+        "_source": "youtube"
+    }
+    assert is_artist_in_title_inversion(expected_artist, cand_cover["title"], expected_title) is True
+    assert validate_candidate_artist(
+        expected_artist=expected_artist,
+        candidate_title=cand_cover["title"],
+        candidate_uploader=cand_cover["uploader"],
+        candidate_channel=cand_cover["channel"],
+        expected_title=expected_title
+    ) is False
+
+    pen_cover = compute_candidate_penalty(
+        candidate=cand_cover,
+        custom_artist=expected_artist,
+        custom_title=expected_title,
+        expected_duration=None,
+        clean_search="Psychea - Бесконечный стук шагов",
+        is_apple_music=False
+    )
+    assert pen_cover > 20000.0, f"Expected huge penalty for cover candidate, got {pen_cover}"
+
+    # 4. Кандидат без артиста в названии и без артиста в uploader
+    cand_no_art = {
+        "title": "Бесконечный стук шагов",
+        "uploader": "Psyshit Booking",
+        "channel": "Psyshit Booking",
+        "duration": 355.0,
+        "_source": "youtube"
+    }
+    assert validate_candidate_artist(
+        expected_artist=expected_artist,
+        candidate_title=cand_no_art["title"],
+        candidate_uploader=cand_no_art["uploader"],
+        candidate_channel=cand_no_art["channel"],
+        expected_title=expected_title
+    ) is False
+
+    pen_no_art = compute_candidate_penalty(
+        candidate=cand_no_art,
+        custom_artist=expected_artist,
+        custom_title=expected_title,
+        expected_duration=None,
+        clean_search="Psychea - Бесконечный стук шагов",
+        is_apple_music=False
+    )
+    assert pen_no_art > 10000.0, f"Expected penalty for candidate without artist, got {pen_no_art}"
+    assert pen_valid < pen_no_art, "Authentic candidate must rank higher than candidate without artist"
+
+
 

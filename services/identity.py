@@ -400,7 +400,7 @@ def transliterate_text(text: str) -> str:
 # -------------------------------------------------------------
 
 _ARTIST_SEPARATORS_RE = re.compile(
-    r'\s*(?:feat\.?|ft\.?|featuring|with|prod\.?|prod\s+by|vs\.?|x|&|,|/|\\)\s*',
+    r'\s*(?:(?:\b(?:feat|ft|featuring|with|prod|prod\s+by|vs)\b\.?)|(?:\s+x\s+)|[&,/\\|])\s*',
     re.IGNORECASE
 )
 
@@ -422,10 +422,36 @@ def split_artist_names(artist_str: Optional[str]) -> Set[str]:
     return result
 
 
+def phonetic_artist_key(text: Optional[str]) -> str:
+    """
+    Фонетическая нормализация имени артиста для устойчивого сопоставления
+    между латиницей и кириллицей (например Psychea <-> Психея, Tchaikovsky <-> Чайковский).
+    """
+    if not text:
+        return ""
+    s = transliterate_text(text).lower()
+    s = re.sub(r'[\W_]+', ' ', s).strip()
+    words = s.split()
+    norm_words = []
+    for w in words:
+        if w in {"the", "a", "an"}:
+            continue
+        w = w.replace('tch', 'ch').replace('kh', 'h').replace('ch', 'h').replace('x', 'h')
+        w = w.replace('ph', 'f').replace('w', 'v').replace('ck', 'k').replace('c', 'k')
+        w = w.replace('ts', 'c').replace('tz', 'c')
+        w = w.replace('ea', 'ya').replace('ey', 'y').replace('ia', 'ya')
+        w = w.replace('y', 'i').replace('j', 'i')
+        w = re.sub(r'(.)\1+', r'\1', w)
+        if w:
+            norm_words.append(w)
+    return " ".join(norm_words)
+
+
 def validate_artist_match(expected_artist: Optional[str], candidate_text: Optional[str]) -> bool:
     """
     Строгая валидация совпадения исполнителя:
     - проверяет точные нормализованные токены артиста в тексте кандидата (uploader/channel/title);
+    - поддерживает двустороннюю транслитерацию и фонетическое сопоставление (Psychea <-> Психея);
     - поддерживает мульти-артистов, feat, ft, &, запятые;
     - предотвращает ложные совпадения подстрок ("Eve" != "Steve Aoki", "Ian" != "Ariana Grande", "A" != "The A").
     """
@@ -438,6 +464,12 @@ def validate_artist_match(expected_artist: Optional[str], candidate_text: Option
     if clean_expected in clean_cand:
         pattern = r'(?<![a-z0-9а-яё])' + re.escape(clean_expected) + r'(?![a-z0-9а-яё])'
         if re.search(pattern, clean_cand):
+            return True
+
+    cand_tr = transliterate_text(clean_cand)
+    if clean_expected in cand_tr:
+        pattern = r'(?<![a-z0-9])' + re.escape(clean_expected) + r'(?![a-z0-9])'
+        if re.search(pattern, cand_tr):
             return True
 
     expected_sub_artists = split_artist_names(expected_artist)
@@ -453,6 +485,17 @@ def validate_artist_match(expected_artist: Optional[str], candidate_text: Option
             if art_tr != art_norm and len(art_tr) >= 2 and art_tr not in {"the", "a", "an"}:
                 pattern_tr = r'(?<![a-z0-9а-яё])' + re.escape(art_tr) + r'(?![a-z0-9а-яё])'
                 if re.search(pattern_tr, clean_cand):
+                    return True
+            if len(art_tr) >= 2:
+                pattern_cand_tr = r'(?<![a-z0-9])' + re.escape(art_tr) + r'(?![a-z0-9])'
+                if re.search(pattern_cand_tr, cand_tr):
+                    return True
+
+            art_pk = phonetic_artist_key(art_norm)
+            if len(art_pk) >= 3:
+                cand_pk = phonetic_artist_key(clean_cand)
+                pattern_pk = r'(?<![a-z0-9])' + re.escape(art_pk) + r'(?![a-z0-9])'
+                if re.search(pattern_pk, cand_pk):
                     return True
 
     return False

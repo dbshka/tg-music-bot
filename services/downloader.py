@@ -2191,7 +2191,8 @@ async def download_track(
                 print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
                 return audio
             except Exception as yt_err:
-                print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {yt_err}", flush=True)
+                safe_yt_err = str(yt_err).encode("ascii", errors="replace").decode("ascii")
+                print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {safe_yt_err}", flush=True)
         is_direct_yt = bool(("youtube.com" in query_or_url or "youtu.be" in query_or_url) and not query_or_url.startswith("ytsearch"))
         if is_direct_yt:
             print(f"{req_tag}[DOWNLOADER] Прямая ссылка YouTube завершилась ошибкой ({primary_error}). Fallback в SoundCloud запрещён.", flush=True)
