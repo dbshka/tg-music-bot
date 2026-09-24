@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import urllib.parse
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union
 
 import requests
 
@@ -22,7 +22,7 @@ def _sync_http_request(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     proxy: Optional[str] = None,
-    timeout: float = 8.0
+    timeout: Union[float, Tuple[float, float]] = 8.0
 ) -> requests.Response:
     """Выполняет синхронный HTTP GET запрос с поддержкой SOCKS5 и HTTP прокси через requests."""
     proxies = None
@@ -51,6 +51,30 @@ def extract_yandex_track_id(url: str) -> Optional[str]:
     return None
 
 
+def extract_yandex_album_id(url: str) -> Optional[str]:
+    """Извлекает ID альбома из ссылок Яндекс Музыки (если присутствует)."""
+    parsed = urllib.parse.urlparse(url.strip())
+    m_album = re.search(r'/album/(\d+)', parsed.path)
+    if m_album:
+        return m_album.group(1)
+    return None
+
+
+def normalize_yandex_url(url: str) -> Optional[str]:
+    """
+    Нормализует URL трека Яндекс Музыки, удаляя query-параметры (utm_medium, ref_id и т.д.).
+    Возвращает канонический URL вида https://music.yandex.ru/album/{album_id}/track/{track_id}
+    или https://music.yandex.ru/track/{track_id}.
+    """
+    track_id = extract_yandex_track_id(url)
+    if not track_id:
+        return None
+    album_id = extract_yandex_album_id(url)
+    if album_id:
+        return f"https://music.yandex.ru/album/{album_id}/track/{track_id}"
+    return f"https://music.yandex.ru/track/{track_id}"
+
+
 def extract_vk_audio_id(url: str) -> Optional[Tuple[str, str]]:
     """Извлекает (owner_id, audio_id) из ссылок ВКонтакте."""
     m = re.search(r'audio(-?\d+)_(\d+)', url)
@@ -64,7 +88,7 @@ async def resolve_yandex_music_track(
     session: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
-    Разрешает метаданные трека Яндекс Музыки через Russian Proxy.
+    Разрешает метаданные трека Яндекс Музыки через Russian Proxy или прямое подключение.
     Формирует точный поисковый запрос в YouTube без прямого скачивания аудиопотока из Яндекс Музыки.
     """
     parsed = urllib.parse.urlparse(url.strip())
@@ -84,6 +108,7 @@ async def resolve_yandex_music_track(
             "💡 Пожалуйста, отправьте прямую ссылку на трек (например: https://music.yandex.ru/track/60292250)."
         )
 
+    album_id = extract_yandex_album_id(url)
     proxy = get_proxy_for_source("yandex", stage="resolve")
     proxy_label = "RU" if proxy else "DIRECT"
     print(f"[PROXY] source=yandex stage=resolve proxy={proxy_label}", flush=True)
@@ -97,15 +122,81 @@ async def resolve_yandex_music_track(
         if token and token.strip():
             headers["Authorization"] = f"OAuth {token.strip()}"
 
-        # 1. Получение метаданных трека
         meta_url = f"https://api.music.yandex.net/tracks/{track_id}"
-        try:
-            resp_meta = _sync_http_request(meta_url, headers=headers, proxy=proxy, timeout=8.0)
-            meta_json = resp_meta.json()
-        except Exception as e:
-            logger.warning("Ошибка запроса метаданных Яндекс Музыки (track_id=%s): %s", track_id, e)
+        meta_json = None
+        last_error = None
+
+        # 1. Запрос через прокси (если настроен)
+        if proxy:
+            try:
+                resp_meta = _sync_http_request(meta_url, headers=headers, proxy=proxy, timeout=(3.0, 4.0))
+                meta_json = resp_meta.json()
+            except Exception as e:
+                logger.warning(
+                    "Ошибка запроса метаданных Яндекс Музыки через прокси %s (track_id=%s): %s. Пробуем напрямую...",
+                    proxy, track_id, e
+                )
+                last_error = e
+
+        # 2. Прямой запрос без прокси (если прокси не задан или через прокси произошла ошибка)
+        if not meta_json:
+            try:
+                resp_meta = _sync_http_request(meta_url, headers=headers, proxy=None, timeout=(3.0, 4.0))
+                meta_json = resp_meta.json()
+            except Exception as e:
+                logger.warning("Ошибка прямого запроса метаданных Яндекс Музыки (track_id=%s): %s", track_id, e)
+                last_error = e
+
+        # 3. HTML OpenGraph fallback, если JSON API недоступен
+        if not meta_json:
+            logger.info("Попытка извлечения метаданных Яндекс Музыки из OpenGraph HTML (track_id=%s)...", track_id)
+            html_url = normalize_yandex_url(url) or url
+            html_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }
+            html_resp = None
+            try:
+                html_resp = _sync_http_request(html_url, headers=html_headers, proxy=None, timeout=(3.0, 4.0))
+            except Exception:
+                if proxy:
+                    try:
+                        html_resp = _sync_http_request(html_url, headers=html_headers, proxy=proxy, timeout=(3.0, 4.0))
+                    except Exception as e2:
+                        last_error = e2
+
+            if html_resp and html_resp.status_code == 200:
+                html_text = html_resp.text
+                m_title = re.search(r'<meta [^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']', html_text)
+                m_desc = re.search(r'<meta [^>]*property=["\']og:description["\'][^>]*content=["\']([^"\']+)["\']', html_text)
+                m_img = re.search(r'<meta [^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']', html_text)
+
+                og_title = m_title.group(1).strip() if m_title else None
+                og_artist = None
+                if m_desc:
+                    desc_text = m_desc.group(1)
+                    parts = [p.strip() for p in desc_text.split("•") if p.strip()]
+                    if parts:
+                        og_artist = parts[0]
+
+                if og_title:
+                    og_thumb = m_img.group(1).strip() if m_img else None
+                    eff_artist = og_artist or "Unknown Artist"
+                    search_query = f"{eff_artist} - {og_title}" if (eff_artist and eff_artist.lower() not in og_title.lower()) else og_title
+                    return {
+                        "platform": "Yandex Music",
+                        "target": f"ytsearch5:{search_query}",
+                        "is_search": True,
+                        "title": og_title,
+                        "artist": eff_artist,
+                        "album": None,
+                        "album_id": album_id,
+                        "thumbnail_url": og_thumb,
+                        "duration": None,
+                        "track_id": track_id
+                    }
+
             raise ValueError(
-                f"Не удалось связаться с сервером Яндекс Музыки ({e}). "
+                f"Не удалось связаться с сервером Яндекс Музыки ({last_error}). "
                 f"Убедитесь, что настроен рабочий российский прокси (VLESS_RU_URL)."
             )
 
@@ -133,6 +224,11 @@ async def resolve_yandex_music_track(
 
         albums_list = track_data.get("albums", [])
         album = albums_list[0].get("title") if (albums_list and isinstance(albums_list[0], dict)) else None
+        eff_album_id = album_id
+        if not eff_album_id and albums_list and isinstance(albums_list[0], dict):
+            raw_aid = albums_list[0].get("id")
+            if raw_aid is not None:
+                eff_album_id = str(raw_aid)
 
         cover_uri = track_data.get("ogImage") or track_data.get("coverUri")
         thumbnail_url = f"https://{cover_uri.replace('%%', '600x600')}" if cover_uri else None
@@ -146,12 +242,20 @@ async def resolve_yandex_music_track(
             "title": title,
             "artist": artist,
             "album": album,
+            "album_id": eff_album_id,
             "thumbnail_url": thumbnail_url,
             "duration": duration,
             "track_id": track_id
         }
 
-    return await asyncio.to_thread(_do_resolve)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_do_resolve), timeout=10.0)
+    except asyncio.TimeoutError:
+        logger.warning("Превышен таймаут разрешения трека Яндекс Музыки (track_id=%s, limit=10.0s)", track_id)
+        raise ValueError(
+            "⚠️ Время ожидания ответа от Яндекс Музыки истекло.\n\n"
+            "💡 Пожалуйста, отправьте название трека текстом."
+        )
 
 
 async def resolve_vk_music_track(

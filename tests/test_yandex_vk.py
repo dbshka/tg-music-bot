@@ -9,6 +9,7 @@ Unit and integration tests for Yandex Music and VK support:
 - YouTube candidate selection, duration validation & metadata injection
 - Full end-to-end pipeline test
 """
+import asyncio
 import pytest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
@@ -25,6 +26,8 @@ from services.vless_proxy import (
 )
 from services.yandex_vk import (
     extract_yandex_track_id,
+    extract_yandex_album_id,
+    normalize_yandex_url,
     extract_vk_audio_id,
     resolve_yandex_music_track,
     resolve_vk_music_track,
@@ -798,3 +801,220 @@ async def test_vk_music_ru_domain_and_token_regression():
         assert res["is_search"] is True
         assert "url" not in res
         assert "169.254" not in res["target"]
+
+
+# ============================================================================
+# Regression Tests A - F: Yandex Music Robust Resolution & Bounded Timeout
+# ============================================================================
+
+FAKE_NOKTU_META = {
+    "result": [
+        {
+            "id": "143075895",
+            "title": "Кайф",
+            "available": True,
+            "durationMs": 127070,
+            "artists": [{"name": "НОКТУ"}],
+            "albums": [{"id": 38283718, "title": "Кайф"}],
+            "coverUri": "avatars.yandex.net/get-music-content/15018579/fa898c10.a.38283718-2/%%",
+            "ogImage": "avatars.yandex.net/get-music-content/15018579/fa898c10.a.38283718-2/%%"
+        }
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_yandex_music_regression_test_a_exact_url():
+    """
+    Test A — exact URL:
+    https://music.yandex.ru/album/38283718/track/143075895?utm_medium=copy_link&ref_id=371e271f-356d-48ad-9366-263458700d30
+    Проверить:
+    platform = Yandex Music
+    album_id = 38283718
+    track_id = 143075895
+    и успешный TrackInfo.
+    """
+    url = "https://music.yandex.ru/album/38283718/track/143075895?utm_medium=copy_link&ref_id=371e271f-356d-48ad-9366-263458700d30"
+
+    assert extract_yandex_track_id(url) == "143075895"
+    assert extract_yandex_album_id(url) == "38283718"
+    assert normalize_yandex_url(url) == "https://music.yandex.ru/album/38283718/track/143075895"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = FAKE_NOKTU_META
+
+    with patch("services.yandex_vk._sync_http_request", return_value=mock_resp):
+        res = await resolve_yandex_music_track(url)
+        assert res["platform"] == "Yandex Music"
+        assert res["album_id"] == "38283718"
+        assert res["track_id"] == "143075895"
+        assert res["title"] == "Кайф"
+        assert res["artist"] == "НОКТУ"
+
+        track_info = await resolve_track_url(url)
+        assert track_info.platform == "Yandex Music"
+        assert track_info.album_id == "38283718"
+        assert track_info.track_id == "143075895"
+        assert track_info.title == "Кайф"
+        assert track_info.artist == "НОКТУ"
+        assert track_info.duration == 127
+        assert track_info.thumbnail_url == "https://avatars.yandex.net/get-music-content/15018579/fa898c10.a.38283718-2/600x600"
+        assert track_info.target == "ytsearch5:НОКТУ - Кайф"
+
+
+@pytest.mark.asyncio
+async def test_yandex_music_regression_test_b_url_without_query():
+    """
+    Test B — URL без query:
+    Проверить тот же track без ?utm...
+    """
+    url = "https://music.yandex.ru/album/38283718/track/143075895"
+
+    assert extract_yandex_track_id(url) == "143075895"
+    assert extract_yandex_album_id(url) == "38283718"
+    assert normalize_yandex_url(url) == "https://music.yandex.ru/album/38283718/track/143075895"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = FAKE_NOKTU_META
+
+    with patch("services.yandex_vk._sync_http_request", return_value=mock_resp):
+        track_info = await resolve_track_url(url)
+        assert track_info.platform == "Yandex Music"
+        assert track_info.album_id == "38283718"
+        assert track_info.track_id == "143075895"
+        assert track_info.title == "Кайф"
+        assert track_info.artist == "НОКТУ"
+
+
+@pytest.mark.asyncio
+async def test_yandex_music_regression_test_c_arbitrary_query_parameters():
+    """
+    Test C — query parameters:
+    Проверить, что произвольные tracking-параметры не ломают parsing.
+    """
+    url = "https://music.yandex.ru/album/38283718/track/143075895?from=button&ref=feed&analytics_id=abcdef123&foo=bar"
+
+    assert extract_yandex_track_id(url) == "143075895"
+    assert extract_yandex_album_id(url) == "38283718"
+    assert normalize_yandex_url(url) == "https://music.yandex.ru/album/38283718/track/143075895"
+    assert normalize_cache_key(url) == "yandex:143075895"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = FAKE_NOKTU_META
+
+    with patch("services.yandex_vk._sync_http_request", return_value=mock_resp):
+        track_info = await resolve_track_url(url)
+        assert track_info.platform == "Yandex Music"
+        assert track_info.album_id == "38283718"
+        assert track_info.track_id == "143075895"
+
+
+@pytest.mark.asyncio
+async def test_yandex_music_regression_test_d_metadata_result():
+    """
+    Test D — metadata result:
+    Проверить, что после Yandex resolution формируются:
+    artist, title, duration, thumbnail_url, target.
+    Также проверяет OpenGraph HTML fallback при недоступности JSON API.
+    """
+    url = "https://music.yandex.ru/album/38283718/track/143075895"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = FAKE_NOKTU_META
+
+    with patch("services.yandex_vk._sync_http_request", return_value=mock_resp):
+        res = await resolve_yandex_music_track(url)
+        assert res["artist"] == "НОКТУ"
+        assert res["title"] == "Кайф"
+        assert res["duration"] == 127
+        assert res["thumbnail_url"] == "https://avatars.yandex.net/get-music-content/15018579/fa898c10.a.38283718-2/600x600"
+        assert res["target"] == "ytsearch5:НОКТУ - Кайф"
+
+    # Проверка OpenGraph HTML fallback
+    html_sample = (
+        '<html><head>'
+        '<meta property="og:title" content="Кайф">'
+        '<meta property="og:description" content="НОКТУ • Трек • 2025">'
+        '<meta property="og:image" content="https://avatars.yandex.net/get-music-content/15018579/fa898c10.a.38283718-2/m1000x1000">'
+        '</head><body></body></html>'
+    )
+    def fake_sync_http_og(u, headers=None, proxy=None, timeout=None):
+        if "api.music.yandex.net" in u:
+            raise requests.exceptions.ConnectionError("API blocked")
+        mock_html = MagicMock()
+        mock_html.status_code = 200
+        mock_html.text = html_sample
+        return mock_html
+
+    with patch("services.yandex_vk._sync_http_request", side_effect=fake_sync_http_og):
+        res_og = await resolve_yandex_music_track(url)
+        assert res_og["artist"] == "НОКТУ"
+        assert res_og["title"] == "Кайф"
+        assert res_og["thumbnail_url"] == "https://avatars.yandex.net/get-music-content/15018579/fa898c10.a.38283718-2/m1000x1000"
+        assert res_og["target"] == "ytsearch5:НОКТУ - Кайф"
+
+
+@pytest.mark.asyncio
+async def test_yandex_music_regression_test_e_timeout_bounding():
+    """
+    Test E — Yandex request timeout:
+    Смоделировать зависший HTTP request.
+    Проверить, что функция завершается controlled timeout, а не висит бесконечно.
+    """
+    import time
+    url = "https://music.yandex.ru/album/38283718/track/143075895"
+
+    def hanging_sync_http(u, headers=None, proxy=None, timeout=None):
+        time.sleep(2.0)
+        return MagicMock()
+
+    async def fake_wait_for(fut, timeout):
+        if hasattr(fut, "close"):
+            fut.close()
+        raise asyncio.TimeoutError()
+
+    with patch("services.yandex_vk._sync_http_request", side_effect=hanging_sync_http), \
+         patch("asyncio.wait_for", side_effect=fake_wait_for):
+        with pytest.raises(ValueError, match="Время ожидания ответа от Яндекс Музыки истекло"):
+            await resolve_yandex_music_track(url)
+
+
+@pytest.mark.asyncio
+async def test_yandex_music_regression_test_f_metadata_failure_and_fallback():
+    """
+    Test F — Yandex metadata failure:
+    1. Прокси падает с ошибкой/таймаутом -> авто-переход на прямое подключение -> успех.
+    2. Полный сбой всех каналов -> понятное исключение ValueError.
+    """
+    url = "https://music.yandex.ru/album/38283718/track/143075895"
+
+    # 1. Сбой прокси, успех прямого запроса
+    direct_called = False
+    def fake_proxy_fail_then_direct(u, headers=None, proxy=None, timeout=None):
+        nonlocal direct_called
+        if proxy is not None:
+            raise requests.exceptions.ConnectTimeout("Proxy unreachable")
+        direct_called = True
+        mock_r = MagicMock()
+        mock_r.status_code = 200
+        mock_r.json.return_value = FAKE_NOKTU_META
+        return mock_r
+
+    with patch("services.yandex_vk.get_proxy_for_source", return_value="socks5://127.0.0.1:10809"), \
+         patch("services.yandex_vk._sync_http_request", side_effect=fake_proxy_fail_then_direct):
+        res = await resolve_yandex_music_track(url)
+        assert direct_called is True
+        assert res["title"] == "Кайф"
+        assert res["artist"] == "НОКТУ"
+
+    # 2. Полный сбой (API 404 / 500 и HTML недоступен)
+    def fake_complete_fail(u, headers=None, proxy=None, timeout=None):
+        raise requests.exceptions.HTTPError("404 Not Found")
+
+    with patch("services.yandex_vk._sync_http_request", side_effect=fake_complete_fail):
+        with pytest.raises(ValueError, match="Не удалось связаться с сервером Яндекс Музыки"):
+            await resolve_yandex_music_track(url)

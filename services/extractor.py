@@ -59,6 +59,8 @@ class ExtractedTrack:
     thumbnail_url: Optional[str] = None
     duration: Optional[int] = None
     album: Optional[str] = None
+    album_id: Optional[str] = None
+    track_id: Optional[str] = None
 
     @property
     def display_name(self) -> str:
@@ -877,12 +879,22 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
 
     clean_url_key = f"url:{url.strip()}"
     cached = _get_cached_extracted_track(clean_url_key)
+    if not cached and ("music.yandex." in url or "yandex." in url):
+        from services.yandex_vk import normalize_yandex_url
+        norm_u = normalize_yandex_url(url)
+        if norm_u:
+            cached = _get_cached_extracted_track(f"url:{norm_u}")
     if cached:
         return cached
 
     result = await _resolve_track_url_inner(url, session)
     if result:
         _set_cached_extracted_track(clean_url_key, result)
+        if result.platform == "Yandex Music":
+            from services.yandex_vk import normalize_yandex_url
+            norm_u = normalize_yandex_url(url)
+            if norm_u and f"url:{norm_u}" != clean_url_key:
+                _set_cached_extracted_track(f"url:{norm_u}", result)
     return result
 
 
@@ -931,7 +943,9 @@ async def _resolve_track_url_inner(url: str, session: aiohttp.ClientSession) -> 
             artist=res["artist"],
             thumbnail_url=res["thumbnail_url"],
             duration=res["duration"],
-            album=res.get("album")
+            album=res.get("album"),
+            album_id=res.get("album_id"),
+            track_id=res.get("track_id")
         )
 
     # 2. Spotify
