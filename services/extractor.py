@@ -1,8 +1,11 @@
 import asyncio
+import copy
 import logging
 import re
+import time
 import unicodedata
 import urllib.parse
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import aiohttp
@@ -64,6 +67,35 @@ class ExtractedTrack:
         if self.title:
             return self.title
         return self.target
+
+
+_EXTRACTED_CACHE: OrderedDict[str, tuple[ExtractedTrack, float]] = OrderedDict()
+_CACHE_TTL_SECONDS = 600.0  # 10 minutes TTL
+_CACHE_MAX_SIZE = 1000
+
+
+def _get_cached_extracted_track(key: str) -> Optional[ExtractedTrack]:
+    if key not in _EXTRACTED_CACHE:
+        return None
+    track, expire_at = _EXTRACTED_CACHE[key]
+    if time.time() > expire_at:
+        del _EXTRACTED_CACHE[key]
+        return None
+    _EXTRACTED_CACHE.move_to_end(key)
+    return copy.copy(track)
+
+
+def _set_cached_extracted_track(key: str, track: ExtractedTrack):
+    if key in _EXTRACTED_CACHE:
+        _EXTRACTED_CACHE.move_to_end(key)
+    _EXTRACTED_CACHE[key] = (copy.copy(track), time.time() + _CACHE_TTL_SECONDS)
+    if len(_EXTRACTED_CACHE) > _CACHE_MAX_SIZE:
+        _EXTRACTED_CACHE.popitem(last=False)
+
+
+def clear_extracted_cache():
+    """Очищает in-memory TTL кэш распознанных треков."""
+    _EXTRACTED_CACHE.clear()
 
 
 def find_first_url(text: str) -> Optional[str]:
@@ -386,6 +418,10 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
        сохраняя оригинальный текст пользователя (кириллицу).
     """
     clean_q = unicodedata.normalize("NFC", query).strip()
+    cache_key = f"text:{clean_q.lower()}"
+    cached = _get_cached_extracted_track(cache_key)
+    if cached:
+        return cached
 
     parsed_artist, parsed_title = None, clean_q
     for sep in [" — ", " - ", " – "]:
@@ -397,7 +433,7 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
 
     # 1. Запрос с явными модификаторами (например 'Billie Eilish — bad guy 1.1x')
     if has_track_modifiers(clean_q):
-        return ExtractedTrack(
+        res = ExtractedTrack(
             platform="TextSearch",
             target=f"ytsearch5:{clean_q}",
             is_search=True,
@@ -406,10 +442,13 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
             thumbnail_url=None,
             duration=None
         )
+        _set_cached_extracted_track(cache_key, res)
+        return res
 
     # 2. Поиск канонического студийного оригинала
     canonical = await resolve_canonical_track_info_async(clean_q)
     if canonical:
+        _set_cached_extracted_track(cache_key, canonical)
         return canonical
 
     # 3. Резервная проверка каталога со сменой раскладки (только для запроса в каталог!)
@@ -417,6 +456,7 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
     if flipped.lower() != clean_q.lower():
         canonical_flipped = await resolve_canonical_track_info_async(flipped)
         if canonical_flipped:
+            _set_cached_extracted_track(cache_key, canonical_flipped)
             return canonical_flipped
 
     # 4. Резервный поиск по оригинальному тексту (редкий звук, инди, кириллица, SoundCloud)
@@ -429,7 +469,7 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
                 parsed_artist, parsed_title = parts[0].strip(), parts[1].strip()
                 break
 
-    return ExtractedTrack(
+    res = ExtractedTrack(
         platform="TextSearch",
         target=f"ytsearch5:{clean_q}",
         is_search=True,
@@ -438,6 +478,8 @@ async def resolve_text_to_track_info(query: str) -> ExtractedTrack:
         thumbnail_url=None,
         duration=None
     )
+    _set_cached_extracted_track(cache_key, res)
+    return res
 
 
 async def _extract_microlink_metadata(url: str, session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -832,6 +874,19 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     is_safe_after, reason_after = is_safe_url(url)
     if not is_safe_after:
         raise ValueError(f"Недопустимая ссылка после редиректа ({reason_after})")
+
+    clean_url_key = f"url:{url.strip()}"
+    cached = _get_cached_extracted_track(clean_url_key)
+    if cached:
+        return cached
+
+    result = await _resolve_track_url_inner(url, session)
+    if result:
+        _set_cached_extracted_track(clean_url_key, result)
+    return result
+
+
+async def _resolve_track_url_inner(url: str, session: aiohttp.ClientSession) -> ExtractedTrack:
 
     parsed = urllib.parse.urlparse(url)
     domain = parsed.netloc.lower()

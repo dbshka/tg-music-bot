@@ -476,6 +476,52 @@ def _apply_custom_metadata(
         pass
 
 
+def _cleanup_temp_candidate_files(output_dir: Path):
+    """Безопасная очистка временных аудиофайлов кандидата, сохраняя обложку и бэкапы."""
+    try:
+        if not output_dir.exists():
+            return
+        for temp_f in output_dir.iterdir():
+            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_") and not temp_f.name.startswith("thumb_") and not temp_f.name.startswith("embedded_"):
+                try:
+                    temp_f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _process_remote_cover_bytes(data: bytes, target_path: Path) -> tuple[Optional[Path], Optional[Path]]:
+    """
+    Атомарная синхронная обработка обложки из байтов в один проход в памяти:
+    1. Декодирует изображение через PIL.
+    2. Устраняет леттербоксинг (чёрные полосы) один раз.
+    3. Создает полноразмерный квадратный JPEG (quality=95) для ID3 APIC / MP4 covr.
+    4. Создает уменьшенную копию <=320x320 (quality=85) для Telegram sendAudio.
+    """
+    try:
+        import io
+        highres_path = target_path.with_name(f"embedded_{target_path.stem}.jpg")
+        thumb_path = target_path.with_name(f"thumb_{target_path.stem}.jpg")
+        with Image.open(io.BytesIO(data)) as img:
+            rgb_img = img.convert("RGB")
+            cleaned = trim_letterbox_black_bars(rgb_img)
+            highres_img = make_square_cover(cleaned, max_side=None)
+            highres_img.save(highres_path, "JPEG", quality=95)
+
+            tg_img = make_square_cover(highres_img, max_side=320)
+            tg_img.save(thumb_path, "JPEG", quality=85)
+            return thumb_path, highres_path
+    except Exception:
+        raw_thumb = target_path.with_suffix(".raw_img")
+        raw_thumb.write_bytes(data)
+        highres_cover = _prepare_embedded_cover(raw_thumb)
+        tg_thumb = _convert_thumbnail_to_jpg(highres_cover or raw_thumb)
+        if raw_thumb.exists() and raw_thumb not in (highres_cover, tg_thumb):
+            raw_thumb.unlink(missing_ok=True)
+        return tg_thumb, highres_cover
+
+
 async def _download_remote_thumbnail(url: str, target_path: Path) -> tuple[Optional[Path], Optional[Path]]:
     """
     Скачивает обложку по URL через shared session.
@@ -488,18 +534,74 @@ async def _download_remote_thumbnail(url: str, target_path: Path) -> tuple[Optio
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 data = await resp.read()
-                raw_thumb = target_path.with_suffix(".raw_img")
-                raw_thumb.write_bytes(data)
-                highres_cover = await asyncio.to_thread(_prepare_embedded_cover, raw_thumb)
-                tg_thumb = await asyncio.to_thread(_convert_thumbnail_to_jpg, highres_cover or raw_thumb)
-                if raw_thumb.exists() and raw_thumb not in (highres_cover, tg_thumb):
-                    raw_thumb.unlink(missing_ok=True)
-                return tg_thumb, highres_cover
+                return await asyncio.to_thread(_process_remote_cover_bytes, data, target_path)
     except Exception:
         pass
     return None, None
 
 
+
+
+def _is_candidate_promising(
+    candidate: dict,
+    custom_artist: Optional[str] = None,
+    custom_title: Optional[str] = None,
+    core_title_words: Optional[set] = None,
+    clean_search: str = ""
+) -> bool:
+    """
+    Быстрая и легковесная проверка: является ли YouTube-кандидат перспективным.
+    Используется для обоснованного сокращения ожидания медленного SoundCloud (grace period).
+    Возвращает False, если кандидат:
+    - является очевидной инверсией артиста в названии чужой песни (например Joe Inferno - Tribal Church);
+    - не проходит базовую валидацию артиста;
+    - имеет неприемлемо низкое совпадение названия (< 0.25);
+    - является очевидно ложным кандидатом.
+    """
+    e = candidate
+    cand_title = e.get("_norm_title") or unicodedata.normalize("NFKC", e.get("title") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+    cand_uploader = e.get("_norm_uploader") or unicodedata.normalize("NFKC", e.get("uploader") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+    cand_channel = e.get("_norm_channel") or unicodedata.normalize("NFKC", e.get("channel") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+
+    if not custom_artist and not custom_title and clean_search:
+        p_art, p_tit = parse_query_artist_title(clean_search)
+        if p_art and p_tit:
+            custom_artist = p_art
+            custom_title = p_tit
+
+    # 1. Проверка явной инверсии артиста в названии чужой песни
+    if custom_artist:
+        if is_artist_in_title_inversion(
+            expected_artist=custom_artist,
+            candidate_title=cand_title,
+            expected_title=custom_title,
+            candidate_uploader=cand_uploader,
+            candidate_channel=cand_channel
+        ):
+            return False
+
+        # 2. Валидация принадлежности ожидаемому артисту
+        is_art_valid = validate_candidate_artist(
+            expected_artist=custom_artist,
+            candidate_title=cand_title,
+            candidate_uploader=cand_uploader,
+            candidate_channel=cand_channel,
+            expected_title=custom_title,
+            candidate_artist=e.get("artist") or e.get("creator")
+        )
+        if not is_art_valid:
+            return False
+
+    # 3. Совпадение ключевых слов названия трека
+    if not core_title_words and custom_title:
+        core_title_words = extract_core_title_words(custom_title, custom_artist)
+
+    if core_title_words:
+        ratio = compute_title_match_ratio(cand_title, core_title_words)
+        if ratio < 0.25:
+            return False
+
+    return True
 
 
 def compute_candidate_penalty(
@@ -513,15 +615,29 @@ def compute_candidate_penalty(
     source: str = "youtube",
     clean_search: str = ""
 ) -> float:
-    """Вычисляет штрафные баллы для ранжирования кандидата."""
+    """Вычисляет штрафные баллы для ранжирования кандидата с мемоизацией результатов."""
     e = candidate
-    cand_title = unicodedata.normalize("NFKC", e.get("title") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
-    cand_uploader = unicodedata.normalize("NFKC", e.get("uploader") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
-    cand_channel = unicodedata.normalize("NFKC", e.get("channel") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+
+    cand_title = e.get("_norm_title")
+    if cand_title is None:
+        cand_title = unicodedata.normalize("NFKC", e.get("title") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+        e["_norm_title"] = cand_title
+
+    cand_uploader = e.get("_norm_uploader")
+    if cand_uploader is None:
+        cand_uploader = unicodedata.normalize("NFKC", e.get("uploader") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+        e["_norm_uploader"] = cand_uploader
+
+    cand_channel = e.get("_norm_channel")
+    if cand_channel is None:
+        cand_channel = unicodedata.normalize("NFKC", e.get("channel") or "").lower().replace("’", "'").replace("‘", "'").replace("`", "'")
+        e["_norm_channel"] = cand_channel
+
     dur = e.get("duration") or 0
     fmt_str = (str(e.get("formats", "")) + str(e.get("format_id", ""))).lower()
     is_prev = "preview" in fmt_str or (expected_duration and expected_duration > 50 and 0 < dur <= 35)
     if is_prev:
+        e["_penalty"] = 5000.0
         return 5000.0
 
     penalty = 0.0
@@ -535,6 +651,8 @@ def compute_candidate_penalty(
             custom_title = p_tit
 
     # 0. Строгая валидация исполнителя (Artist Validation)
+    is_cand_art_valid = True
+    is_inv = False
     if custom_artist:
         is_cand_art_valid = validate_candidate_artist(
             expected_artist=custom_artist,
@@ -545,13 +663,14 @@ def compute_candidate_penalty(
             candidate_artist=e.get("artist") or e.get("creator")
         )
         if not is_cand_art_valid:
-            if is_artist_in_title_inversion(
+            is_inv = is_artist_in_title_inversion(
                 expected_artist=custom_artist,
                 candidate_title=cand_title,
                 expected_title=custom_title,
                 candidate_uploader=cand_uploader,
                 candidate_channel=cand_channel
-            ):
+            )
+            if is_inv:
                 # Исполнитель из запроса оказался названием песни другого артиста (например Joe Inferno - Tribal Church)
                 penalty += 20000.0
             else:
@@ -559,9 +678,12 @@ def compute_candidate_penalty(
                 penalty += 12000.0
         else:
             penalty -= 80.0
+    e["_is_art_valid"] = is_cand_art_valid
+    e["_is_inversion"] = is_inv
 
     # 1. Семантическое соответствие названия трека (Core Title Matching)
     core_title_words = extract_core_title_words(custom_title, artist=custom_artist) if custom_title else set()
+    match_ratio = 1.0
     if core_title_words:
         match_ratio = compute_title_match_ratio(cand_title, core_title_words)
         if match_ratio >= 0.8:
@@ -573,10 +695,11 @@ def compute_candidate_penalty(
         else:
             # 0% совпадение названия трека: чужая песня другого названия!
             penalty += 15000.0
-
+    e["_title_ratio"] = match_ratio
 
     ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
     cand_modifiers = extract_modifiers(cand_text, ignore_words=ignore_cand_words)
+    e["_cand_modifiers"] = cand_modifiers
     req_mods = requested_modifiers or set()
 
     # Деприоритет очевидных DJ-сетов, подкастов и длинных миксов для одиночных треков
@@ -780,6 +903,7 @@ def compute_candidate_penalty(
                 if ca in cand_uploader or ca.replace(" ", "") in cand_uploader.replace(" ", ""):
                     penalty -= 50.0
 
+    e["_penalty"] = penalty
     return penalty
 
 
@@ -989,6 +1113,7 @@ def _sync_download(
                 core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
 
             clean_q_simple = f"{clean_artist_str} {clean_title_str}".strip() if (clean_artist_str and clean_title_str) else clean_search
+            ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
 
 
             import concurrent.futures
@@ -1035,15 +1160,43 @@ def _sync_download(
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks))
             try:
-                futures = [executor.submit(_fetch_candidates, q, src) for src, q in search_tasks]
-                done, not_done = concurrent.futures.wait(futures, timeout=7.0)
-                for f in done:
-                    try:
-                        res = f.result()
-                        if res:
-                            entries.extend(res)
-                    except Exception:
-                        pass
+                futures = {executor.submit(_fetch_candidates, q, src): src for src, q in search_tasks}
+                yt_futures = {f for f, src in futures.items() if src == "youtube"}
+
+                t_deadline = time.perf_counter() + 7.0
+                while futures and time.perf_counter() < t_deadline:
+                    remaining_time = max(0.05, t_deadline - time.perf_counter())
+                    done_batch, _ = concurrent.futures.wait(
+                        list(futures.keys()),
+                        timeout=min(0.15, remaining_time),
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    for f in done_batch:
+                        futures.pop(f, None)
+                        try:
+                            res = f.result()
+                            if res:
+                                entries.extend(res)
+                        except Exception:
+                            pass
+
+                    # Адаптивное завершение: если все YouTube-задачи завершились и вернули хотя бы одного
+                    # действительно перспективного кандидата, даем медленным SoundCloud-задачам льготный лимит 0.8с.
+                    # Если все кандидаты YouTube мусорные/сомнительные (инверсии, несовпадение названия/артиста), НЕ обрываем SoundCloud на 0.8с.
+                    has_promising_yt = any(
+                        e.get("_source") == "youtube" and _is_candidate_promising(
+                            e,
+                            custom_artist=custom_artist,
+                            custom_title=custom_title,
+                            core_title_words=core_title_words,
+                            clean_search=clean_search
+                        )
+                        for e in entries
+                    )
+                    all_yt_done = not any(f in futures for f in yt_futures)
+                    if all_yt_done and has_promising_yt:
+                        if t_deadline > time.perf_counter() + 0.8:
+                            t_deadline = time.perf_counter() + 0.8
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1105,34 +1258,35 @@ def _sync_download(
             })
             print(f"{req_tag}[YTDLP] invocation=#{inv_idx1} purpose='parallel_candidate_search' start={t_s0 - t_start_all:.2f}s end={t_s1 - t_start_all:.2f}s duration={dur_s:.2f}s result='OK ({len(entries)} candidates)'", flush=True)
 
-            if not entries:
-                raise ValueError("Трек не найден по данному запросу.")
-
             # 2. Интеллектуальный Query-Aware скоринг кандидатов
-            t_c0 = time.perf_counter()
-
-            def _candidate_penalty(e):
-                return compute_candidate_penalty(
-                    candidate=e,
-                    custom_artist=custom_artist,
-                    custom_title=custom_title,
-                    expected_duration=expected_duration,
-                    requested_modifiers=requested_modifiers,
-                    is_text_input=is_text_input,
-                    is_apple_music=is_apple_music,
-                    source=source,
-                    clean_search=clean_search
-                )
-
-            ranked_candidates = sorted(entries, key=_candidate_penalty)
-            t_c1 = time.perf_counter()
-            perf_timings["candidate_selection"] += (t_c1 - t_c0)
-
-            # 3. Цикл скачивания лучших кандидатов с принципом гарантированной доставки (Zero False Negatives)
+            has_usable_candidate = False
             last_cand_error = None
             youtube_blocked = False
             best_fallback_info = None
 
+            if not entries:
+                ranked_candidates = []
+            else:
+                t_c0 = time.perf_counter()
+
+                def _candidate_penalty(e):
+                    return compute_candidate_penalty(
+                        candidate=e,
+                        custom_artist=custom_artist,
+                        custom_title=custom_title,
+                        expected_duration=expected_duration,
+                        requested_modifiers=requested_modifiers,
+                        is_text_input=is_text_input,
+                        is_apple_music=is_apple_music,
+                        source=source,
+                        clean_search=clean_search
+                    )
+
+                ranked_candidates = sorted(entries, key=_candidate_penalty)
+                t_c1 = time.perf_counter()
+                perf_timings["candidate_selection"] += (t_c1 - t_c0)
+
+            # 3. Цикл скачивания лучших кандидатов с принципом гарантированной доставки (Zero False Negatives)
             for cand_idx, selected_entry in enumerate(ranked_candidates):
                 cand_source = selected_entry.get("_source") or source
                 if youtube_blocked and cand_source == "youtube":
@@ -1148,18 +1302,23 @@ def _sync_download(
                 cand_dur = selected_entry.get("duration") or 0
 
                 # 0) Предварительная валидация кандидата ДО скачивания потока:
-                if is_artist_in_title_inversion(
-                    expected_artist=custom_artist,
-                    candidate_title=cand_title,
-                    expected_title=custom_title,
-                    candidate_uploader=selected_entry.get("uploader"),
-                    candidate_channel=selected_entry.get("channel")
-                ):
+                is_inv_pre = selected_entry.get("_is_inversion")
+                if is_inv_pre is None and custom_artist:
+                    is_inv_pre = is_artist_in_title_inversion(
+                        expected_artist=custom_artist,
+                        candidate_title=cand_title,
+                        expected_title=custom_title,
+                        candidate_uploader=selected_entry.get("uploader"),
+                        candidate_channel=selected_entry.get("channel")
+                    )
+                if is_inv_pre:
                     print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' отклонён до загрузки (инверсия: артист '{custom_artist}' в названии чужой песни).", flush=True)
                     continue
 
                 if core_title_words:
-                    pre_title_ratio = compute_title_match_ratio(cand_title, core_title_words)
+                    pre_title_ratio = selected_entry.get("_title_ratio")
+                    if pre_title_ratio is None:
+                        pre_title_ratio = compute_title_match_ratio(cand_title, core_title_words)
                     if pre_title_ratio < 0.25:
                         print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_title}' отклонён до загрузки (название имеет совпадение {pre_title_ratio:.2f} < 0.25 с '{custom_title}').", flush=True)
                         continue
@@ -1224,12 +1383,7 @@ def _sync_download(
                             f"(файлы на диске: {existing_files}, max_filesize_abort={is_likely_filesize}). Пропускаем кандидата.",
                             flush=True
                         )
-                        for temp_f in output_dir.iterdir():
-                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                try:
-                                    temp_f.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                        _cleanup_temp_candidate_files(output_dir)
                         last_cand_error = ValueError(f"Кандидат #{cand_idx+1} '{cand_title}' не предоставил доступного аудиопотока.")
                         continue
 
@@ -1250,12 +1404,7 @@ def _sync_download(
                     # а кандидат имеет менее 50% совпадения, ЭТО ЧУЖАЯ ПЕСНЯ! Немедленно отклоняем.
                     if core_title_words and cand_match_ratio < 0.5:
                         print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' недостаточно соответствует названию ({cand_match_ratio:.2f} < 0.5, words={core_title_words}). Отклоняем как неаутентичный.", flush=True)
-                        for temp_f in output_dir.iterdir():
-                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                try:
-                                    temp_f.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                        _cleanup_temp_candidate_files(output_dir)
                         continue
 
                     # 1b. Жесткая валидация исполнителя: кандидат должен принадлежать ожидаемому артисту!
@@ -1271,12 +1420,7 @@ def _sync_download(
                         candidate_artist=cand_artist_val
                     ):
                         print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не принадлежит исполнителю '{custom_artist}'. Отклоняем как неаутентичный.", flush=True)
-                        for temp_f in output_dir.iterdir():
-                            if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                try:
-                                    temp_f.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                        _cleanup_temp_candidate_files(output_dir)
                         continue
 
                     # 2. Проверяем модификаторы и при необходимости восстанавливаем студийный темп/тональность
@@ -1290,12 +1434,7 @@ def _sync_download(
                         if not requested_modifiers:
                             if cand_modifiers:
                                 print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит нежелательные модификаторы {cand_modifiers}. Отклоняем.", flush=True)
-                                for temp_f in output_dir.iterdir():
-                                    if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                        try:
-                                            temp_f.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
+                                _cleanup_temp_candidate_files(output_dir)
                                 continue
                         else:
                             # Пользователь явно запросил модификацию (например acoustic, live или remix):
@@ -1309,24 +1448,14 @@ def _sync_download(
                             }
                             if conflicting_mods:
                                 print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' содержит несовместимые модификаторы {conflicting_mods} (запрошено: {requested_modifiers}). Отклоняем.", flush=True)
-                                for temp_f in output_dir.iterdir():
-                                    if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                        try:
-                                            temp_f.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
+                                _cleanup_temp_candidate_files(output_dir)
                                 continue
 
                             # Если запрошен любой модификатор (slowed, super slowed, sped up, reverb, acoustic и т.д.),
                             # а кандидат его НЕ удовлетворяет — отклоняем, чтобы не отдать обычный студийный трек!
                             if requested_modifiers and not is_candidate_matching_modifiers(requested_modifiers, cand_modifiers):
                                 print(f"{req_tag}[AUTHENTICITY] Кандидат #{cand_idx+1} '{cand_entry_title}' не удовлетворяет запрошенным модификаторам {requested_modifiers} (кандидат: {cand_modifiers}). Отклоняем.", flush=True)
-                                for temp_f in output_dir.iterdir():
-                                    if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                                        try:
-                                            temp_f.unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
+                                _cleanup_temp_candidate_files(output_dir)
                                 continue
 
                     new_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, cand_modifiers, req_tag, req_query=clean_search)
@@ -1399,6 +1528,7 @@ def _sync_download(
                             "result": "OK"
                         })
                         print(f"{req_tag}[YTDLP] invocation=#{inv_idx2} candidate=#{cand_idx+1} purpose='stream_download' source='{cand_source}' duration={dur_dl_all:.2f}s result='OK'", flush=True)
+                        has_usable_candidate = True
                         res_info["_source_title"] = cand_entry_title or cand_title
                         res_info["_source_modifiers"] = cand_modifiers
                         return res_info
@@ -1428,13 +1558,9 @@ def _sync_download(
                             res_info["_source_title"] = cand_entry_title or cand_title
                             res_info["_source_modifiers"] = cand_modifiers
                             best_fallback_info = {"res_info": res_info, "diff": diff}
+                            has_usable_candidate = True
 
-                    for temp_f in output_dir.iterdir():
-                        if temp_f.is_file() and not temp_f.name.startswith("cover") and not temp_f.name.startswith("backup_"):
-                            try:
-                                temp_f.unlink(missing_ok=True)
-                            except Exception:
-                                pass
+                    _cleanup_temp_candidate_files(output_dir)
                     continue
                 except Exception as cand_err:
                     if cancel_event and cancel_event.is_set():
@@ -1527,6 +1653,7 @@ def _sync_download(
                                     dur_ok = not expected_duration or (diff <= max_retry_diff)
                                     if dur_ok:
                                         print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
+                                        has_usable_candidate = True
                                         res_info["_source_title"] = retry_title
                                         res_info["_source_modifiers"] = retry_mods
                                         return res_info
@@ -1557,7 +1684,7 @@ def _sync_download(
 
             # Экстренный поиск в SoundCloud (запрещён для прямых ссылок YouTube!)
             is_direct_yt = bool(("youtube.com" in query_or_url or "youtu.be" in query_or_url) and not query_or_url.startswith("ytsearch"))
-            if (last_cand_error or not entries) and not is_direct_yt:
+            if not has_usable_candidate and not is_direct_yt:
                 print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{clean_search}' в SoundCloud...", flush=True)
                 try:
                     sc_opts = dict(options)
@@ -1567,8 +1694,8 @@ def _sync_download(
                     sc_opts["extract_flat"] = True
                     sc_opts["noplaylist"] = True
                     sc_opts["ignoreerrors"] = True
-                    sc_opts["socket_timeout"] = 12
-                    sc_opts["retries"] = 2
+                    sc_opts["socket_timeout"] = 6
+                    sc_opts["retries"] = 1
                     with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
                         sc_raw = ydl_sc.extract_info(f"scsearch4:{clean_search}", download=False)
                         sc_entries = [e for e in sc_raw.get("entries", []) if e]
@@ -1631,8 +1758,8 @@ def _sync_download(
                                     sc_opts_dl.pop("extractor_args", None)
                                     sc_opts_dl.pop("proxy", None)  # Прокси только для YouTube
                                     sc_opts_dl["extract_flat"] = False
-                                    sc_opts_dl["socket_timeout"] = 12
-                                    sc_opts_dl["retries"] = 2
+                                    sc_opts_dl["socket_timeout"] = 8
+                                    sc_opts_dl["retries"] = 1
                                     try:
                                         with yt_dlp.YoutubeDL(sc_opts_dl) as ydl_sc_dl:
                                              res_cand = ydl_sc_dl.extract_info(s_url, download=True)
@@ -1666,11 +1793,37 @@ def _sync_download(
                                                          if temp_f.is_file() and not temp_f.name.startswith("cover"):
                                                              temp_f.unlink(missing_ok=True)
                                                      continue
-                                                 new_sc_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, s_mods, req_tag, req_query=clean_search)
+                                                 sc_dl_mods = extract_modifiers(f"{sc_entry_title} {res_cand.get('uploader') or s_cand.get('uploader') or ''}", ignore_words=ignore_cand_words)
+                                                 if is_apple_music or is_text_input:
+                                                     sc_unrequested = sc_dl_mods - requested_modifiers
+                                                     if not requested_modifiers:
+                                                         if sc_dl_mods:
+                                                             print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{sc_entry_title}' содержит нежелательные модификаторы {sc_dl_mods}. Отклоняем.", flush=True)
+                                                             for temp_f in output_dir.iterdir():
+                                                                 if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                                                                     temp_f.unlink(missing_ok=True)
+                                                             continue
+                                                     else:
+                                                         sc_conflicting = sc_unrequested & {
+                                                             "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix", "club mix", "dance mix",
+                                                             "live", "лайв", "концерт", "performance", "cover", "кавер", "acoustic", "акустика",
+                                                             "drum edit", "drums", "dnb", "драмка", "с драмкой",
+                                                             "slowed", "slow", "sped up", "speed up", "nightcore",
+                                                             "instrumental", "инструментал", "minus", "минус", "karaoke"
+                                                         }
+                                                         if sc_conflicting or not is_candidate_matching_modifiers(requested_modifiers, sc_dl_mods):
+                                                             print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{sc_entry_title}' не удовлетворяет запрошенным модификаторам {requested_modifiers}. Отклоняем.", flush=True)
+                                                             for temp_f in output_dir.iterdir():
+                                                                 if temp_f.is_file() and not temp_f.name.startswith("cover"):
+                                                                     temp_f.unlink(missing_ok=True)
+                                                             continue
+
+                                                 new_sc_dur = _apply_audio_modifier_if_needed(audio_files[0], requested_modifiers, sc_dl_mods, req_tag, req_query=clean_search)
                                                  if new_sc_dur > 0:
                                                      res_cand["duration"] = new_sc_dur
                                                  res_cand["_source_title"] = s_title
-                                                 res_cand["_source_modifiers"] = s_mods
+                                                 res_cand["_source_modifiers"] = sc_dl_mods
+                                                 has_usable_candidate = True
                                                  return res_cand
                                     except Exception as s_err:
                                         print(f"{req_tag}[DOWNLOADER] SoundCloud fallback candidate '{s_url}' не удался: {s_err}", flush=True)
@@ -1683,6 +1836,8 @@ def _sync_download(
                     if any(k in str(last_cand_error).lower() for k in ["не был создан", "не предоставил доступного аудиопотока", "превышен max_filesize"]):
                         raise ValueError("Ни один подходящий аудиопоток не найден для данного трека.")
                     raise last_cand_error
+            if not entries:
+                raise ValueError("Трек не найден по данному запросу.")
             raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
         else:
             inv_idx = len(invocations) + 1

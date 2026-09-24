@@ -1,4 +1,5 @@
 # services/identity.py
+import functools
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ _ZERO_WIDTH_RE = re.compile(
 )
 
 
+@functools.lru_cache(maxsize=4096)
 def clean_unicode_text(text: Optional[str]) -> str:
     """
     Безопасная нормализация пользовательского текста:
@@ -239,6 +241,7 @@ _SPEED_PERCENT_RE = re.compile(
 )
 
 
+@functools.lru_cache(maxsize=1024)
 def parse_speed_multiplier(text: Optional[str]) -> Optional[float]:
     """
     Извлекает числовой множитель скорости из текста в диапазоне 0.5x .. 2.0x.
@@ -390,6 +393,7 @@ TRANSLIT_TABLE = {
 }
 
 
+@functools.lru_cache(maxsize=4096)
 def transliterate_text(text: str) -> str:
     norm = clean_unicode_text(text).lower()
     return "".join(TRANSLIT_TABLE.get(c, c) for c in norm)
@@ -405,10 +409,10 @@ _ARTIST_SEPARATORS_RE = re.compile(
 )
 
 
-def split_artist_names(artist_str: Optional[str]) -> Set[str]:
-    """Разбивает строку исполнителей на отдельные имена."""
+@functools.lru_cache(maxsize=2048)
+def _split_artist_names_cached(artist_str: Optional[str]) -> tuple:
     if not artist_str:
-        return set()
+        return ()
     cleaned = clean_unicode_text(artist_str)
     raw_artists = _ARTIST_SEPARATORS_RE.split(cleaned)
     result = set()
@@ -419,9 +423,15 @@ def split_artist_names(artist_str: Optional[str]) -> Set[str]:
             no_the = re.sub(r'^(?:the|a|an)\s+', '', a_clean, flags=re.IGNORECASE).strip()
             if no_the and no_the != a_clean and no_the.lower() not in {"the", "a", "an"}:
                 result.add(no_the)
-    return result
+    return tuple(sorted(result))
 
 
+def split_artist_names(artist_str: Optional[str]) -> Set[str]:
+    """Разбивает строку исполнителей на отдельные имена."""
+    return set(_split_artist_names_cached(artist_str))
+
+
+@functools.lru_cache(maxsize=4096)
 def phonetic_artist_key(text: Optional[str]) -> str:
     """
     Фонетическая нормализация имени артиста для устойчивого сопоставления
@@ -505,13 +515,10 @@ def validate_artist_match(expected_artist: Optional[str], candidate_text: Option
 # 7. Title Matching & Eponymous Protection
 # -------------------------------------------------------------
 
-def extract_core_title_words(title: Optional[str], artist: Optional[str] = None) -> Set[str]:
-    """
-    Извлекает ключевые слова названия трека с защитой от eponymous-запросов
-    (The Drums - Drums, Bad Company - Bad Company, Future - Future).
-    """
+@functools.lru_cache(maxsize=2048)
+def _extract_core_title_words_cached(title: Optional[str], artist: Optional[str]) -> tuple:
     if not title:
-        return set()
+        return ()
     raw = clean_unicode_text(title).lower()
 
     # 1. Удаляем feat/ft/prod конструкции в скобках и без скобок (например 'Rich Flex ft. 21 Savage')
@@ -527,13 +534,21 @@ def extract_core_title_words(title: Optional[str], artist: Optional[str] = None)
         artist_clean = clean_unicode_text(artist).lower()
         artist_tokens = set(re.findall(r'[\w]+', artist_clean))
         if raw_tokens and raw_tokens.issubset(artist_tokens):
-            return {t for t in raw_tokens if len(t) >= 1}
+            return tuple(sorted(t for t in raw_tokens if len(t) >= 1))
         for aw in artist_tokens:
             if len(aw) >= 2:
                 raw = re.sub(r'(?<!\w)' + re.escape(aw) + r'(?!\w)', ' ', raw)
 
     tokens = set(re.findall(r'[\w]+', raw))
-    return {t for t in tokens if len(t) >= 1}
+    return tuple(sorted(t for t in tokens if len(t) >= 1))
+
+
+def extract_core_title_words(title: Optional[str], artist: Optional[str] = None) -> Set[str]:
+    """
+    Извлекает ключевые слова названия трека с защитой от eponymous-запросов
+    (The Drums - Drums, Bad Company - Bad Company, Future - Future).
+    """
+    return set(_extract_core_title_words_cached(title, artist))
 
 
 def compute_title_match_ratio(cand_title: str, core_words: Set[str]) -> float:
