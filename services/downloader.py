@@ -19,8 +19,10 @@ import yt_dlp
 
 logger = logging.getLogger(__name__)
 
-# Глобальный семафор ограничения одновременных загрузок для предотвращения OOM (Render 512 MB)
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
+# Глобальный семафор ограничения одновременных загрузок для предотвращения OOM на ограниченных ресурсах (Render 512MB)
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
 
 # Лимиты времени на жизненный цикл кандидата и общий бюджет экстракции
 CANDIDATE_DOWNLOAD_TIMEOUT = 12.0  # Максимальный бюджет времени на одного кандидата (включая попытку с cookies и без)
@@ -782,6 +784,27 @@ def _is_candidate_promising(
     return eligible
 
 
+def is_valid_topic_channel(cand_uploader: str, cand_channel: str, custom_artist: Optional[str] = None) -> bool:
+    """Проверяет, является ли канал официальным Topic-каналом артиста или релизом дистрибьютора."""
+    u_low = (cand_uploader or "").lower()
+    c_low = (cand_channel or "").lower()
+    is_topic_name = (
+        u_low.endswith("- topic")
+        or c_low.endswith("- topic")
+        or " - topic" in u_low
+        or " - topic" in c_low
+    )
+    if not is_topic_name:
+        return False
+    if not custom_artist:
+        return True
+    if validate_artist_match(custom_artist, cand_uploader) or validate_artist_match(custom_artist, cand_channel):
+        return True
+    if any(v in u_low or v in c_low for v in ["various artists", "release"]):
+        return True
+    return False
+
+
 def compute_candidate_penalty(
     candidate: dict,
     custom_artist: Optional[str] = None,
@@ -935,7 +958,7 @@ def compute_candidate_penalty(
 
         cand_src = e.get("_source") or source
         if cand_src == "youtube":
-            is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
+            is_topic = is_valid_topic_channel(cand_uploader, cand_channel, custom_artist)
             if is_topic:
                 penalty -= 350.0
             elif "vevo" in cand_uploader or "official" in cand_uploader or "vevo" in cand_channel:
@@ -1003,7 +1026,7 @@ def compute_candidate_penalty(
 
         cand_src = e.get("_source") or source
         if cand_src == "youtube":
-            is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
+            is_topic = is_valid_topic_channel(cand_uploader, cand_channel, custom_artist)
             if is_topic and not req_mods:
                 penalty -= 350.0
             elif is_topic and req_mods:
@@ -1068,7 +1091,7 @@ def compute_candidate_penalty(
 
         cand_src = e.get("_source") or source
         if cand_src == "youtube":
-            is_topic = cand_uploader.endswith("- topic") or cand_channel.endswith("- topic") or " - topic" in cand_uploader or " - topic" in cand_channel
+            is_topic = is_valid_topic_channel(cand_uploader, cand_channel, custom_artist)
             if is_topic and cookies_info.get("active"):
                 penalty -= 150.0
             elif is_topic and not cookies_info.get("active"):
@@ -1296,6 +1319,12 @@ def _sync_download(
             ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
 
 
+            try:
+                from services.search import register_ytmsearch_extractor
+                register_ytmsearch_extractor()
+            except Exception:
+                pass
+
             import concurrent.futures
             if is_apple_music or is_text_input:
                 if requested_modifiers:
@@ -1311,8 +1340,8 @@ def _sync_download(
                     ]
                 else:
                     search_tasks = [
-                        ("youtube", f"ytsearch5:{clean_q_simple} Topic"),
-                        ("youtube", f"ytsearch5:{clean_q_simple}"),
+                        ("youtube", f"ytmsearch5:{clean_q_simple}"),
+                        ("youtube", f"ytsearch8:{clean_q_simple}"),
                         ("soundcloud", f"scsearch5:{clean_q_simple}")
                     ]
                     if clean_search and clean_search != clean_q_simple:
@@ -1329,7 +1358,8 @@ def _sync_download(
                     ]
                 else:
                     search_tasks = [
-                        ("youtube", f"ytsearch5:{clean_q_simple}"),
+                        ("youtube", f"ytmsearch5:{clean_q_simple}"),
+                        ("youtube", f"ytsearch8:{clean_q_simple}"),
                         ("soundcloud", f"scsearch5:{clean_q_simple}")
                     ]
 
@@ -1700,7 +1730,7 @@ def _sync_download(
                         cand_uploader_l = (res_info.get("uploader") or selected_entry.get("uploader") or "").lower()
                         cand_channel_l = (res_info.get("channel") or selected_entry.get("channel") or "").lower()
                         is_official_high_confidence = (
-                            "- topic" in cand_uploader_l or "- topic" in cand_channel_l or
+                            is_valid_topic_channel(cand_uploader_l, cand_channel_l, custom_artist) or
                             "vevo" in cand_uploader_l or "vevo" in cand_channel_l or
                             "gazgolder" in cand_uploader_l or "gazgolder" in cand_channel_l or
                             "official" in cand_uploader_l or "official" in cand_channel_l

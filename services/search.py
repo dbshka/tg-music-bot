@@ -30,8 +30,11 @@ from services.extractor import (
 )
 from services.identity import (
     clean_unicode_text,
+    count_matched_artists,
     extract_modifiers,
+    format_track_display,
     is_candidate_matching_modifiers,
+    parse_multi_artist_query,
     validate_artist_match,
 )
 
@@ -120,16 +123,15 @@ search_cache = SearchCache()
 
 def extract_artist_title_from_query(query: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Извлекает (artist, title) из поискового запроса пользователя вида 'Исполнитель — Название'.
-    Поддерживает варианты разделителей: ' -- ', '--', ' — ', '—', ' – ', '–', ' - '.
+    Извлекает (artist, title) из поискового запроса пользователя вида 'Исполнитель — Название'
+    или 'Исполнитель 1, Исполнитель 2 -- Название'.
+    Поддерживает варианты разделителей: '--', ' — ', '—', ' – ', '–', ' - '.
     """
     if not query:
         return None, None
-    clean_q = clean_unicode_text(query).strip()
-    for pattern in [r'\s*(?:--|—|–)\s*', r'\s+-\s+']:
-        parts = re.split(pattern, clean_q, maxsplit=1)
-        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            return parts[0].strip(), parts[1].strip()
+    artists_list, clean_title, raw_artist = parse_multi_artist_query(query)
+    if raw_artist and clean_title:
+        return raw_artist, clean_title
     return None, None
 
 
@@ -511,8 +513,17 @@ def _score_inline_candidate(
         effective_art = item.artist or full_text
         if validate_artist_match(query_artist, effective_art):
             score += 150.0
+            # Дополнительный бонус за совпадение нескольких артистов из запроса
+            matched_count = count_matched_artists(query_artist, effective_art)
+            if matched_count > 1:
+                score += 150.0 * matched_count
         else:
-            score -= 3000.0
+            # При нескольких исполнителях в запросе допускаем частичное совпадение
+            matched_count = count_matched_artists(query_artist, effective_art)
+            if matched_count > 0:
+                score += 50.0 * matched_count
+            else:
+                score -= 3000.0
 
     # 7. Хронометраж и многоуровневая защита от подозрительной длительности
     if canonical_duration and canonical_duration > 35 and item.duration:
@@ -772,7 +783,13 @@ def render_search_page(session_id: str, query: str, items: List[SearchItem], pag
     lines = [f"<b>{html.escape(query)}</b>\n"]
     for i, item in enumerate(page_items, start=start_idx + 1):
         dur_str = f" <b>{item.formatted_duration}</b>" if item.formatted_duration else ""
-        escaped_title = html.escape(item.title)
+        if item.clean_artist and item.clean_title:
+            display_title = format_track_display(item.clean_artist, item.clean_title)
+        elif " - " in item.title:
+            display_title = item.title.replace(" - ", " — ")
+        else:
+            display_title = item.title
+        escaped_title = html.escape(display_title)
         lines.append(f"<b>{i}.</b> <i>{escaped_title}</i>{dur_str}")
 
     text = "\n".join(lines)

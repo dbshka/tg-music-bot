@@ -97,15 +97,15 @@ async def resolve_yandex_music_track(
     # Проверка на ссылки альбомов/плейлистов
     if ("/album/" in path and "/track/" not in path) or "/playlists/" in path or "/users/" in path:
         raise ValueError(
-            "Загрузка альбомов и плейлистов не поддерживается.\n\n"
-            "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+            "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
+            "Отправьте ссылку на отдельный трек."
         )
 
     track_id = extract_yandex_track_id(url)
     if not track_id:
         raise ValueError(
-            "Не удалось определить ID трека в ссылке Яндекс Музыки.\n\n"
-            "💡 Пожалуйста, отправьте прямую ссылку на трек (например: https://music.yandex.ru/track/60292250)."
+            "Не удалось распознать ссылку на трек Яндекс Музыки.\n\n"
+            "Отправьте прямую ссылку на трек (например: https://music.yandex.ru/album/38283718/track/143075895)."
         )
 
     album_id = extract_yandex_album_id(url)
@@ -196,13 +196,12 @@ async def resolve_yandex_music_track(
                     }
 
             raise ValueError(
-                f"Не удалось связаться с сервером Яндекс Музыки ({last_error}). "
-                f"Убедитесь, что настроен рабочий российский прокси (VLESS_RU_URL)."
+                "Не удалось связаться с сервером Яндекс Музыки. Попробуйте повторить запрос позже или отправьте название треком: Исполнитель — Название"
             )
 
         track_list = meta_json.get("result", [])
         if not track_list:
-            raise ValueError("Трек не найден в каталоге Яндекс Музыки.")
+            raise ValueError("Трек не найден в каталоге Яндекс Музыки. Попробуйте отправить название треком: Исполнитель — Название")
 
         track_data = track_list[0]
         title = track_data.get("title")
@@ -253,8 +252,8 @@ async def resolve_yandex_music_track(
     except asyncio.TimeoutError:
         logger.warning("Превышен таймаут разрешения трека Яндекс Музыки (track_id=%s, limit=10.0s)", track_id)
         raise ValueError(
-            "⚠️ Время ожидания ответа от Яндекс Музыки истекло.\n\n"
-            "💡 Пожалуйста, отправьте название трека текстом."
+            "Время ожидания ответа от Яндекс Музыки истекло.\n\n"
+            "Попробуйте отправить название треком: Исполнитель — Название"
         )
 
 
@@ -269,18 +268,15 @@ async def resolve_vk_music_track(
     audio_ids = extract_vk_audio_id(url)
     if not audio_ids:
         raise ValueError(
-            "Не удалось определить ID аудиозаписи ВКонтакте.\n\n"
-            "💡 Пример правильной ссылки: https://vk.com/audio-2001429780_128429780"
+            "Не удалось определить аудиозапись ВКонтакте.\n\n"
+            "Отправьте прямую ссылку на трек (например: https://vk.com/audio-2001429780_128429780)."
         )
 
     owner_id, audio_id = audio_ids
     vk_token = getattr(config, "VK_TOKEN", None) or os.getenv("VK_TOKEN")
     if not vk_token or not vk_token.strip():
         raise ValueError(
-            "⚠️ Для распознавания трека по ссылке ВКонтакте требуется указание VK_TOKEN в настройках бота "
-            "(ВКонтакте закрыл публичный доступ к метаданным аудиозаписей без авторизации).\n\n"
-            "💡 Пожалуйста, отправьте название трека или исполнителя текстом (например: MiyaGi — Captain), "
-            "и бот моментально найдёт и пришлёт MP3!"
+            "Для работы с аудиозаписями ВКонтакте требуется указание VK_TOKEN."
         )
 
     proxy = get_proxy_for_source("vk", stage="resolve")

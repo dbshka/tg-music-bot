@@ -511,6 +511,19 @@ def validate_artist_match(expected_artist: Optional[str], candidate_text: Option
     return False
 
 
+def count_matched_artists(expected_artist: Optional[str], candidate_text: Optional[str]) -> int:
+    """
+    Возвращает количество исполнителей из expected_artist, найденных в candidate_text.
+    Позволяет отдавать приоритет кандидатам, содержащим ВСЕХ исполнителей совместного релиза.
+    """
+    if not expected_artist or not candidate_text:
+        return 0
+    sub_artists = split_artist_names(expected_artist)
+    if not sub_artists:
+        return 1 if validate_artist_match(expected_artist, candidate_text) else 0
+    return sum(1 for a in sub_artists if validate_artist_match(a, candidate_text))
+
+
 # -------------------------------------------------------------
 # 7. Title Matching & Eponymous Protection
 # -------------------------------------------------------------
@@ -617,6 +630,7 @@ def compute_title_match_ratio(cand_title: str, core_words: Set[str]) -> float:
 def parse_query_artist_title(query: str) -> Tuple[Optional[str], str]:
     """
     Разбивает пользовательский поисковый запрос на (artist, title):
+    - Поддерживает специальный формат '--' (Исполнитель 1, Исполнитель 2... -- Название);
     - Поддерживает разделители: ' — ', ' - ', ' – ', '—', '–', ' : ', ' / ', ' | ';
     - Защищает составные имена исполнителей с дефисами (A-Ha, Jay-Z, Blink-182, T-Pain, AC/DC);
     - Если разделителя нет, возвращает (None, query).
@@ -624,6 +638,12 @@ def parse_query_artist_title(query: str) -> Tuple[Optional[str], str]:
     cleaned = clean_unicode_text(query)
     if not cleaned:
         return None, ""
+
+    # Приоритет специальному разделителю нескольких исполнителей '--'
+    if "--" in cleaned:
+        parts = re.split(r'\s*--\s*', cleaned, maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return parts[0].strip(), parts[1].strip()
 
     # Приоритет разделителям с пробелами вокруг, чтобы не разбивать A-Ha, Jay-Z, Blink-182
     spaced_separators = [" — ", " - ", " – ", " : ", " | ", " / "]
@@ -646,6 +666,128 @@ def parse_query_artist_title(query: str) -> Tuple[Optional[str], str]:
         return by_match[1].strip(), by_match[0].strip()
 
     return None, cleaned
+
+
+def parse_multi_artist_query(query: str) -> Tuple[List[str], Optional[str], Optional[str]]:
+    """
+    Разбирает поисковый запрос с поддержкой одного или нескольких исполнителей.
+    Форматы ввода:
+      1. Специальный multi-artist формат:
+         'Исполнитель 1, Исполнитель 2... -- Название'
+      2. Стандартный формат с длинным тире:
+         'Исполнитель 1, Исполнитель 2 — Название'
+      3. Другие тире и разделители:
+         'Исполнитель - Название', 'Исполнитель – Название'
+
+    Возвращает:
+      (artists_list, clean_title, raw_artist_string)
+      где artists_list = [Исполнитель 1, Исполнитель 2, ...],
+      clean_title = 'Название' (или None, если разделитель не найден),
+      raw_artist_string = 'Исполнитель 1, Исполнитель 2' (или None).
+    """
+    if not query:
+        return [], None, None
+
+    cleaned = clean_unicode_text(query).strip()
+    if not cleaned:
+        return [], None, None
+
+    artist_part, title_part = None, None
+
+    # 1. Приоритет специальному разделителю '--' для нескольких исполнителей
+    if "--" in cleaned:
+        parts = re.split(r'\s*--\s*', cleaned, maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            artist_part, title_part = parts[0].strip(), parts[1].strip()
+
+    # 2. Стандартные разделители с длинным тире или пробелами вокруг
+    if not artist_part:
+        for sep in [" — ", " – ", " - ", "—", "–"]:
+            if sep in cleaned:
+                parts = cleaned.split(sep, 1)
+                if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                    artist_part, title_part = parts[0].strip(), parts[1].strip()
+                    break
+
+    # 3. Резервный разделитель 'by' ("Title by Artist")
+    if not artist_part:
+        by_match = re.split(r'\s+\bby\b\s+', cleaned, maxsplit=1, flags=re.IGNORECASE)
+        if len(by_match) == 2 and by_match[0].strip() and by_match[1].strip():
+            artist_part, title_part = by_match[1].strip(), by_match[0].strip()
+
+    if not artist_part or not title_part:
+        return [], None, None
+
+    # Извлечение структурированного списка артистов (строго через запятую согласно синтаксису "Исполнитель 1, Исполнитель 2... -- Название")
+    # Не разбиваем автоматически внутренние символы артиста (&, /, x, feat), чтобы не повреждать имена вроде AC/DC, Above & Beyond, Guns N' Roses.
+    raw_artists = [a.strip() for a in artist_part.split(",") if a.strip()]
+    if not raw_artists:
+        raw_artists = [artist_part]
+
+    # Сохраняем исходный порядок исполнителей, удаляя точные дубликаты
+    seen = set()
+    artists_list = []
+    for a in raw_artists:
+        low = a.lower()
+        if low not in seen:
+            seen.add(low)
+            artists_list.append(a)
+
+    return artists_list, title_part, ", ".join(artists_list)
+
+
+def format_track_display(
+    artists: Any,
+    title: Optional[str] = None
+) -> str:
+    """
+    Форматирует отображение трека СТРОГО по единому продуктовому стандарту:
+      'Исполнитель — Название'
+    или при нескольких исполнителях:
+      'Исполнитель 1, Исполнитель 2, Исполнитель 3 — Название'
+
+    Правила:
+      - сначала список исполнителей через запятую с пробелом;
+      - затем только длинное тире ' — ';
+      - затем название трека;
+      - порядок исполнителей сохраняется;
+      - дубликаты исполнителей исключаются.
+    """
+    if not artists and not title:
+        return "Unknown Artist — Unknown Track"
+
+    # Если передан объект с display_name, artist, title (например ExtractedTrack, TrackIdentity, DownloadedAudio)
+    if hasattr(artists, "artist") and hasattr(artists, "title") and title is None:
+        title = getattr(artists, "title", None)
+        artists = getattr(artists, "artist", None)
+
+    # Нормализация списка исполнителей
+    clean_artists = []
+    seen = set()
+
+    if isinstance(artists, (list, tuple, set)):
+        items = list(artists)
+    elif isinstance(artists, str):
+        # Если строка уже содержит запятые (например "Drake, 21 Savage")
+        if "," in artists:
+            items = [a.strip() for a in artists.split(",") if a.strip()]
+        else:
+            items = [artists.strip()] if artists.strip() else []
+    else:
+        items = [str(artists).strip()] if artists else []
+
+    for item in items:
+        if not item:
+            continue
+        c_item = clean_unicode_text(str(item)).strip()
+        if c_item and c_item.lower() not in seen:
+            seen.add(c_item.lower())
+            clean_artists.append(c_item)
+
+    art_str = ", ".join(clean_artists) if clean_artists else "Unknown Artist"
+    tit_str = clean_unicode_text(str(title)).strip() if title else "Unknown Track"
+
+    return f"{art_str} — {tit_str}"
 
 
 def is_artist_in_title_inversion(

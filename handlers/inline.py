@@ -50,6 +50,7 @@ from services.extractor import (
     UNSUPPORTED_URL_FALLBACK_TEXT,
     clean_unicode_text,
 )
+from services.identity import format_track_display
 from services.persistent_cache import (
     build_source_key,
     get_persistent_track_async,
@@ -142,13 +143,15 @@ async def handle_inline_query(inline_query: InlineQuery):
     if not query_text:
         prompt_article = InlineQueryResultArticle(
             id="empty_query_prompt",
-            title="🎵 Введите исполнителя и название трека",
-            description="Например: @musicAutoSaver_bot The Weeknd Blinding Lights",
+            title="Введите исполнителя и название трека",
+            description="Например: Исполнитель — Название",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    "🎵 <b>Поиск музыки</b>\n\n"
-                    "Чтобы найти трек, введите его название или автора после имени бота:\n"
-                    "<code>@musicAutoSaver_bot Исполнитель — Название</code>"
+                    "<b>Поиск музыки</b>\n\n"
+                    "Введите запрос после имени бота в формате:\n"
+                    "<code>@musicAutoSaver_bot Исполнитель — Название</code>\n\n"
+                    "Для совместных треков:\n"
+                    "<code>@musicAutoSaver_bot Исполнитель 1, Исполнитель 2 -- Название</code>"
                 ),
                 parse_mode="HTML"
             )
@@ -165,10 +168,10 @@ async def handle_inline_query(inline_query: InlineQuery):
     if query_text.lower() in ("test", "тест", "ping"):
         test_article = InlineQueryResultArticle(
             id="diag_test_ok",
-            title="🎵 Тест Inline",
-            description="Inline Mode работает",
+            title="Тест Inline",
+            description="Inline Mode работает корректно",
             input_message_content=InputTextMessageContent(
-                message_text="🎵 <b>Тест Inline</b>\nInline Mode работает!",
+                message_text="<b>Тест поиска</b>\nПоиск работает корректно.",
                 parse_mode="HTML"
             )
         )
@@ -204,6 +207,7 @@ async def handle_inline_query(inline_query: InlineQuery):
             )
 
             desc = f"{track.artist} • {dur_str}" if dur_str else (track.artist or "")
+            disp = format_track_display(track.artist, track.title)
             url_article = InlineQueryResultArticle(
                 id=f"art_{cand_id}",
                 title=track.title or "Unknown Track",
@@ -211,9 +215,9 @@ async def handle_inline_query(inline_query: InlineQuery):
                 thumbnail_url=thumb_url or None,
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        f"🎵 <b>{html.escape(track.artist or 'Unknown Artist')} — {html.escape(track.title or 'Unknown Track')}</b>\n"
+                        f"<b>{html.escape(disp)}</b>\n"
                         f"⏱ <b>Длительность:</b> {dur_str or '—'}\n\n"
-                        f"⏳ <i>Подготовка к загрузке...</i>"
+                        f"<i>Загрузка аудио...</i>"
                     ),
                     parse_mode="HTML"
                 ),
@@ -231,7 +235,7 @@ async def handle_inline_query(inline_query: InlineQuery):
             logger.info("Unsupported or unresolvable URL in inline query: %s (%s)", url_found, url_err)
             fallback_article = InlineQueryResultArticle(
                 id="unsupported_url_result",
-                title="⚠️ Не удалось распознать эту ссылку",
+                title="Не удалось распознать ссылку",
                 description="Отправьте название трека или исполнителя текстом",
                 input_message_content=InputTextMessageContent(
                     message_text=UNSUPPORTED_URL_FALLBACK_TEXT,
@@ -266,11 +270,12 @@ async def handle_inline_query(inline_query: InlineQuery):
             result_id = f"ca_{hashlib.md5(c_file_id.encode()).hexdigest()[:10]}"
             artist_name = c.get("artist") or "Unknown Artist"
             title_name = c.get("title") or "Unknown Track"
+            disp = format_track_display(artist_name, title_name)
             results.append(
                 InlineQueryResultCachedAudio(
                     id=result_id,
                     audio_file_id=c_file_id,
-                    caption=f"🎵 <b>{html.escape(artist_name)} — {html.escape(title_name)}</b>",
+                    caption=f"<b>{html.escape(disp)}</b>",
                     parse_mode="HTML"
                 )
             )
@@ -344,6 +349,7 @@ async def handle_inline_query(inline_query: InlineQuery):
                 )
 
                 desc = f"{artist} • {dur_str}" if dur_str else artist
+                disp = format_track_display(artist, title)
 
                 article = InlineQueryResultArticle(
                     id=f"art_{cand_id}",
@@ -352,9 +358,9 @@ async def handle_inline_query(inline_query: InlineQuery):
                     thumbnail_url=resolved_thumb_url,
                     input_message_content=InputTextMessageContent(
                         message_text=(
-                            f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n"
+                            f"<b>{html.escape(disp)}</b>\n"
                             f"⏱ <b>Длительность:</b> {dur_str or '—'}\n\n"
-                            f"⏳ <i>Подготовка к загрузке...</i>"
+                            f"<i>Загрузка трека...</i>"
                         ),
                         parse_mode="HTML"
                     ),
@@ -376,12 +382,12 @@ async def handle_inline_query(inline_query: InlineQuery):
         results.append(
             InlineQueryResultArticle(
                 id="no_results_found",
-                title="🔍 Ничего не найдено",
-                description=f"По запросу «{query_text[:40]}» подходящих треков не найдено",
+                title="Ничего не найдено",
+                description=f"По запросу «{query_text[:40]}» треки не найдены",
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        f"🔍 По запросу <b>«{html.escape(query_text)}»</b> ничего не найдено.\n\n"
-                        f"💡 Попробуйте уточнить имя исполнителя или название трека."
+                        f"По запросу <b>«{html.escape(query_text)}»</b> ничего не найдено.\n\n"
+                        f"Попробуйте указать исполнителя и название: <code>Исполнитель — Название</code>"
                     ),
                     parse_mode="HTML"
                 )
@@ -463,7 +469,7 @@ async def process_inline_download(
             try:
                 await bot.edit_message_text(
                     inline_message_id=inline_message_id,
-                    text="⚠️ Срок действия этой ссылки истёк. Пожалуйста, выполните поиск заново."
+                    text="Срок действия ссылки истёк. Пожалуйста, повторите поиск."
                 )
             except Exception:
                 pass
@@ -481,11 +487,12 @@ async def process_inline_download(
     # 1. Сразу переводим сообщение в состояние DOWNLOADING и удаляем техническую клавиатуру
     if inline_message_id:
         try:
+            disp = format_track_display(artist, title)
             await bot.edit_message_text(
                 inline_message_id=inline_message_id,
                 text=(
-                    f"🎵 <b>{html.escape(artist)} — {html.escape(title)}</b>\n\n"
-                    f"⏳ Скачиваю..."
+                    f"🎵 <b>{html.escape(disp)}</b>\n\n"
+                    f"⏳ Загрузка..."
                 ),
                 parse_mode="HTML",
                 reply_markup=None
@@ -772,8 +779,8 @@ async def process_inline_download(
                     err_text = "⚠️ Не удалось подготовить аудио."
                 else:
                     err_text = (
-                        "⚠️ Не удалось скачать этот трек.\n\n"
-                        "Попробуйте другой результат."
+                        "Не удалось скачать этот трек.\n\n"
+                        "Попробуйте выбрать другой вариант."
                     )
                 await bot.edit_message_text(
                     inline_message_id=inline_message_id,
@@ -796,12 +803,12 @@ async def process_inline_download(
 @router.callback_query(F.data.startswith("inl_status:"))
 async def handle_inline_status_callback(callback: CallbackQuery, bot: Bot):
     """
-    Failsafe-обработчик клика по технической кнопке '⏳ Подготавливается...'.
+    Failsafe-обработчик клика по технической кнопке '⏳ Загрузка...'.
     Если ChosenInlineResult уже отработал, просто уведомляет пользователя.
     Если feedback задержался, запускает скачивание.
     """
     cand_id = callback.data.split(":", 1)[1]
-    await callback.answer("⏳ Скачивание уже идёт...", show_alert=False)
+    await callback.answer("Загрузка уже идёт...", show_alert=False)
     if callback.inline_message_id:
         _start_inline_download(
             cand_id=cand_id,

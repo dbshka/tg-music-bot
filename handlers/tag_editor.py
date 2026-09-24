@@ -37,7 +37,7 @@ def get_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Артист", callback_data="tag:edit:artist"),
+                InlineKeyboardButton(text="Исполнитель", callback_data="tag:edit:artist"),
                 InlineKeyboardButton(text="Название", callback_data="tag:edit:title"),
             ],
             [
@@ -45,7 +45,7 @@ def get_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Обложка", callback_data="tag:edit:cover"),
             ],
             [
-                InlineKeyboardButton(text="Применить и отправить", callback_data="tag:save"),
+                InlineKeyboardButton(text="Сохранить", callback_data="tag:save"),
             ],
             [
                 InlineKeyboardButton(text="Отмена", callback_data="tag:cancel"),
@@ -68,7 +68,7 @@ def get_back_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура кнопки «Назад» при вводе данных."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Назад в меню", callback_data="tag:back")]
+            [InlineKeyboardButton(text="Назад", callback_data="tag:back")]
         ]
     )
 
@@ -92,7 +92,7 @@ def format_menu_text(data: dict) -> str:
         f"<b>Название:</b> {title}\n"
         f"<b>Альбом:</b> {album}\n"
         f"<b>Обложка:</b> {cover_status}\n\n"
-        "Нажмите на нужную кнопку ниже, чтобы изменить поле, или «Применить и отправить»:"
+        "Выберите поле для изменения или нажмите «Сохранить»:"
     )
 
 
@@ -154,7 +154,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
         shutil.rmtree(prev_data["folder_path"], ignore_errors=True)
     await state.clear()
 
-    status_msg = await message.reply("Загружаю аудиофайл для редактирования...")
+    status_msg = await message.reply("Загрузка аудиофайла...")
 
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
@@ -204,7 +204,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
         logger.exception("Ошибка при обработке аудиофайла")
         shutil.rmtree(session_dir, ignore_errors=True)
         await status_msg.edit_text(
-            f"<b>Не удалось обработать аудиофайл:</b>\n<i>{html.escape(str(e))}</i>",
+            "<b>Не удалось обработать аудиофайл.</b>",
             parse_mode="HTML"
         )
 
@@ -219,7 +219,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
     if len(parts) >= 3 and parts[2].isdigit():
         expected_owner = int(parts[2])
         if callback.from_user and callback.from_user.id != expected_owner:
-            await callback.answer("Редактировать теги может только пользователь, запросивший трек.", show_alert=True)
+            await callback.answer("Редактировать теги может только владелец сообщения.", show_alert=True)
             return
 
     audio_obj = callback.message.audio
@@ -235,7 +235,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
         shutil.rmtree(prev_data["folder_path"], ignore_errors=True)
     await state.clear()
 
-    status_msg = await callback.message.reply("Загружаю аудиофайл для редактирования...")
+    status_msg = await callback.message.reply("Загрузка аудиофайла...")
 
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
@@ -284,7 +284,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
         logger.exception("Ошибка при обработке аудиофайла по кнопке 'Изменить'")
         shutil.rmtree(session_dir, ignore_errors=True)
         await status_msg.edit_text(
-            f"<b>Не удалось загрузить аудио:</b>\n<i>{html.escape(str(e))}</i>",
+            "<b>Не удалось загрузить аудио.</b>",
             parse_mode="HTML"
         )
 
@@ -299,8 +299,8 @@ async def cb_edit_artist(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_artist)
     await callback.message.edit_text(
-        "<b>Введите имя исполнителя (артиста):</b>\n\n"
-        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
+        "<b>Введите имя исполнителя:</b>\n\n"
+        "Либо нажмите «Назад», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -313,8 +313,8 @@ async def cb_edit_title(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_title)
     await callback.message.edit_text(
-        "<b>Введите новое название песни:</b>\n\n"
-        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
+        "<b>Введите название трека:</b>\n\n"
+        "Либо нажмите «Назад», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -328,7 +328,7 @@ async def cb_edit_album(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TagEditorStates.waiting_for_album)
     await callback.message.edit_text(
         "<b>Введите название альбома:</b>\n\n"
-        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
+        "Либо нажмите «Назад», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -341,9 +341,9 @@ async def cb_edit_cover(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_cover)
     await callback.message.edit_text(
-        "<b>Отправьте изображение (фотографию) для обложки трека:</b>\n\n"
-        "Изображение будет автоматически обрезано 1:1 и вшито в аудиофайл.\n\n"
-        "Либо нажмите «Назад в меню», чтобы оставить текущее значение.",
+        "<b>Отправьте изображение для обложки трека:</b>\n\n"
+        "Изображение будет автоматически обрезано 1:1 и вшито в файл.\n\n"
+        "Либо нажмите «Назад», чтобы оставить текущее значение.",
         reply_markup=get_back_keyboard(),
         parse_mode="HTML"
     )
@@ -384,7 +384,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
-    await callback.message.edit_text("Применяю теги и отправляю аудио...")
+    await callback.message.edit_text("Сохраняю изменения и отправляю аудио...")
     await callback.answer()
 
     try:

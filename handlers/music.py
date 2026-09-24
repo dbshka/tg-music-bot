@@ -49,7 +49,12 @@ from services.database import (
     save_cached_track_async,
     invalidate_cached_file_id_async
 )
-from services.identity import extract_modifiers, is_candidate_matching_modifiers
+from services.identity import (
+    extract_modifiers,
+    format_track_display,
+    is_candidate_matching_modifiers,
+    parse_multi_artist_query,
+)
 from services.persistent_cache import (
     build_source_key,
     get_persistent_track_async,
@@ -97,27 +102,39 @@ async def cmd_start(message: Message, state: FSMContext):
     if message.from_user:
         await log_user_activity_async(message.from_user.id, message.from_user.username, message.from_user.full_name)
     start_text = (
-        "Отправьте ссылку на трек или напишите автора и название песни.\n\n"
-        "Также вы можете отправить свой аудиофайл для редактирования тегов."
+        "<b>музыка скачать не фейк</b> — быстрый поиск и загрузка музыки в MP3.\n\n"
+        "Отправьте ссылку на трек или напишите: <code>Исполнитель — Название</code>\n"
+        "Для совместных треков: <code>Исполнитель 1, Исполнитель 2 -- Название</code>\n\n"
+        "Поддерживаемые платформы:\n"
+        "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка (MP3).\n"
+        "Остальные сервисы официально не поддерживаются.\n\n"
+        "Вы также можете отправить аудиофайл для редактирования тегов."
     )
-    await message.answer(start_text, reply_markup=get_main_reply_keyboard())
+    await message.answer(start_text, reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
-        "Инструкция по использованию:\n\n"
-        "1. Скачивание по ссылке\n"
-        "Отправьте ссылку на трек из Spotify, Apple Music, YouTube или SoundCloud.\n\n"
-        "2. Поиск по тексту\n"
-        "Отправьте сообщение в формате: Автор — Название. Или используйте команду /search.\n\n"
-        "3. Редактор тегов\n"
-        "Нажмите кнопку редактирования под отправленным треком или пришлите свой аудиофайл в чат.\n\n"
-        "Поддерживаемые платформы: Spotify, Apple Music, YouTube, SoundCloud.\n"
-        "Другие сервисы (включая Яндекс Музыку и VK) не поддерживаются из-за региональных ограничений."
+        "<b>Справка и возможности:</b>\n\n"
+        "<b>1. Загрузка по ссылке</b>\n"
+        "Отправьте ссылку на трек из поддерживаемых сервисов:\n"
+        "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка.\n"
+        "Формат аудио: MP3. Другие сервисы официально не поддерживаются.\n\n"
+        "<b>2. Поиск по названию</b>\n"
+        "Отправьте сообщение в формате: <code>Исполнитель — Название</code>\n"
+        "Если исполнителей несколько: <code>Исполнитель 1, Исполнитель 2 -- Название</code>\n"
+        "Либо используйте команду /search.\n\n"
+        "<b>3. Редактор тегов</b>\n"
+        "Пришлите аудиофайл или нажмите «Изменить теги» под отправленным треком.\n\n"
+        "<b>Команды:</b>\n"
+        "/start — Главное меню\n"
+        "/search — Поиск по исполнителю и названию\n"
+        "/cancel — Отмена действия\n"
+        "/help — Справка"
     )
-    await message.answer(help_text, reply_markup=get_main_reply_keyboard())
+    await message.answer(help_text, reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
 
 
 @router.message(Command("version"))
@@ -132,7 +149,7 @@ async def cancel_handler(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state:
         await state.clear()
-        await message.answer("Поиск отменен.", reply_markup=get_main_reply_keyboard())
+        await message.answer("Поиск отменён.", reply_markup=get_main_reply_keyboard())
     else:
         await message.answer("Нет активного поиска.", reply_markup=get_main_reply_keyboard())
 
@@ -140,9 +157,9 @@ async def cancel_handler(message: Message, state: FSMContext):
 @router.callback_query(F.data == "search:cancel")
 async def cb_search_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.answer("Поиск отменен")
+    await callback.answer("Поиск отменён")
     try:
-        await callback.message.edit_text("Поиск отменен.")
+        await callback.message.edit_text("Поиск отменён.")
     except Exception:
         pass
 
@@ -153,9 +170,13 @@ async def cmd_search_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(SearchFSM.waiting_for_artist)
     await message.answer(
-        "Шаг 1 из 2: Введите имя исполнителя:\n\n"
-        "Или отправьте сообщение в формате: Исполнитель — Название",
-        reply_markup=get_cancel_reply_keyboard()
+        "Шаг 1 из 2: введите имя исполнителя.\n"
+        "Если исполнителей несколько, перечислите через запятую:\n"
+        "<code>Исполнитель 1, Исполнитель 2</code>\n\n"
+        "Или отправьте трек целиком:\n"
+        "<code>Исполнитель 1, Исполнитель 2 -- Название</code>",
+        reply_markup=get_cancel_reply_keyboard(),
+        parse_mode="HTML"
     )
 
 
@@ -164,14 +185,14 @@ async def cb_use_quick_artist(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     artist = data.get("quick_artist")
     if not artist:
-        await callback.answer("Ошибка: автор не найден", show_alert=True)
+        await callback.answer("Исполнитель не указан", show_alert=True)
         return
     await state.update_data(artist=artist)
     await state.set_state(SearchFSM.waiting_for_title)
     await callback.answer()
     prompt_text = (
         f"Исполнитель: <b>{html.escape(artist)}</b>\n\n"
-        "Шаг 2 из 2: Введите название трека:"
+        "Шаг 2 из 2: введите название трека:"
     )
     try:
         await callback.message.edit_text(prompt_text, parse_mode="HTML")
@@ -187,30 +208,32 @@ async def process_search_artist(message: Message, state: FSMContext):
     if not artist_text:
         return
 
-    # Если пользователь случайно прислал ссылку
+    # Если пользователь прислал ссылку
     url = find_first_url(artist_text)
     if url:
         await state.clear()
-        clean_url, mods = parse_url_and_modifiers(artist_text)
+        clean_url, mods, _ = parse_url_and_modifiers(artist_text)
         variant = ", ".join(mods) if mods else "original"
         await _execute_download_and_send(message=message, raw_query=artist_text, url=clean_url or url, variant=variant)
         return
 
-    # Если пользователь прислал сразу "Автор — Название"
-    dash_match = re.split(r'\s+[-—–]\s+', artist_text, maxsplit=1)
-    if len(dash_match) == 2 and dash_match[0].strip() and dash_match[1].strip():
+    # Если пользователь прислал сразу "Исполнитель — Название" или "Исполнитель 1, Исполнитель 2 -- Название"
+    artists_list, parsed_title, raw_artist = parse_multi_artist_query(artist_text)
+    if parsed_title and raw_artist:
         await state.clear()
-        clean_title, mods = extract_track_modifiers(dash_match[1].strip())
+        artist_words = set(re.findall(r'[\w]+', raw_artist.lower()))
+        clean_title, mods = extract_track_modifiers(parsed_title, ignore_words=artist_words)
         variant = ", ".join(mods) if mods else "original"
+        display_name = format_track_display(artists_list, clean_title)
         await message.answer(
-            f"Ищу трек: <b>{html.escape(dash_match[0].strip())} — {html.escape(clean_title)}</b>...",
+            f"Поиск: <b>{html.escape(display_name)}</b>...",
             parse_mode="HTML",
             reply_markup=get_main_reply_keyboard()
         )
         await _execute_download_and_send(
             message=message,
             raw_query=artist_text,
-            custom_artist=dash_match[0].strip(),
+            custom_artist=raw_artist,
             custom_title=clean_title,
             variant=variant
         )
@@ -220,7 +243,7 @@ async def process_search_artist(message: Message, state: FSMContext):
     await state.set_state(SearchFSM.waiting_for_title)
     await message.answer(
         f"Исполнитель: <b>{html.escape(artist_text)}</b>\n\n"
-        "Шаг 2 из 2: Введите название трека:",
+        "Шаг 2 из 2: введите название трека:",
         parse_mode="HTML",
         reply_markup=get_cancel_reply_keyboard()
     )
@@ -234,7 +257,7 @@ async def process_search_title(message: Message, state: FSMContext):
     if not title_text:
         return
 
-    # Если пользователь случайно прислал ссылку
+    # Если пользователь прислал ссылку
     url = find_first_url(title_text)
     if url:
         await state.clear()
@@ -252,8 +275,9 @@ async def process_search_title(message: Message, state: FSMContext):
     clean_title, mods = extract_track_modifiers(title_text, ignore_words=artist_words)
     variant = ", ".join(mods) if mods else "original"
 
+    display_name = format_track_display(artist, clean_title)
     await message.answer(
-        f"Ищу трек: <b>{html.escape(artist)} — {html.escape(clean_title)}</b>...",
+        f"Поиск: <b>{html.escape(display_name)}</b>...",
         parse_mode="HTML",
         reply_markup=get_main_reply_keyboard()
     )
@@ -279,19 +303,16 @@ async def handle_music_request(message: Message, state: FSMContext):
         await _execute_download_and_send(message=message, raw_query=user_text, url=clean_url, variant=variant)
         return
 
-    # 2. Разделение по тире: "Исполнитель — Название"
-    # Сначала проверяем дефис/тире в исходном тексте, чтобы не ломать треки вроде "The Drums - Drums"
-    dash_match = re.split(r'\s+[-—–]\s+', user_text, maxsplit=1)
-    if len(dash_match) == 2 and dash_match[0].strip() and dash_match[1].strip():
-        raw_artist = dash_match[0].strip()
-        raw_title = dash_match[1].strip()
-        artist_words = set(re.findall(r'[\w]+', raw_artist.lower()))
-        clean_title, text_mods = extract_track_modifiers(raw_title, ignore_words=artist_words)
+    # 2. Разделение по тире: "Исполнитель — Название" или "Исполнитель 1, Исполнитель 2 -- Название"
+    artists_list, parsed_title, raw_artists = parse_multi_artist_query(user_text)
+    if parsed_title and raw_artists:
+        artist_words = set(re.findall(r'[\w]+', raw_artists.lower()))
+        clean_title, text_mods = extract_track_modifiers(parsed_title, ignore_words=artist_words)
         variant = ", ".join(text_mods) if text_mods else "original"
         await _execute_download_and_send(
             message=message,
             raw_query=user_text,
-            custom_artist=raw_artist,
+            custom_artist=raw_artists,
             custom_title=clean_title,
             variant=variant
         )
@@ -301,7 +322,7 @@ async def handle_music_request(message: Message, state: FSMContext):
     clean_text, text_mods = extract_track_modifiers(user_text)
     variant = ", ".join(text_mods) if text_mods else "original"
 
-    # 3. Текст без тире и не ссылка: запускаем пошаговый поиск (автор -> название)
+    # 3. Текст без тире и не ссылка: запускаем пошаговый поиск
     await state.clear()
     await state.set_state(SearchFSM.waiting_for_artist)
     await state.update_data(quick_artist=clean_text)
@@ -310,16 +331,17 @@ async def handle_music_request(message: Message, state: FSMContext):
     if len(clean_text) <= 40:
         quick_markup = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=f"Использовать «{clean_text}» как автора", callback_data="search:use_quick_artist")],
+                [InlineKeyboardButton(text=f"Использовать «{clean_text}» как исполнителя", callback_data="search:use_quick_artist")],
                 [InlineKeyboardButton(text="Отмена", callback_data="search:cancel")]
             ]
         )
 
     await message.answer(
-        "Поиск музыки\n\n"
-        "Шаг 1 из 2: Введите имя исполнителя:\n\n"
-        "Или отправьте сообщение в формате:\n"
-        "Исполнитель — Название",
+        "Шаг 1 из 2: введите имя исполнителя.\n"
+        "Если исполнителей несколько, перечислите через запятую:\n"
+        "<code>Исполнитель 1, Исполнитель 2</code>\n\n"
+        "Или отправьте трек целиком:\n"
+        "<code>Исполнитель 1, Исполнитель 2 -- Название</code>",
         parse_mode="HTML",
         reply_markup=quick_markup or get_cancel_reply_keyboard()
     )
@@ -328,70 +350,70 @@ async def handle_music_request(message: Message, state: FSMContext):
 def format_download_error(e: Exception, track_info: Optional[ExtractedTrack] = None) -> str:
     """
     Преобразует внутренние ошибки и исключения yt-dlp/сети в понятные,
-    лаконичные сообщения для пользователя без многострочных технических трейсов.
+    лаконичные сообщения для пользователя без технических деталей и дампов.
     """
     err_str = str(e)
     err_lower = err_str.lower()
     if "drm protected" in err_lower or "is drm protected" in err_lower:
         return (
-            "<b>Этот трек защищен DRM (SoundCloud Go+).</b>\n\n"
+            "<b>Трек защищён DRM (SoundCloud Go+).</b>\n\n"
             "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
         )
     if err_str.startswith("⚠️"):
-        return err_str
+        return err_str.replace("⚠️ ", "").strip()
     if track_info and track_info.platform in ("Yandex Music", "VK Music") and (
         "не найден" in err_lower or "не подошел" in err_lower or "кандидат" in err_lower or "not found" in err_lower
     ):
+        disp = format_track_display(track_info.artist, track_info.title)
         return (
-            f"⚠️ Не удалось найти подходящий трек на YouTube для «{html.escape(track_info.display_name)}».\n\n"
-            f"💡 Попробуйте отправить название трека или исполнителя текстом для более точного поиска."
+            f"Не удалось найти подходящий трек для «{html.escape(disp)}».\n\n"
+            f"Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
         )
     if any(k in err_lower for k in ("private video", "this video is private", "video is private")):
         return (
-            "⚠️ <b>Видео приватно</b>\n\n"
-            "Это видео доступно только по приглашению или закрыто автором. Скачивание аудио невозможно."
+            "<b>Видео приватно</b>\n\n"
+            "Это видео доступно только по приглашению или закрыто автором. Скачивание невозможно."
         )
     if any(k in err_lower for k in ("confirm your age", "age-restricted", "age restricted", "content warning", "requires authentication")):
         return (
-            "⚠️ <b>Возрастное ограничение</b>\n\n"
-            "YouTube требует авторизацию для доступа к этому видео. Скачивание аудио невозможно без входа в аккаунт."
+            "<b>Возрастное ограничение</b>\n\n"
+            "YouTube требует авторизацию для доступа к этому видео. Скачивание невозможно без входа в аккаунт."
         )
     if any(k in err_lower for k in ("not available in your country", "uploader has not made this video available", "geo-restricted", "georestricted", "blocked in your country")):
         return (
-            "⚠️ <b>Региональное ограничение</b>\n\n"
-            "Автор видео или правообладатель ограничил доступ в регионе расположения сервера."
+            "<b>Региональное ограничение</b>\n\n"
+            "Автор видео или правообладатель ограничил доступ в регионе сервера."
         )
     if any(k in err_lower for k in ("confirm you're not a bot", "automated queries", "too many requests", "http error 429", "bot-check", "bot check")):
         return (
-            "⚠️ <b>Временное ограничение YouTube</b>\n\n"
-            "YouTube временно ограничил запросы (проверка на бота). Пожалуйста, повторите попытку через пару минут."
+            "<b>Временное ограничение YouTube</b>\n\n"
+            "YouTube временно ограничил запросы. Пожалуйста, повторите попытку через пару минут."
         )
     if any(k in err_lower for k in ("format is not available", "requested format", "no audio stream", "format not available")):
         return (
-            "⚠️ <b>Аудиопоток недоступен</b>\n\n"
-            "Не удалось извлечь аудиопоток для этого видео. Попробуйте другую ссылку или текстовый поиск."
+            "<b>Аудиопоток недоступен</b>\n\n"
+            "Не удалось извлечь аудиопоток для этой записи. Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
         )
-    if any(k in err_lower for k in ("timed out", "timeout", "timedout", "connection reset", "network is unreachable", "temporary failure in name resolution")):
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)) or any(k in err_lower for k in ("timed out", "timeout", "timedout", "connection reset", "network is unreachable", "temporary failure in name resolution")):
         return (
-            "⚠️ <b>Превышено время ожидания</b>\n\n"
-            "Превышено время ожидания ответа от видеохостинга. Попробуйте повторить запрос ещё раз."
+            "<b>Превышено время ожидания</b>\n\n"
+            "Время ожидания ответа истекло. Пожалуйста, повторите попытку через минуту."
         )
     if any(k in err_lower for k in ("ffmpeg", "ffprobe", "conversion failed", "postprocessing")):
         return (
-            "⚠️ <b>Ошибка конвертации аудио</b>\n\n"
-            "Не удалось обработать аудиопоток через FFmpeg. Попробуйте другую ссылку."
+            "<b>Ошибка конвертации аудио</b>\n\n"
+            "Не удалось сконвертировать аудиофайл. Попробуйте повторить запрос позже."
         )
     if any(k in err_lower for k in ("video unavailable", "this video is unavailable", "has been removed", "deleted", "does not exist")):
         return (
-            "⚠️ <b>Видео недоступно или удалено</b>\n\n"
-            "Видео по указанной ссылке не найдено или было удалено с YouTube."
+            "<b>Видео недоступно или удалено</b>\n\n"
+            "Запись по указанной ссылке не найдена или была удалена с сервиса."
         )
 
-    first_line = err_str.split("\n")[0].strip()
-    first_line = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", first_line).strip()
-    if len(first_line) > 150:
-        first_line = first_line[:147] + "..."
-    return f"<b>Не удалось скачать трек.</b>\n<i>Причина: {html.escape(first_line)}</i>"
+    return (
+        "<b>Не удалось скачать трек.</b>\n\n"
+        "Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
+    )
 
 
 async def _execute_download_and_send(
@@ -427,9 +449,9 @@ async def _execute_download_and_send(
     try:
         t_m0 = time.perf_counter()
         if url:
-            status_msg = await message.reply("Анализирую ссылку...")
+            status_msg = await message.reply("Анализ ссылки...")
             print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
-            track_info = await resolve_track_url(url)
+            track_info = await asyncio.wait_for(resolve_track_url(url), timeout=10.0)
             # Определение варианта для URL-входов:
             # Приоритет:
             # 1. Явные пользовательские модификаторы (url_mods / variant != "original")
@@ -448,8 +470,9 @@ async def _execute_download_and_send(
                         variant = ", ".join(title_mods)
                     print(f"[MUSIC][request_id={req_id}] Variant detected from canonical title: variant='{variant}' (title='{track_info.title}')", flush=True)
         elif custom_artist and custom_title:
+            disp_name = format_track_display(custom_artist, custom_title)
             status_msg = await message.reply(
-                f"Ищу трек: <b>{html.escape(custom_artist)} — {html.escape(custom_title)}</b>...",
+                f"Поиск: <b>{html.escape(disp_name)}</b>...",
                 parse_mode="HTML"
             )
             combined_q = f"{custom_artist} {custom_title}"
@@ -486,11 +509,14 @@ async def _execute_download_and_send(
                 )
         else:
             status_msg = await message.reply(
-                f"Ищу трек: <b>{html.escape(raw_query)}</b>...",
+                f"Поиск: <b>{html.escape(raw_query)}</b>...",
                 parse_mode="HTML"
             )
             print(f"[MUSIC][request_id={req_id}] resolve_text_to_track_info START query='{raw_query}'", flush=True)
-            track_info = await resolve_text_to_track_info(raw_query)
+            track_info = await asyncio.wait_for(resolve_text_to_track_info(raw_query), timeout=10.0)
+
+        if not track_info:
+            raise ValueError("Не удалось распознать трек. Попробуйте текстовый поиск.")
 
         t_metadata = time.perf_counter() - t_m0
         print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}' duration={track_info.duration}s", flush=True)
@@ -612,9 +638,9 @@ async def _execute_download_and_send(
 
         platform_label = f"\nПлатформа: <b>{track_info.platform}</b>" if track_info.platform and "Search" not in track_info.platform else ""
         if status_msg:
+            display_title = format_track_display(track_info.artist, track_info.title)
             await status_msg.edit_text(
-                f"Скачиваю: <b>{html.escape(track_info.display_name)}</b>{platform_label}\n"
-                f"Загрузка аудиопотока...",
+                f"Загрузка: <b>{html.escape(display_title)}</b>{platform_label}...",
                 parse_mode="HTML"
             )
 
@@ -684,7 +710,7 @@ async def _execute_download_and_send(
             size_mb = downloaded_audio.filesize / (1024 * 1024)
             await status_msg.edit_text(
                 f"Файл слишком большой ({size_mb:.1f} МБ).\n"
-                f"Telegram разрешает ботам отправлять файлы размером до 50 МБ."
+                f"Telegram разрешает ботам отправлять файлы до 50 МБ."
             )
             return
 
@@ -696,15 +722,12 @@ async def _execute_download_and_send(
                 max_final_diff = max(4, min(7, int(track_info.duration * 0.02)))
                 if final_diff > max_final_diff:
                     print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s for студийного оригинала). Refusing to send to Telegram.", flush=True)
-                    if track_info and track_info.platform in ("Yandex Music", "VK Music"):
-                        msg_text = (
-                            f"⚠️ На YouTube не удалось найти точную версию трека «{html.escape(track_info.display_name)}» "
-                            f"(найденный ролик отличается по длительности от оригинала на {final_diff} сек во избежание подмены).\n\n"
-                            f"💡 Попробуйте отправить название трека или исполнителя текстом для поиска."
-                        )
-                    else:
-                        msg_text = f"⚠️ К сожалению, найденный аудиофайл не прошёл финальную проверку подлинности студийного оригинала (отклонение хронометража более {max_final_diff} сек). Попробуйте уточнить запрос."
-                    await status_msg.edit_text(msg_text)
+                    disp = format_track_display(track_info.artist, track_info.title)
+                    msg_text = (
+                        f"Не удалось найти точную версию трека «{html.escape(disp)}».\n\n"
+                        f"Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
+                    )
+                    await status_msg.edit_text(msg_text, parse_mode="HTML")
                     downloaded_audio.cleanup()
                     return
             elif variant != "original":
@@ -724,12 +747,12 @@ async def _execute_download_and_send(
                 if not is_candidate_matching_modifiers(target_mods, cand_mods):
                     print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: downloaded audio '{downloaded_audio.title}' (source: '{downloaded_audio.source_title}') lacks requested variant '{variant}' (got mods: {cand_mods}, target: {target_mods}). Refusing to send to Telegram.", flush=True)
                     await status_msg.edit_text(
-                        f"⚠️ К сожалению, готовая версия «{variant}» для данного трека не найдена. Оригинальный трек отклонён во избежание подмены."
+                        f"Версия «{html.escape(variant)}» для этого трека не найдена."
                     )
                     downloaded_audio.cleanup()
                     return
 
-        await status_msg.edit_text("Отправка трека в Telegram...")
+        await status_msg.edit_text("Отправка трека...")
 
         audio_file = FSInputFile(downloaded_audio.file_path)
         thumb_path = downloaded_audio.thumbnail_path

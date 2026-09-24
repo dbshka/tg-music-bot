@@ -46,8 +46,8 @@ async def test_unsupported_domains_raise_unsupported_url_error():
             with pytest.raises(UnsupportedUrlError) as exc_info:
                 await resolve_track_url(u)
             assert str(exc_info.value) == UNSUPPORTED_URL_FALLBACK_TEXT
-            assert "⚠️ Не удалось распознать эту ссылку" in str(exc_info.value)
-            assert "💡 Отправьте название трека или исполнителя текстом — я найду его на YouTube" in str(exc_info.value)
+            assert "Не удалось распознать ссылку" in str(exc_info.value)
+            assert "Поддерживаемые платформы" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -68,7 +68,7 @@ async def test_vk_audio_without_token_raises_friendly_fallback():
         assert "audio.getById" not in msg
         assert "error 15" not in msg
         assert "OAuth" not in msg
-        assert "⚠️ Не удалось распознать эту ссылку" in msg
+        assert "Не удалось распознать ссылку" in msg
 
 
 @pytest.mark.asyncio

@@ -163,26 +163,26 @@ async def main():
 
         try:
             await bot.set_my_commands([
-                BotCommand(command="start", description="Перезапуск бота"),
-                BotCommand(command="search", description="Поиск по автору и названию"),
-                BotCommand(command="cancel", description="Отмена текущего действия"),
-                BotCommand(command="help", description="Справка и поддерживаемые сервисы"),
+                BotCommand(command="start", description="Запустить бота"),
+                BotCommand(command="search", description="Поиск по исполнителю и названию"),
+                BotCommand(command="cancel", description="Отмена действия"),
+                BotCommand(command="help", description="Справка и возможности"),
             ])
             # Окно «Что умеет этот бот?», отображаемое по центру чата до нажатия «Старт»
             bot_description = (
-                "Бот скачивает музыку по ссылке или названию и отправляет аудио в формате MP3 / M4A. "
-                "Доступен встроенный редактор тегов (название, артист, альбом, обложка).\n\n"
+                "музыка скачать не фейк — быстрый поиск и загрузка музыки в MP3.\n\n"
+                "Отправьте ссылку на трек или текстовый запрос: Исполнитель — Название.\n\n"
                 "Поддерживаемые платформы:\n"
                 "• Spotify\n"
                 "• Apple Music\n"
-                "• YouTube / YouTube Music\n"
+                "• YouTube\n"
                 "• SoundCloud\n"
-                "• Яндекс Музыка\n"
-                "• ВКонтакте (VK Музыка)\n"
+                "• Яндекс Музыка\n\n"
+                "Формат аудио: MP3. Другие сервисы официально не поддерживаются."
             )
             await bot.set_my_description(description=bot_description)
             await bot.set_my_short_description(
-                short_description="Скачивание музыки из Spotify, Apple Music, YouTube, SoundCloud, Яндекс Музыки и VK в MP3/M4A."
+                short_description="музыка скачать не фейк. Поиск и загрузка треков из Spotify, Apple Music, YouTube, SoundCloud, Яндекс Музыки в MP3."
             )
         except Exception as e:
             logger.debug("Не удалось обновить меню команд и описание: %s", e)

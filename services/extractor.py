@@ -38,8 +38,10 @@ from services.yandex_vk import resolve_yandex_music_track, resolve_vk_music_trac
 logger = logging.getLogger(__name__)
 
 UNSUPPORTED_URL_FALLBACK_TEXT = (
-    "⚠️ Не удалось распознать эту ссылку.\n\n"
-    "💡 Отправьте название трека или исполнителя текстом — я найду его на YouTube."
+    "Не удалось распознать ссылку.\n\n"
+    "Поддерживаемые платформы: Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка (MP3).\n"
+    "Другие сервисы официально не поддерживаются.\n\n"
+    "Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
 )
 
 
@@ -908,28 +910,28 @@ async def _resolve_track_url_inner(url: str, session: aiohttp.ClientSession) -> 
     if "spotify.com" in domain:
         if "/album/" in path or "/playlist/" in path or "/collection/" in path:
             raise ValueError(
-                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
-                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
+                "Отправьте ссылку на отдельный трек."
             )
     elif "apple.com" in domain:
         qs = urllib.parse.parse_qs(parsed.query)
         if "/album/" in path and "i" not in qs and not re.search(r'/album/[^/\s?]+/\d+/\d+', path):
             raise ValueError(
-                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
-                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
+                "Отправьте ссылку на отдельный трек."
             )
     elif "youtube.com" in domain or "youtu.be" in domain:
         qs = urllib.parse.parse_qs(parsed.query)
         if "/playlist" in path or ("list=" in url and "v" not in qs):
             raise ValueError(
-                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
-                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
+                "Отправьте ссылку на отдельный трек."
             )
     elif "soundcloud.com" in domain:
         if "/sets/" in path:
             raise ValueError(
-                "Загрузка альбомов и плейлистов не поддерживается.\n\n"
-                "💡 Пожалуйста, отправьте ссылку на конкретный трек."
+                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
+                "Отправьте ссылку на отдельный трек."
             )
 
     # 1. Яндекс Музыка (двухэтапный resolve через российский VLESS-маршрут)
