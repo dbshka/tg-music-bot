@@ -500,6 +500,31 @@ def _cleanup_temp_candidate_files(output_dir: Path):
         pass
 
 
+def _promote_candidate_assets(source_dir: Path, target_dir: Path, audio_file: Path) -> Path:
+    """
+    Продвигает аудиофайл и обложку победителя из изолированной директории кандидата в целевую директорию.
+    Гарантирует, что обложки yt-dlp (*.webp, *.jpg, *.png) не теряются при удалении source_dir.
+    """
+    winner_path = target_dir / audio_file.name
+    if winner_path.exists():
+        winner_path.unlink(missing_ok=True)
+    shutil.move(str(audio_file), str(winner_path))
+
+    for img_pattern in ("*.webp", "*.jpg", "*.jpeg", "*.png"):
+        for img_f in list(source_dir.glob(img_pattern)):
+            target_img = target_dir / img_f.name
+            if target_img.exists():
+                target_img.unlink(missing_ok=True)
+            try:
+                shutil.move(str(img_f), str(target_img))
+            except Exception:
+                pass
+            break
+
+    shutil.rmtree(source_dir, ignore_errors=True)
+    return winner_path
+
+
 def _extract_info_with_timeout(
     ydl_opts: dict,
     url: str,
@@ -1344,7 +1369,10 @@ def _sync_download(
                             custom_artist=custom_artist,
                             custom_title=custom_title,
                             core_title_words=core_title_words,
-                            clean_search=clean_search
+                            clean_search=clean_search,
+                            requested_modifiers=requested_modifiers,
+                            is_apple_music=is_apple_music,
+                            is_text_input=is_text_input
                         )
                         for e in entries
                     )
@@ -1693,13 +1721,9 @@ def _sync_download(
                     )
 
                     if is_duration_acceptable and (not core_title_words or cand_match_ratio >= 0.5):
-                        # Продвигаем победившую аудиодорожку в output_dir:
-                        winner_path = output_dir / audio_files[0].name
-                        if winner_path.exists():
-                            winner_path.unlink(missing_ok=True)
-                        shutil.move(str(audio_files[0]), str(winner_path))
+                        # Продвигаем победившую аудиодорожку и обложку в output_dir:
+                        winner_path = _promote_candidate_assets(cand_dir, output_dir, audio_files[0])
                         audio_files = [winner_path]
-                        shutil.rmtree(cand_dir, ignore_errors=True)
 
                         # Идеальное попадание! Удаляем возможный бэкап и возвращаем результат
                         for old_f in output_dir.iterdir():
@@ -1787,9 +1811,9 @@ def _sync_download(
                     if cand_source == "youtube" and not getattr(selected_entry, "_retried", False):
                         if any(k in cand_err_str for k in ["reload", "format", "sign in", "bot", "403", "429"]):
                             selected_entry["_retried"] = True
-                            t_retry_remain = cand_deadline - time.perf_counter()
                             t_global_remain = t_global_deadline - time.perf_counter()
-                            if t_retry_remain < MIN_RETRY_TIME_REMAINING or t_global_remain < MIN_RETRY_TIME_REMAINING + GLOBAL_SC_FALLBACK_RESERVE:
+                            t_retry_remain = min(CANDIDATE_DOWNLOAD_TIMEOUT, max(0.0, t_global_remain - GLOBAL_SC_FALLBACK_RESERVE))
+                            if t_retry_remain < MIN_RETRY_TIME_REMAINING:
                                 print(f"{req_tag}[DOWNLOADER] Недостаточно времени для повторной загрузки кандидата #{cand_idx+1} без cookies ({t_retry_remain:.1f}s осталось). Пропускаем.", flush=True)
                                 shutil.rmtree(cand_dir, ignore_errors=True)
                                 _cleanup_temp_candidate_files(output_dir)
@@ -1865,12 +1889,8 @@ def _sync_download(
                                     max_retry_diff = 45 if requested_modifiers else ((max(4, min(7, int(expected_duration * 0.02))) if is_official_high_confidence else 4) if (is_apple_music or is_text_input) else 25)
                                     dur_ok = not expected_duration or (diff <= max_retry_diff)
                                     if dur_ok:
-                                        winner_path = output_dir / audio_files[0].name
-                                        if winner_path.exists():
-                                            winner_path.unlink(missing_ok=True)
-                                        shutil.move(str(audio_files[0]), str(winner_path))
+                                        winner_path = _promote_candidate_assets(cand_dir, output_dir, audio_files[0])
                                         audio_files = [winner_path]
-                                        shutil.rmtree(cand_dir, ignore_errors=True)
                                         print(f"{req_tag}[DOWNLOADER] Резервный запуск кандидата #{cand_idx+1} успешен!", flush=True)
                                         has_usable_candidate = True
                                         res_info["_source_title"] = retry_title
@@ -2030,12 +2050,8 @@ def _sync_download(
                                             res_cand["_source_title"] = s_title
                                             res_cand["_source_modifiers"] = sc_dl_mods
 
-                                            winner_path = output_dir / audio_files[0].name
-                                            if winner_path.exists():
-                                                winner_path.unlink(missing_ok=True)
-                                            shutil.move(str(audio_files[0]), str(winner_path))
+                                            winner_path = _promote_candidate_assets(sc_cand_dir, output_dir, audio_files[0])
                                             audio_files = [winner_path]
-                                            shutil.rmtree(sc_cand_dir, ignore_errors=True)
 
                                             has_usable_candidate = True
                                             return res_cand
@@ -2500,7 +2516,7 @@ async def download_track(
         # Очищаем только временные аудиофайлы, сохраняя скачанную обложку
         if output_dir.exists():
             for item in output_dir.iterdir():
-                if item.is_file() and not item.name.startswith("cover"):
+                if item.is_file() and not item.name.startswith("cover") and not item.name.startswith("thumb_") and not item.name.startswith("embedded_"):
                     try:
                         item.unlink(missing_ok=True)
                     except Exception:

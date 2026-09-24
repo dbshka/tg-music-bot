@@ -1624,3 +1624,354 @@ async def test_race_timeout_candidate1_does_not_swap_or_corrupt_winner_candidate
         # И Candidate #1 изолирован в своей директории:
         if c1_out_dir and c1_out_dir.exists():
             assert c1_out_dir != tmp_path
+
+
+# ============================================================================
+# SECTION 10: SPEED / EXPENSIVE OPERATIONS BOUNDED & BAD CANDIDATES NOT DOWNLOADED
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_expensive_operations_bounded_and_bad_candidates_not_downloaded():
+    """
+    Section 10: 5 YouTube candidates (3 bad, 2 eligible).
+    - Bad candidates (artist mismatch, unwanted modifier, bad title) have 0 download attempts.
+    - Only eligible candidate #1 downloads.
+    - 403 on eligible candidate #1 retries once without cookies and succeeds.
+    - Eligible candidate #2 and subsequent candidates are NOT touched.
+    """
+    cand1_bad_artist = {
+        "id": "c1_bad_artist",
+        "title": "Wrong Artist - Pt.02",
+        "uploader": "Wrong Artist",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c1_bad_artist",
+        "_source": "youtube",
+    }
+    cand2_bad_modifier = {
+        "id": "c2_bad_modifier",
+        "title": "Tribal Church - Pt.02 (Live 2003)",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c2_bad_modifier",
+        "_source": "youtube",
+    }
+    cand3_bad_title = {
+        "id": "c3_bad_title",
+        "title": "Tribal Church - Completely Different Track",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c3_bad_title",
+        "_source": "youtube",
+    }
+    cand4_eligible_1 = {
+        "id": "c4_eligible_1",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c4_eligible_1",
+        "_source": "youtube",
+    }
+    cand5_eligible_2 = {
+        "id": "c5_eligible_2",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c5_eligible_2",
+        "_source": "youtube",
+    }
+
+    all_candidates = [
+        cand1_bad_artist,
+        cand2_bad_modifier,
+        cand3_bad_title,
+        cand4_eligible_1,
+        cand5_eligible_2,
+    ]
+
+    download_attempts = []
+    retry_no_cookies_called = False
+
+    class MockSection10YDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            nonlocal retry_no_cookies_called
+            if not download:
+                return {"entries": all_candidates}
+
+            download_attempts.append((url, bool(self.opts.get("cookiefile"))))
+            if "c4_eligible_1" in url:
+                if self.opts.get("cookiefile"):
+                    raise Exception("HTTP Error 403: Forbidden")
+                else:
+                    retry_no_cookies_called = True
+                    out_dir = Path(self.opts["outtmpl"]).parent
+                    f = out_dir / "valid_track.m4a"
+                    f.write_bytes(b"audio_content" * 500)
+                    return cand4_eligible_1
+
+            if "c5_eligible_2" in url:
+                raise RuntimeError("Candidate #5 must not be touched!")
+
+            raise RuntimeError(f"Unexpected download call for {url}")
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockSection10YDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True,
+        )
+
+        assert result is not None
+        assert result.title == "Pt.02"
+        assert result.artist == "Tribal Church"
+
+        # 1. Плохие кандидаты не должны скачиваться вовсе:
+        bad_urls = ["c1_bad_artist", "c2_bad_modifier", "c3_bad_title"]
+        for bad_id in bad_urls:
+            assert not any(bad_id in url for url, _ in download_attempts), f"Bad candidate {bad_id} was attempted to download!"
+
+        # 2. Только подходящий кандидат #4 скачивался:
+        assert len(download_attempts) == 2  # 1 попытка с cookies (403) + 1 retry без cookies (success)
+        assert "c4_eligible_1" in download_attempts[0][0]
+        assert download_attempts[0][1] is True  # with cookies
+        assert "c4_eligible_1" in download_attempts[1][0]
+        assert download_attempts[1][1] is False  # without cookies
+        assert retry_no_cookies_called is True
+
+        # 3. Последующий кандидат #5 не затрагивался:
+        assert not any("c5_eligible_2" in url for url, _ in download_attempts)
+
+        result.cleanup()
+
+
+# ============================================================================
+# SECTION 11: COVER PIPELINE REGRESSION TESTS (TESTS A - F)
+# ============================================================================
+
+def test_cover_regression_a_remote_cover_to_mp3_apic(tmp_path):
+    """
+    Test A: _apply_custom_metadata записывает ID3 APIC frame в MP3 с корректным mime и данными.
+    """
+    from services.downloader import _apply_custom_metadata
+    from mutagen.id3 import ID3
+
+    # Создаем dummy MP3 с валидными фреймами
+    mp3_file = tmp_path / "test_track.mp3"
+    frame_header = b"\xff\xfb\x90\x04" + b"\x00" * 414
+    mp3_file.write_bytes(frame_header * 10)
+
+    # Создаем dummy обложку JPEG
+    cover_file = tmp_path / "cover.jpg"
+    img = Image.new("RGB", (600, 600), color="blue")
+    img.save(cover_file, "JPEG")
+
+    _apply_custom_metadata(
+        audio_path=mp3_file,
+        title="Cover Track",
+        artist="Cover Artist",
+        cover_path=cover_file,
+        album="Cover Album"
+    )
+
+    tags = ID3(mp3_file)
+    apic_frames = tags.getall("APIC")
+    assert len(apic_frames) == 1, "ID3 APIC frame must be present in MP3"
+    apic = apic_frames[0]
+    assert apic.mime == "image/jpeg"
+    assert apic.type == 3  # Cover front
+
+    with Image.open(io.BytesIO(apic.data)) as loaded_img:
+        assert loaded_img.format == "JPEG"
+        assert loaded_img.size == (600, 600)
+
+
+def test_cover_regression_b_remote_cover_to_m4a_covr(tmp_path):
+    """
+    Test B: _apply_custom_metadata записывает MP4 covr atom в M4A.
+    """
+    from services.downloader import _apply_custom_metadata
+    from mutagen.mp4 import MP4Cover
+
+    m4a_file = tmp_path / "test_track.m4a"
+    m4a_file.write_bytes(b"dummy_m4a_content")
+
+    cover_file = tmp_path / "cover.jpg"
+    img = Image.new("RGB", (500, 500), color="red")
+    img.save(cover_file, "JPEG")
+
+    mock_mp4_tags = {}
+    mock_mp4_instance = MagicMock()
+    mock_mp4_instance.__setitem__.side_effect = lambda k, v: mock_mp4_tags.__setitem__(k, v)
+    mock_mp4_instance.__getitem__.side_effect = lambda k: mock_mp4_tags[k]
+
+    with patch("services.downloader.MP4", return_value=mock_mp4_instance):
+        _apply_custom_metadata(
+            audio_path=m4a_file,
+            title="M4A Title",
+            artist="M4A Artist",
+            cover_path=cover_file,
+            album="M4A Album"
+        )
+
+        assert "\xa9nam" in mock_mp4_tags and mock_mp4_tags["\xa9nam"] == ["M4A Title"]
+        assert "\xa9ART" in mock_mp4_tags and mock_mp4_tags["\xa9ART"] == ["M4A Artist"]
+        assert "covr" in mock_mp4_tags
+        assert len(mock_mp4_tags["covr"]) == 1
+        assert isinstance(mock_mp4_tags["covr"][0], MP4Cover)
+        mock_mp4_instance.save.assert_called_once()
+
+
+def test_cover_regression_c_candidate_promotion_preserves_thumbnail(tmp_path):
+    """
+    Test C: _promote_candidate_assets переносит обложку yt-dlp (*.webp, *.jpg) вместе с аудио
+    из изолированной cand_dir в output_dir до удаления cand_dir.
+    """
+    from services.downloader import _promote_candidate_assets
+
+    cand_dir = tmp_path / "candidate_isolated_dir"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = tmp_path / "final_output_dir"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    audio_file = cand_dir / "audio.m4a"
+    audio_file.write_bytes(b"AUDIO_DATA")
+
+    thumb_file = cand_dir / "thumbnail.webp"
+    thumb_file.write_bytes(b"THUMBNAIL_WEBP_DATA")
+
+    winner = _promote_candidate_assets(cand_dir, output_dir, audio_file)
+
+    assert winner.exists()
+    assert winner.parent == output_dir
+    assert winner.read_bytes() == b"AUDIO_DATA"
+
+    # Обложка должна быть перемещена в output_dir
+    promoted_thumb = output_dir / "thumbnail.webp"
+    assert promoted_thumb.exists()
+    assert promoted_thumb.read_bytes() == b"THUMBNAIL_WEBP_DATA"
+
+    # Изолированная директория кандидата удалена
+    assert not cand_dir.exists()
+
+
+def test_cover_regression_d_cleanup_preserves_covers_before_embedding(tmp_path):
+    """
+    Test D: _cleanup_temp_candidate_files и очистка в fallback сохраняют cover.jpg, thumb_cover.jpg, embedded_cover.jpg.
+    """
+    from services.downloader import _cleanup_temp_candidate_files
+
+    # Создаем набор файлов
+    cover_main = tmp_path / "cover.jpg"
+    cover_main.write_bytes(b"COVER_MAIN")
+    thumb_cover = tmp_path / "thumb_cover.jpg"
+    thumb_cover.write_bytes(b"THUMB_COVER")
+    embedded_cover = tmp_path / "embedded_cover.jpg"
+    embedded_cover.write_bytes(b"EMBEDDED_COVER")
+
+    temp_audio = tmp_path / "temp_audio.m4a"
+    temp_audio.write_bytes(b"TEMP_AUDIO")
+    temp_part = tmp_path / "temp.part"
+    temp_part.write_bytes(b"TEMP_PART")
+
+    # 1. Проверяем _cleanup_temp_candidate_files
+    _cleanup_temp_candidate_files(tmp_path)
+    assert cover_main.exists()
+    assert thumb_cover.exists()
+    assert embedded_cover.exists()
+
+    # 2. Проверяем fallback-очистку в download_track
+    for item in tmp_path.iterdir():
+        if item.is_file() and not item.name.startswith("cover") and not item.name.startswith("thumb_") and not item.name.startswith("embedded_"):
+            item.unlink(missing_ok=True)
+
+    assert cover_main.exists()
+    assert thumb_cover.exists()
+    assert embedded_cover.exists()
+    assert not temp_audio.exists()
+    assert not temp_part.exists()
+
+
+def test_cover_regression_e_missing_cover_graceful_fallback(tmp_path):
+    """
+    Test E: _apply_custom_metadata при отсутствии cover_path (None или несуществующий файл)
+    не падает с ошибкой и корректно прописывает текстовые теги.
+    """
+    from services.downloader import _apply_custom_metadata
+    from mutagen.id3 import ID3
+
+    mp3_file = tmp_path / "no_cover.mp3"
+    frame_header = b"\xff\xfb\x90\x04" + b"\x00" * 414
+    mp3_file.write_bytes(frame_header * 10)
+
+    # 1. cover_path = None
+    _apply_custom_metadata(
+        audio_path=mp3_file,
+        title="Title Only",
+        artist="Artist Only",
+        cover_path=None,
+        album="Album Only"
+    )
+
+    tags = ID3(mp3_file)
+    assert str(tags["TIT2"]) == "Title Only"
+    assert str(tags["TPE1"]) == "Artist Only"
+    assert len(tags.getall("APIC")) == 0
+
+    # 2. cover_path = несуществующий путь
+    non_existent_cover = tmp_path / "ghost_cover.jpg"
+    _apply_custom_metadata(
+        audio_path=mp3_file,
+        title="Title 2",
+        artist="Artist 2",
+        cover_path=non_existent_cover,
+    )
+    tags2 = ID3(mp3_file)
+    assert str(tags2["TIT2"]) == "Title 2"
+    assert len(tags2.getall("APIC")) == 0
+
+
+@pytest.mark.asyncio
+async def test_cover_regression_f_cover_download_failure_resilient(tmp_path):
+    """
+    Test F: Сбой скачивания обложки в download_track (ошибка в thumb_task)
+    не приводит к ошибке всего пайплайна — трек успешно отдаётся пользователю.
+    """
+    from services.downloader import download_track, DownloadedAudio
+
+    fake_audio_path = tmp_path / "valid.m4a"
+    fake_audio_path.write_bytes(b"AUDIO_DATA")
+
+    fake_downloaded = DownloadedAudio(
+        file_path=fake_audio_path,
+        title="Resilient Song",
+        artist="Resilient Artist",
+        duration=200,
+        thumbnail_path=None,
+        filesize=len(b"AUDIO_DATA"),
+        folder_path=tmp_path
+    )
+
+    with patch("services.downloader._sync_download", return_value=fake_downloaded), \
+         patch("services.downloader._process_remote_cover_bytes", side_effect=ConnectionError("CDN unreachable")):
+        result = await download_track(
+            query_or_url="https://www.youtube.com/watch?v=mock123",
+            custom_artist="Resilient Artist",
+            custom_title="Resilient Song",
+            thumbnail_url="https://example.com/bad_cover.jpg"
+        )
+
+        assert result is not None
+        assert result.title == "Resilient Song"
+        assert result.artist == "Resilient Artist"
+        assert result.file_path.exists()
