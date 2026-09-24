@@ -22,7 +22,8 @@ from services.downloader import (
     compute_candidate_penalty,
     _process_remote_cover_bytes,
     _cleanup_temp_candidate_files,
-    _is_candidate_promising
+    _is_candidate_promising,
+    is_candidate_download_eligible
 )
 
 
@@ -495,3 +496,1131 @@ async def test_multiple_candidates_fake_inversion_valid_succeeds_without_fallbac
         assert not any("c1_fake" in u for u in downloaded_urls)
         assert not any("c2_inversion" in u for u in downloaded_urls)
         result.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_candidate_hang_times_out_and_next_candidate_succeeds():
+    """Тест A: кандидат #1 зависает при скачивании -> отсекается по таймауту; кандидат #2 валиден -> скачивается и отдаётся."""
+    cand1_hang = {
+        "id": "c1_hang",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c1_hang",
+        "_source": "youtube",
+    }
+    cand2_valid = {
+        "id": "c2_valid",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c2_valid",
+        "_source": "youtube",
+    }
+
+    downloaded_urls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand1_hang, cand2_valid]}
+            downloaded_urls.append(url)
+            if "c1_hang" in url:
+                time.sleep(0.5)
+                return {"id": "c1_hang", "title": "Tribal Church - Pt.02", "duration": 216}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "valid_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "c2_valid",
+                "title": "Tribal Church - Pt.02",
+                "uploader": "Tribal Church - Topic",
+                "duration": 216,
+            }
+
+    t0 = time.perf_counter()
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader.CANDIDATE_DOWNLOAD_TIMEOUT", 0.15), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        elapsed = time.perf_counter() - t0
+        assert result is not None
+        assert result.title == "Pt.02"
+        assert any("c2_valid" in u for u in downloaded_urls)
+        assert elapsed < 1.0, f"Elapsed {elapsed:.2f}s exceeded limit"
+        result.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_candidate_retry_without_cookies_bounded_by_candidate_deadline():
+    """Тест B: кандидат #1 попытка 1 падает с 403; попытка 2 (без cookies) зависает -> отсекается по бюджету кандидата."""
+    cand1_403_hang = {
+        "id": "c1_403_hang",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c1_403_hang",
+        "_source": "youtube",
+    }
+    cand2_valid = {
+        "id": "c2_valid",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c2_valid",
+        "_source": "youtube",
+    }
+
+    downloaded_urls = []
+    retry_attempted = False
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            nonlocal retry_attempted
+            if not download:
+                return {"entries": [cand1_403_hang, cand2_valid]}
+            downloaded_urls.append(url)
+            if "c1_403_hang" in url:
+                if self.opts.get("cookiefile"):
+                    raise Exception("HTTP Error 403: Forbidden")
+                else:
+                    retry_attempted = True
+                    time.sleep(0.5)
+                    return {"id": "c1_403_hang", "title": "Tribal Church - Pt.02", "duration": 216}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "valid_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "c2_valid",
+                "title": "Tribal Church - Pt.02",
+                "uploader": "Tribal Church - Topic",
+                "duration": 216,
+            }
+
+    t0 = time.perf_counter()
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader.CANDIDATE_DOWNLOAD_TIMEOUT", 0.25), \
+         patch("services.downloader.MIN_RETRY_TIME_REMAINING", 0.05), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        elapsed = time.perf_counter() - t0
+        assert retry_attempted is True, "Retry without cookies must be attempted"
+        assert result is not None
+        assert result.title == "Pt.02"
+        assert any("c2_valid" in u for u in downloaded_urls)
+        assert elapsed < 1.0, f"Elapsed {elapsed:.2f}s exceeded limit"
+        result.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_all_youtube_candidates_fail_triggers_emergency_soundcloud_fallback():
+    """Тест C: 5 плохих YouTube-кандидатов (все падают/зависают) -> аварийный SoundCloud fallback срабатывает и отдаёт трек."""
+    bad_yt_cands = [
+        {
+            "id": f"yt_bad_{i}",
+            "title": f"Tribal Church - Pt.02 (Version {i})",
+            "uploader": "Tribal Church - Topic",
+            "duration": 216,
+            "webpage_url": f"https://www.youtube.com/watch?v=yt_bad_{i}",
+            "_source": "youtube",
+        }
+        for i in range(1, 6)
+    ]
+    cand_sc_fallback = {
+        "id": "sc_pt02",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church",
+        "duration": 216,
+        "webpage_url": "https://soundcloud.com/tribalchurch/pt02",
+        "_source": "soundcloud",
+    }
+
+    sc_fallback_called = False
+    downloaded_urls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            nonlocal sc_fallback_called
+            if not download:
+                if "scsearch4:" in url:
+                    sc_fallback_called = True
+                    return {"entries": [cand_sc_fallback]}
+                return {"entries": bad_yt_cands}
+
+            downloaded_urls.append(url)
+            if "youtube.com" in url:
+                raise Exception("HTTP Error 403: Forbidden")
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "sc_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "sc_pt02",
+                "title": "Tribal Church - Pt.02",
+                "uploader": "Tribal Church",
+                "duration": 216,
+            }
+
+    t0 = time.perf_counter()
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader.CANDIDATE_DOWNLOAD_TIMEOUT", 0.15), \
+         patch("services.downloader.GLOBAL_EXTRACTION_TIMEOUT", 3.0), \
+         patch("services.downloader.MIN_RETRY_TIME_REMAINING", 0.05), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        elapsed = time.perf_counter() - t0
+        assert sc_fallback_called is True, "Emergency SoundCloud fallback must be called"
+        assert result is not None
+        assert result.title == "Pt.02"
+        assert any("soundcloud.com" in u for u in downloaded_urls)
+        assert elapsed < 2.0, f"Elapsed {elapsed:.2f}s exceeded limit"
+        result.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_bad_candidate_then_valid_candidate_chosen_without_fallback():
+    """Тест D: кандидат #1 плохой (403), кандидат #2 валидный -> выбирается валидный, без аварийного fallback."""
+    cand1_bad = {
+        "id": "c1_bad",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c1_bad",
+        "_source": "youtube",
+    }
+    cand2_valid = {
+        "id": "c2_valid",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c2_valid",
+        "_source": "youtube",
+    }
+
+    sc_fallback_called = False
+    downloaded_urls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            nonlocal sc_fallback_called
+            if not download:
+                if "scsearch4:" in url:
+                    sc_fallback_called = True
+                return {"entries": [cand1_bad, cand2_valid]}
+
+            downloaded_urls.append(url)
+            if "c1_bad" in url:
+                raise Exception("HTTP Error 403: Forbidden")
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "valid_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "c2_valid",
+                "title": "Tribal Church - Pt.02",
+                "uploader": "Tribal Church - Topic",
+                "duration": 216,
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader.CANDIDATE_DOWNLOAD_TIMEOUT", 0.2), \
+         patch("services.downloader.MIN_RETRY_TIME_REMAINING", 0.05), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        assert sc_fallback_called is False, "Emergency fallback must NOT be called when candidate #2 succeeds"
+        assert result is not None
+        assert result.title == "Pt.02"
+        assert any("c2_valid" in u for u in downloaded_urls)
+        result.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_global_extraction_deadline_bounds_total_elapsed_time():
+    """Тест E: несколько медленных кандидатов -> общий лимит времени экстракции прерывает перебор и запускает SoundCloud fallback."""
+    slow_yt_cands = [
+        {
+            "id": f"yt_slow_{i}",
+            "title": f"Tribal Church - Pt.02 (Slow {i})",
+            "uploader": "Tribal Church - Topic",
+            "duration": 216,
+            "webpage_url": f"https://www.youtube.com/watch?v=yt_slow_{i}",
+            "_source": "youtube",
+        }
+        for i in range(1, 6)
+    ]
+    cand_sc_fallback = {
+        "id": "sc_pt02_fast",
+        "title": "Tribal Church - Pt.02",
+        "uploader": "Tribal Church",
+        "duration": 216,
+        "webpage_url": "https://soundcloud.com/tribalchurch/pt02",
+        "_source": "soundcloud",
+    }
+
+    sc_fallback_called = False
+    downloaded_yt_count = 0
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            nonlocal sc_fallback_called, downloaded_yt_count
+            if not download:
+                if "scsearch4:" in url:
+                    sc_fallback_called = True
+                    return {"entries": [cand_sc_fallback]}
+                return {"entries": slow_yt_cands}
+
+            if "youtube.com" in url:
+                downloaded_yt_count += 1
+                time.sleep(0.15)
+                raise Exception("HTTP Error 403: Forbidden")
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "sc_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "sc_pt02_fast",
+                "title": "Tribal Church - Pt.02",
+                "uploader": "Tribal Church",
+                "duration": 216,
+            }
+
+    t0 = time.perf_counter()
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader.GLOBAL_EXTRACTION_TIMEOUT", 0.4), \
+         patch("services.downloader.GLOBAL_SC_FALLBACK_RESERVE", 0.1), \
+         patch("services.downloader.CANDIDATE_DOWNLOAD_TIMEOUT", 0.15), \
+         patch("services.downloader.MIN_RETRY_TIME_REMAINING", 0.05), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        result = await download_track(
+            query_or_url="ytsearch5:Tribal Church - Pt.02",
+            custom_artist="Tribal Church",
+            custom_title="Pt.02",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        elapsed = time.perf_counter() - t0
+        assert sc_fallback_called is True, "SoundCloud fallback must trigger after global timeout"
+        assert downloaded_yt_count < 5, f"Expected < 5 candidates processed due to global deadline, but was {downloaded_yt_count}"
+        assert elapsed < 1.0, f"Elapsed {elapsed:.2f}s exceeded global bound"
+        assert result is not None
+        assert result.title == "Pt.02"
+        result.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_rejects_artist_mismatch_without_download():
+    """Test 1: target artist = Psychea, candidate uploader = another artist -> reject, extract_info(download=True) == 0 calls."""
+    cand_wrong = {
+        "id": "c1_wrong",
+        "title": "Other Singer - Бесконечный стук шагов",
+        "uploader": "Other Channel",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c1_wrong",
+        "_source": "youtube"
+    }
+
+    # 1. Прямая проверка хелпера:
+    eligible, reason = is_candidate_download_eligible(
+        candidate=cand_wrong,
+        custom_artist="Psychea",
+        custom_title="Бесконечный стук шагов",
+        is_apple_music=True
+    )
+    assert eligible is False
+    assert reason == "artist mismatch"
+
+    # 2. Интеграционная проверка через download_track:
+    download_calls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_wrong]}
+            download_calls.append(url)
+            raise RuntimeError("Should never be called for rejected candidate!")
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        with pytest.raises(Exception):
+            await download_track(
+                query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+                custom_artist="Psychea",
+                custom_title="Бесконечный стук шагов",
+                expected_duration=216,
+                is_apple_music=True
+            )
+
+    assert len(download_calls) == 0, f"Expected 0 download calls, but got {len(download_calls)}"
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_rejects_unwanted_modifier_without_download():
+    """Test 2: запрос без модификаторов, candidate c (Live 2003) и (Киберакустика) -> reject, download не выполняется."""
+    cand_live = {
+        "id": "c_live",
+        "title": "Psychea - Бесконечный стук шагов (Live 2003)",
+        "uploader": "Psychea",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_live",
+        "_source": "youtube"
+    }
+    cand_acoustic = {
+        "id": "c_acoustic",
+        "title": "Бесконечный стук шагов (Киберакустика Version)",
+        "uploader": "Psychea",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_acoustic",
+        "_source": "youtube"
+    }
+
+    # Прямая проверка
+    el1, r1 = is_candidate_download_eligible(cand_live, custom_artist="Psychea", custom_title="Бесконечный стук шагов", is_apple_music=True)
+    assert el1 is False
+    assert "live" in r1
+
+    el2, r2 = is_candidate_download_eligible(cand_acoustic, custom_artist="Psychea", custom_title="Бесконечный стук шагов", is_apple_music=True)
+    assert el2 is False
+    assert "киберакустика" in r2 or "acoustic" in r2
+
+    download_calls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_live, cand_acoustic]}
+            download_calls.append(url)
+            raise RuntimeError("Should never be called for rejected candidate!")
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        with pytest.raises(Exception):
+            await download_track(
+                query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+                custom_artist="Psychea",
+                custom_title="Бесконечный стук шагов",
+                expected_duration=216,
+                is_apple_music=True
+            )
+
+    assert len(download_calls) == 0, f"Expected 0 download calls, but got {len(download_calls)}"
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_rejects_bad_title_without_download():
+    """Test 3: нерелевантный title -> reject before download."""
+    cand_bad_title = {
+        "id": "c_bad_tit",
+        "title": "Psychea - Completely Random Song Title",
+        "uploader": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_bad_tit",
+        "_source": "youtube"
+    }
+
+    el, r = is_candidate_download_eligible(cand_bad_title, custom_artist="Psychea", custom_title="Бесконечный стук шагов")
+    assert el is False
+    assert "title mismatch" in r
+
+    download_calls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_bad_title]}
+            download_calls.append(url)
+            raise RuntimeError("Should never be called for rejected candidate!")
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        with pytest.raises(Exception):
+            await download_track(
+                query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+                custom_artist="Psychea",
+                custom_title="Бесконечный стук шагов",
+                expected_duration=216,
+                is_apple_music=True
+            )
+
+    assert len(download_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_allows_valid_candidate_to_download_and_succeed():
+    """Test 4: валидный кандидат -> pre-validation passes -> download выполняется -> post-validation подтверждает."""
+    cand_valid = {
+        "id": "c_valid",
+        "title": "Psychea - Бесконечный стук шагов",
+        "uploader": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_valid",
+        "_source": "youtube"
+    }
+
+    el, r = is_candidate_download_eligible(cand_valid, custom_artist="Psychea", custom_title="Бесконечный стук шагов", is_apple_music=True)
+    assert el is True
+    assert r is None
+
+    download_calls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_valid]}
+            download_calls.append(url)
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "valid_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "c_valid",
+                "title": "Psychea - Бесконечный стук шагов",
+                "uploader": "Psychea - Topic",
+                "duration": 216,
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+
+    assert len(download_calls) == 1
+    assert res is not None
+    assert res.title == "Бесконечный стук шагов"
+    res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_allows_ambiguous_candidate_to_proceed_to_post_validation():
+    """Test 5: metadata недостаточно для уверенного reject -> download разрешён, post-validation решает."""
+    cand_ambiguous = {
+        "id": "c_ambiguous",
+        "title": "Бесконечный стук шагов",
+        "uploader": None,
+        "channel": None,
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_ambiguous",
+        "_source": "youtube"
+    }
+
+    # В пре-валидации этот кандидат не должен отсекаться:
+    el, r = is_candidate_download_eligible(cand_ambiguous, custom_artist="Psychea", custom_title="Бесконечный стук шагов", is_apple_music=True)
+    assert el is True, "Ambiguous candidate must NOT be rejected early"
+    assert r is None
+
+    download_calls = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_ambiguous]}
+            download_calls.append(url)
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "valid_track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "c_ambiguous",
+                "title": "Бесконечный стук шагов",
+                "uploader": "Psychea - Topic",
+                "duration": 216,
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+
+    assert len(download_calls) == 1
+    assert res is not None
+    assert res.title == "Бесконечный стук шагов"
+    res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_403_retry_preserved_for_promising_candidate_and_blocked_for_rejected_candidate():
+    """Test 6: retry без cookies работает для promising candidate; для rejected candidate не вызывается вовсе."""
+    cand_promising_403 = {
+        "id": "c_prom_403",
+        "title": "Psychea - Бесконечный стук шагов",
+        "uploader": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_prom_403",
+        "_source": "youtube"
+    }
+
+    cookies_downloads = []
+    no_cookies_downloads = []
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_promising_403]}
+            if self.opts.get("cookiefile"):
+                cookies_downloads.append(url)
+                raise Exception("HTTP Error 403: Forbidden")
+            else:
+                no_cookies_downloads.append(url)
+                out_dir = Path(self.opts["outtmpl"]).parent
+                f = out_dir / "valid_track.m4a"
+                f.write_bytes(b"audio_bytes" * 500)
+                return {
+                    "id": "c_prom_403",
+                    "title": "Psychea - Бесконечный стук шагов",
+                    "uploader": "Psychea - Topic",
+                    "duration": 216,
+                }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+
+    assert len(cookies_downloads) == 1, "Attempt with cookies must be executed"
+    assert len(no_cookies_downloads) == 1, "Retry without cookies must be executed"
+    assert res is not None
+    assert res.title == "Бесконечный стук шагов"
+    res.cleanup()
+
+    # Проверяем обратное: для заведомо отсеянного кандидата ни cookies, ни no-cookies не запускаются
+    cand_rejected = {
+        "id": "c_rej",
+        "title": "Psychea - Бесконечный стук шагов (Live 2003)",
+        "uploader": "Psychea",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_rej",
+        "_source": "youtube"
+    }
+    calls_rej = []
+
+    class MockYDLRej:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_rejected]}
+            calls_rej.append(url)
+            raise RuntimeError("Must not be called!")
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDLRej), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        with pytest.raises(Exception):
+            await download_track(
+                query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+                custom_artist="Psychea",
+                custom_title="Бесконечный стук шагов",
+                expected_duration=216,
+                is_apple_music=True
+            )
+
+    assert len(calls_rej) == 0, "Rejected candidate must have 0 download attempts!"
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_accepts_youtube_topic_candidate():
+    """Тест 7: YouTube Topic candidate с uploader='Psychea - Topic' и channel='Psychea - Topic'."""
+    cand_topic = {
+        "id": "c_topic_1",
+        "title": "Бесконечный стук шагов",
+        "uploader": "Psychea - Topic",
+        "channel": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_topic_1",
+        "_source": "youtube"
+    }
+
+    eligible, reason = is_candidate_download_eligible(
+        candidate=cand_topic,
+        custom_artist="Psychea",
+        custom_title="Бесконечный стук шагов",
+        expected_duration=216,
+        is_apple_music=True
+    )
+    assert eligible is True
+    assert reason is None
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_topic]}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return cand_topic
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        assert res is not None
+        assert res.title == "Бесконечный стук шагов"
+        res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_accepts_official_channel_candidate():
+    """Тест 8: официальный канал исполнителя с uploader='Psychea', channel='Psychea'."""
+    cand_official = {
+        "id": "c_official_1",
+        "title": "Бесконечный стук шагов (Official Video)",
+        "uploader": "Psychea",
+        "channel": "Psychea",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_official_1",
+        "_source": "youtube"
+    }
+
+    eligible, reason = is_candidate_download_eligible(
+        candidate=cand_official,
+        custom_artist="Psychea",
+        custom_title="Бесконечный стук шагов",
+        expected_duration=216,
+        is_apple_music=True
+    )
+    assert eligible is True
+    assert reason is None
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_official]}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return cand_official
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        assert res is not None
+        assert res.title == "Бесконечный стук шагов"
+        res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_accepts_missing_uploader_and_channel_candidate():
+    """Тест 9: candidate без uploader/channel: ambiguous, не отбраковывается ложно в pre-validation."""
+    cand_missing_meta = {
+        "id": "c_no_meta_1",
+        "title": "Бесконечный стук шагов",
+        "uploader": None,
+        "channel": None,
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_no_meta_1",
+        "_source": "youtube"
+    }
+
+    eligible, reason = is_candidate_download_eligible(
+        candidate=cand_missing_meta,
+        custom_artist="Psychea",
+        custom_title="Бесконечный стук шагов",
+        expected_duration=216,
+        is_apple_music=True
+    )
+    assert eligible is True
+    assert reason is None
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_missing_meta]}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return {
+                "id": "c_no_meta_1",
+                "title": "Бесконечный стук шагов",
+                "artist": "Psychea",
+                "duration": 216
+            }
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        assert res is not None
+        assert res.title == "Бесконечный стук шагов"
+        res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_accepts_reupload_artist_dash_title():
+    """Тест 10: reupload с 'Artist - Title': uploader сторонний, но в title корректный артист."""
+    cand_reupload = {
+        "id": "c_reupload_1",
+        "title": "Psychea - Бесконечный стук шагов",
+        "uploader": "FanReuploader123",
+        "channel": "FanReuploader123",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_reupload_1",
+        "_source": "youtube"
+    }
+
+    eligible, reason = is_candidate_download_eligible(
+        candidate=cand_reupload,
+        custom_artist="Psychea",
+        custom_title="Бесконечный стук шагов",
+        expected_duration=216,
+        is_apple_music=True
+    )
+    assert eligible is True
+    assert reason is None
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_reupload]}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return cand_reupload
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        assert res is not None
+        assert res.title == "Бесконечный стук шагов"
+        res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pre_validation_accepts_candidate_with_slight_title_difference():
+    """Тест 11: candidate с небольшим отличием в title (например альбомная приписка)."""
+    cand_album = {
+        "id": "c_album_ver",
+        "title": "Psychea - Бесконечный стук шагов (Альбом Людям планеты Земля)",
+        "uploader": "Psychea - Topic",
+        "channel": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c_album_ver",
+        "_source": "youtube"
+    }
+
+    eligible, reason = is_candidate_download_eligible(
+        candidate=cand_album,
+        custom_artist="Psychea",
+        custom_title="Бесконечный стук шагов",
+        expected_duration=216,
+        is_apple_music=True
+    )
+    assert eligible is True
+    assert reason is None
+
+    class MockYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def extract_info(self, url, download=False):
+            if not download:
+                return {"entries": [cand_album]}
+            out_dir = Path(self.opts["outtmpl"]).parent
+            f = out_dir / "track.m4a"
+            f.write_bytes(b"audio_bytes" * 500)
+            return cand_album
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockYDL), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        res = await download_track(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            custom_artist="Psychea",
+            custom_title="Бесконечный стук шагов",
+            expected_duration=216,
+            is_apple_music=True
+        )
+        assert res is not None
+        assert res.title == "Бесконечный стук шагов"
+        res.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_race_timeout_candidate1_does_not_swap_or_corrupt_winner_candidate2(tmp_path):
+    """
+    Тест 12: race condition:
+    Candidate #1 получает timeout в _extract_info_with_timeout, но его поток продолжает выполняться в фоне
+    и позже записывает dummy аудиофайл.
+    Candidate #2 успешен и скачивает валидный аудиофайл.
+    Строгая изоляция директорий гарантирует, что отдаётся именно файл Candidate #2,
+    а Candidate #1 ни при каких условиях не подменяет и не портит результат.
+    """
+    import threading
+    import time
+    from services.downloader import _sync_download
+
+    cand1 = {
+        "id": "c1_slow",
+        "title": "Psychea - Бесконечный стук шагов",
+        "uploader": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c1_slow",
+        "_source": "youtube"
+    }
+    cand2 = {
+        "id": "c2_fast",
+        "title": "Psychea - Бесконечный стук шагов",
+        "uploader": "Psychea - Topic",
+        "duration": 216,
+        "webpage_url": "https://www.youtube.com/watch?v=c2_fast",
+        "_source": "youtube"
+    }
+
+    c1_bg_thread_finished = threading.Event()
+    c1_out_dir = None
+
+    class MockRaceYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download=False):
+            nonlocal c1_out_dir
+            if not download:
+                return {"entries": [cand1, cand2]}
+
+            out_dir = Path(self.opts["outtmpl"]).parent
+            if "c1_slow" in url:
+                c1_out_dir = out_dir
+                # Имитируем зависание скачивания Candidate #1 с последующей фоновой записью файла
+                def _background_writer():
+                    time.sleep(0.15)
+                    # Фоновый поток заканчивает запись позже, создавая файл Candidate #1:
+                    try:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        fake_f = out_dir / "c1_audio.m4a"
+                        fake_f.write_bytes(b"CORRUPTED_CANDIDATE_1_AUDIO" * 100)
+                    except Exception:
+                        pass
+                    finally:
+                        c1_bg_thread_finished.set()
+
+                t = threading.Thread(target=_background_writer, daemon=True)
+                t.start()
+                # Вызываем TimeoutError от имени _extract_info_with_timeout:
+                raise TimeoutError("Candidate #1 exceeded candidate deadline")
+
+            elif "c2_fast" in url:
+                # Candidate #2 скачивается быстро и успешно:
+                f2 = out_dir / "c2_audio.m4a"
+                f2.write_bytes(b"VALID_WINNING_CANDIDATE_2_AUDIO" * 100)
+                return cand2
+
+            return {}
+
+    with patch("yt_dlp.YoutubeDL", side_effect=MockRaceYDL), \
+         patch("services.downloader.CANDIDATE_DOWNLOAD_TIMEOUT", 0.05):
+        res = _sync_download(
+            query_or_url="ytsearch5:Psychea - Бесконечный стук шагов",
+            output_dir=tmp_path,
+            custom_title="Бесконечный стук шагов",
+            custom_artist="Psychea",
+            expected_duration=216,
+            is_apple_music=True
+        )
+
+        assert res is not None
+        assert res.file_path.exists()
+        # Проверяем, что в финальном файле находятся байты именно Candidate #2:
+        content = res.file_path.read_bytes()
+        assert b"VALID_WINNING_CANDIDATE_2_AUDIO" in content
+        assert b"CORRUPTED_CANDIDATE_1_AUDIO" not in content
+
+        # Ждём завершения фонового потока Candidate #1, чтобы проверить изоляцию:
+        c1_bg_thread_finished.wait(timeout=1.0)
+        # Проверяем, что файл победителя в tmp_path остался файлом Candidate #2:
+        assert b"VALID_WINNING_CANDIDATE_2_AUDIO" in res.file_path.read_bytes()
+        assert b"CORRUPTED_CANDIDATE_1_AUDIO" not in res.file_path.read_bytes()
+        # И Candidate #1 изолирован в своей директории:
+        if c1_out_dir and c1_out_dir.exists():
+            assert c1_out_dir != tmp_path

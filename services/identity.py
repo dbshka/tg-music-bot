@@ -100,7 +100,7 @@ TRACK_MODIFIERS = {
     "speed_multiplier",
     # Versions & Edits
     "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix",
-    "cover", "кавер", "acoustic", "акустика", "piano", "пианино",
+    "cover", "кавер", "acoustic", "акустика", "киберакустика", "кибер акустика", "piano", "пианино",
     "acapella", "a cappella", "акапелла", "лайв", "концерт",
     "8d", "16d", "nightcore", "daycore", "instrumental", "инструментал", "minus", "минус",
     "edit", "fan edit", "karaoke", "караоке", "orchestral", "orchestra", "tribute",
@@ -139,7 +139,7 @@ SEMANTIC_MODIFIERS = {
     "reverb", "reverbed", "slowed + reverb", "slowed & reverb", "nightcore", "daycore",
     # Versions & Edits:
     "remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix", "club mix", "dance mix",
-    "live", "лайв", "концерт", "performance", "acoustic", "акустика", "unplugged",
+    "live", "лайв", "концерт", "performance", "acoustic", "акустика", "киберакустика", "кибер акустика", "unplugged",
     "cover", "кавер", "tribute", "karaoke", "караоке",
     "instrumental", "инструментал", "minus", "минус", "acapella", "a cappella",
     "clean", "explicit", "remaster", "remastered", "demo"
@@ -151,7 +151,7 @@ SPED_UP_GROUP: Set[str] = {"speed up", "speedup", "sped up", "spedup", "fast ver
 REVERB_GROUP: Set[str] = {"reverb", "reverbed", "slowed + reverb", "slowed & reverb", "slowed and reverb", "slowed+reverb", "slowed reverb", "slowedreverb", "sped up + reverb"}
 NIGHTCORE_GROUP: Set[str] = {"nightcore"}
 DAYCORE_GROUP: Set[str] = {"daycore"}
-ACOUSTIC_GROUP: Set[str] = {"acoustic", "акустика", "piano", "пианино", "unplugged"}
+ACOUSTIC_GROUP: Set[str] = {"acoustic", "акустика", "киберакустика", "кибер акустика", "piano", "пианино", "unplugged"}
 LIVE_GROUP: Set[str] = {"live", "лайв", "концерт", "performance"}
 COVER_GROUP: Set[str] = {"cover", "кавер", "tribute"}
 REMIX_GROUP: Set[str] = {"remix", "ремикс", "rmx", "bootleg", "flip", "mashup", "vip mix", "club mix", "dance mix"}
