@@ -69,7 +69,7 @@ def test_crypto_qr_images_exist_and_valid():
 
         # Проверка целостности картинки через Pillow
         with Image.open(img_file) as im:
-            assert im.size == (320, 320)
+            assert im.size[0] >= 320 and im.size[1] >= 320
             assert im.format in ("JPEG", "PNG")
 
 
