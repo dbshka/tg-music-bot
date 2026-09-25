@@ -393,6 +393,90 @@ def format_download_error(e: Exception, track_info: Optional[ExtractedTrack] = N
     return "Возникла ошибка 11. Попробуйте ещё раз."
 
 
+class DownloadProgressUpdater:
+    """
+    Потокобезопасный и защищенный от rate-limit (троттлинг 1.2s / 5% дельта)
+    обновлятор прогресса загрузки и пост-обработки для Telegram.
+    """
+    def __init__(self, status_msg: Optional[Message], display_title: str, platform_label: str):
+        self.status_msg = status_msg
+        self.display_title = display_title
+        self.platform_label = platform_label
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = None
+        self.last_pct: int = -1
+        self.last_edit_time: float = time.perf_counter()
+        self.min_interval: float = 1.2
+        self.min_delta: int = 5
+        self.stage: str = "downloading"
+        self._closed: bool = False
+        self._edit_lock = asyncio.Lock()
+
+    def on_progress(self, stage: str, pct: int):
+        if self._closed or not self.status_msg or not self.loop or self.loop.is_closed():
+            return
+        try:
+            self.loop.call_soon_threadsafe(self._schedule_update, stage, pct)
+        except Exception:
+            pass
+
+    def _schedule_update(self, stage: str, pct: int):
+        if self._closed or not self.status_msg:
+            return
+        now = time.perf_counter()
+
+        if stage == "processing":
+            if self.stage != "processing":
+                self.stage = "processing"
+                if now - self.last_edit_time < 0.8:
+                    delay = max(0.1, 0.8 - (now - self.last_edit_time))
+                    asyncio.create_task(self._delayed_processing_edit(delay))
+                else:
+                    self.last_edit_time = now
+                    text = f"Обработка аудио: <b>{html.escape(self.display_title)}</b>{self.platform_label}"
+                    asyncio.create_task(self._safe_edit(text))
+            return
+
+        if stage == "downloading" and self.stage == "downloading":
+            clamped_pct = max(0, min(100, pct))
+            if clamped_pct == 100 and self.last_pct == 100:
+                return
+            if clamped_pct != 100:
+                if self.last_pct >= 0 and abs(clamped_pct - self.last_pct) < self.min_delta:
+                    return
+                if (now - self.last_edit_time) < self.min_interval:
+                    return
+
+            self.last_pct = clamped_pct
+            self.last_edit_time = now
+            text = f"Загрузка: <b>{html.escape(self.display_title)}</b>{self.platform_label}\nПрогресс: {clamped_pct}%"
+            asyncio.create_task(self._safe_edit(text))
+
+    async def _delayed_processing_edit(self, delay: float):
+        await asyncio.sleep(delay)
+        if self._closed or self.stage != "processing" or not self.status_msg:
+            return
+        self.last_edit_time = time.perf_counter()
+        text = f"Обработка аудио: <b>{html.escape(self.display_title)}</b>{self.platform_label}"
+        await self._safe_edit(text)
+
+    async def _safe_edit(self, text: str):
+        if self._closed or not self.status_msg:
+            return
+        async with self._edit_lock:
+            if self._closed or not self.status_msg:
+                return
+            try:
+                await self.status_msg.edit_text(text, parse_mode="HTML")
+            except Exception:
+                pass
+
+    def close(self):
+        self._closed = True
+
+
 async def _execute_download_and_send(
     message: Message,
     raw_query: str,
@@ -423,6 +507,7 @@ async def _execute_download_and_send(
     downloaded_audio = None
     t_cleanup = 0.0
     status_msg = None
+    progress_updater = None
     try:
         t_m0 = time.perf_counter()
         if url:
@@ -613,13 +698,15 @@ async def _execute_download_and_send(
                     print(f"[MUSIC][request_id={req_id}] cache send failed: {cache_err}. Falling back to live download.", flush=True)
                     cached = None
 
+        display_title = format_track_display(track_info.artist, track_info.title)
         platform_label = f"\nПлатформа: <b>{track_info.platform}</b>" if track_info.platform and "Search" not in track_info.platform else ""
         if status_msg:
-            display_title = format_track_display(track_info.artist, track_info.title)
             await status_msg.edit_text(
                 f"Загрузка: <b>{html.escape(display_title)}</b>{platform_label}",
                 parse_mode="HTML"
             )
+
+        progress_updater = DownloadProgressUpdater(status_msg, display_title, platform_label)
 
         print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}' is_apple_music={is_apple_music} is_text_input={is_text_input}", flush=True)
         try:
@@ -635,7 +722,8 @@ async def _execute_download_and_send(
                         is_apple_music=is_apple_music,
                         is_text_input=is_text_input,
                         requested_variant=variant,
-                        custom_album=getattr(track_info, "album", None)
+                        custom_album=getattr(track_info, "album", None),
+                        progress_callback=progress_updater.on_progress
                     )
         except Exception as dl_err:
             is_direct_url = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "soundcloud.com")))
@@ -676,10 +764,14 @@ async def _execute_download_and_send(
                             is_apple_music=is_apple_music,
                             is_text_input=is_text_input,
                             requested_variant=variant,
-                            custom_album=getattr(track_info, "album", None)
+                            custom_album=getattr(track_info, "album", None),
+                            progress_callback=progress_updater.on_progress
                         )
             else:
                 raise dl_err
+
+        if progress_updater:
+            progress_updater.close()
 
         print(f"[MUSIC][request_id={req_id}] download_track SUCCESS title='{downloaded_audio.title}' duration={downloaded_audio.duration}s size={downloaded_audio.filesize} bytes", flush=True)
 
@@ -848,6 +940,8 @@ async def _execute_download_and_send(
             except Exception:
                 pass
     finally:
+        if progress_updater:
+            progress_updater.close()
         if downloaded_audio:
             t_cl0 = time.perf_counter()
             downloaded_audio.cleanup()

@@ -457,6 +457,24 @@ def phonetic_artist_key(text: Optional[str]) -> str:
     return " ".join(norm_words)
 
 
+_IN_WORD_HOMOGLYPH_I_RE = re.compile(r'(?<=[a-zA-Z])I(?=[a-zA-Z0-9])')
+_IN_WORD_HOMOGLYPH_1_RE = re.compile(r'(?<=[a-zA-Z])1(?=[a-zA-Z])')
+
+
+def _normalize_visual_homoglyphs(text: str) -> str:
+    """
+    Нормализует визуальные типографические омоглифы без ослабления строгого сравнения:
+    заменяет заглавную 'I' на 'l' и leet '1' на 'l' исключительно внутри слова
+    (например, 'RAIii' -> 'RAlii', 'bIink' -> 'blink', 'RA1ii' -> 'RAlii').
+    Не затрагивает заглавные 'I' в начале слов (Ian, Igor, Imagine) и обычные строчные буквы.
+    """
+    if not text:
+        return ""
+    s = _IN_WORD_HOMOGLYPH_I_RE.sub('l', text)
+    s = _IN_WORD_HOMOGLYPH_1_RE.sub('l', s)
+    return s
+
+
 def validate_artist_match(expected_artist: Optional[str], candidate_text: Optional[str]) -> bool:
     """
     Строгая валидация совпадения исполнителя:
@@ -468,12 +486,22 @@ def validate_artist_match(expected_artist: Optional[str], candidate_text: Option
     if not expected_artist or not candidate_text:
         return True
 
-    clean_expected = clean_unicode_text(expected_artist).lower()
-    clean_cand = clean_unicode_text(candidate_text).lower()
+    orig_expected = clean_unicode_text(expected_artist)
+    orig_cand = clean_unicode_text(candidate_text)
+    clean_expected = orig_expected.lower()
+    clean_cand = orig_cand.lower()
 
     if clean_expected in clean_cand:
         pattern = r'(?<![a-z0-9а-яё])' + re.escape(clean_expected) + r'(?![a-z0-9а-яё])'
         if re.search(pattern, clean_cand):
+            return True
+
+    # Типографические омоглифы латиницы для стилизованных ников (например, DJ ZUP RAlii <-> _DJ ZUP RAIii_)
+    expected_homo = _normalize_visual_homoglyphs(orig_expected).lower()
+    cand_homo = _normalize_visual_homoglyphs(orig_cand).lower()
+    if (expected_homo != clean_expected or cand_homo != clean_cand) and len(expected_homo) >= 4 and expected_homo in cand_homo:
+        pattern_homo = r'(?<![a-z0-9а-яё])' + re.escape(expected_homo) + r'(?![a-z0-9а-яё])'
+        if re.search(pattern_homo, cand_homo):
             return True
 
     cand_tr = transliterate_text(clean_cand)
@@ -491,6 +519,11 @@ def validate_artist_match(expected_artist: Optional[str], candidate_text: Option
             pattern = r'(?<![a-z0-9а-яё])' + re.escape(art_norm) + r'(?![a-z0-9а-яё])'
             if re.search(pattern, clean_cand):
                 return True
+            art_homo = _normalize_visual_homoglyphs(art).lower()
+            if (art_homo != art_norm or cand_homo != clean_cand) and len(art_homo) >= 4 and art_homo in cand_homo:
+                pattern_homo = r'(?<![a-z0-9а-яё])' + re.escape(art_homo) + r'(?![a-z0-9а-яё])'
+                if re.search(pattern_homo, cand_homo):
+                    return True
             art_tr = transliterate_text(art_norm)
             if art_tr != art_norm and len(art_tr) >= 2 and art_tr not in {"the", "a", "an"}:
                 pattern_tr = r'(?<![a-z0-9а-яё])' + re.escape(art_tr) + r'(?![a-z0-9а-яё])'

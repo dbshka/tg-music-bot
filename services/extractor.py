@@ -581,8 +581,8 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
     if track_id:
         artist, title, thumbnail_url, duration = await _extract_spotify_embed_metadata(track_id, session)
 
-    # 2. Быстрый опрос Microlink напрямую, если автор или название не найдены
-    if not (title and artist):
+    # 2. Быстрый опрос Microlink напрямую, если track_id отсутствовал и не опрашивался в шаге 1
+    if not (title and artist) and not track_id:
         m_artist, m_title, m_cover = await _extract_microlink_metadata(clean_url, session)
         artist = artist or m_artist
         title = title or m_title

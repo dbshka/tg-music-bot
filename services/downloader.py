@@ -11,7 +11,7 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union, Dict, List, Tuple
+from typing import Optional, Union, Dict, List, Tuple, Callable
 
 import aiohttp
 import sys
@@ -1169,7 +1169,8 @@ def _sync_download(
     is_apple_music: bool = False,
     is_text_input: bool = False,
     requested_variant: Optional[str] = None,
-    custom_album: Optional[str] = None
+    custom_album: Optional[str] = None,
+    progress_callback: Optional[Callable[[str, int], None]] = None
 ) -> DownloadedAudio:
     """Синхронный процесс ускоренной загрузки и конвертации через yt-dlp."""
     req_tag = f"[MUSIC][request_id={request_id}] " if request_id else ""
@@ -1570,10 +1571,25 @@ def _sync_download(
                     if cand_cancel_event.is_set() or time.perf_counter() > cand_deadline:
                         cand_cancel_event.set()
                         raise TimeoutError(f"Candidate #{cand_idx+1} exceeded candidate deadline")
-                    if d.get("status") == "downloading" and not hook_times["dl_start"]:
-                        hook_times["dl_start"] = time.perf_counter()
+                    if d.get("status") == "downloading":
+                        if not hook_times["dl_start"]:
+                            hook_times["dl_start"] = time.perf_counter()
+                        if progress_callback:
+                            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                            downloaded = d.get("downloaded_bytes") or 0
+                            if total and total > 0:
+                                pct = max(0, min(100, int(downloaded / total * 100)))
+                                try:
+                                    progress_callback("downloading", pct)
+                                except Exception:
+                                    pass
                     elif d.get("status") == "finished":
                         hook_times["dl_end"] = time.perf_counter()
+                        if progress_callback:
+                            try:
+                                progress_callback("downloading", 100)
+                            except Exception:
+                                pass
 
                 def pp_hook(d):
                     if cancel_event and cancel_event.is_set():
@@ -1581,8 +1597,14 @@ def _sync_download(
                     if cand_cancel_event.is_set() or time.perf_counter() > cand_deadline:
                         cand_cancel_event.set()
                         raise TimeoutError(f"Candidate #{cand_idx+1} exceeded candidate deadline")
-                    if d.get("status") == "started" and not hook_times["pp_start"]:
-                        hook_times["pp_start"] = time.perf_counter()
+                    if d.get("status") == "started":
+                        if not hook_times["pp_start"]:
+                            hook_times["pp_start"] = time.perf_counter()
+                        if progress_callback:
+                            try:
+                                progress_callback("processing", 100)
+                            except Exception:
+                                pass
                     elif d.get("status") == "finished":
                         hook_times["pp_end"] = time.perf_counter()
 
@@ -1873,12 +1895,14 @@ def _sync_download(
                                         _cleanup_temp_candidate_files(output_dir)
                                         continue
 
+                                    cand_art_val = res_info.get("artist") or selected_entry.get("artist") or res_info.get("creator") or selected_entry.get("creator")
                                     if custom_artist and not validate_candidate_artist(
                                         expected_artist=custom_artist,
                                         candidate_title=retry_title,
                                         candidate_uploader=res_info.get("uploader") or selected_entry.get("uploader"),
                                         candidate_channel=res_info.get("channel") or selected_entry.get("channel"),
-                                        expected_title=custom_title
+                                        expected_title=custom_title,
+                                        candidate_artist=cand_art_val
                                     ):
                                         print(f"{req_tag}[AUTHENTICITY] Резервный запуск: кандидат '{retry_title}' не принадлежит исполнителю '{custom_artist}'. Отклоняем.", flush=True)
                                         shutil.rmtree(cand_dir, ignore_errors=True)
@@ -2006,6 +2030,32 @@ def _sync_download(
                                     sc_opts_dl["outtmpl"] = str(sc_cand_dir / "%(title).100B.%(ext)s")
                                     sc_opts_dl["socket_timeout"] = 8
                                     sc_opts_dl["retries"] = 1
+                                    if progress_callback:
+                                        def sc_p_hook(d):
+                                            if d.get("status") == "downloading":
+                                                tot = d.get("total_bytes") or d.get("total_bytes_estimate")
+                                                dl = d.get("downloaded_bytes") or 0
+                                                if tot and tot > 0:
+                                                    pct = max(0, min(100, int(dl / tot * 100)))
+                                                    try:
+                                                        progress_callback("downloading", pct)
+                                                    except Exception:
+                                                        pass
+                                            elif d.get("status") == "finished":
+                                                try:
+                                                    progress_callback("downloading", 100)
+                                                except Exception:
+                                                    pass
+
+                                        def sc_pp_hook(d):
+                                            if d.get("status") == "started":
+                                                try:
+                                                    progress_callback("processing", 100)
+                                                except Exception:
+                                                    pass
+
+                                        sc_opts_dl["progress_hooks"] = [sc_p_hook]
+                                        sc_opts_dl["postprocessor_hooks"] = [sc_pp_hook]
                                     try:
                                         sc_remain = max(2.0, t_global_deadline - time.perf_counter())
                                         sc_timeout = min(10.0, sc_remain)
@@ -2032,12 +2082,14 @@ def _sync_download(
                                                 print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{sc_entry_title}' недостаточно соответствует названию ({sc_match_ratio:.2f} < 0.5). Отклоняем.", flush=True)
                                                 shutil.rmtree(sc_cand_dir, ignore_errors=True)
                                                 continue
+                                            sc_art_val = res_cand.get("artist") or s_cand.get("artist") or res_cand.get("creator") or s_cand.get("creator")
                                             if custom_artist and not validate_candidate_artist(
                                                 expected_artist=custom_artist,
                                                 candidate_title=sc_entry_title,
                                                 candidate_uploader=res_cand.get("uploader") or s_cand.get("uploader"),
                                                 candidate_channel=res_cand.get("channel") or s_cand.get("channel"),
-                                                expected_title=custom_title
+                                                expected_title=custom_title,
+                                                candidate_artist=sc_art_val
                                             ):
                                                 print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{sc_entry_title}' не принадлежит исполнителю '{custom_artist}'. Отклоняем.", flush=True)
                                                 shutil.rmtree(sc_cand_dir, ignore_errors=True)
@@ -2115,10 +2167,25 @@ def _sync_download(
             def p_hook(d):
                 if cancel_event and cancel_event.is_set():
                     raise RuntimeError("Download cancelled by user")
-                if d.get("status") == "downloading" and not hook_times["dl_start"]:
-                    hook_times["dl_start"] = time.perf_counter()
+                if d.get("status") == "downloading":
+                    if not hook_times["dl_start"]:
+                        hook_times["dl_start"] = time.perf_counter()
+                    if progress_callback:
+                        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                        downloaded = d.get("downloaded_bytes") or 0
+                        if total and total > 0:
+                            pct = max(0, min(100, int(downloaded / total * 100)))
+                            try:
+                                progress_callback("downloading", pct)
+                            except Exception:
+                                pass
                 elif d.get("status") == "finished":
                     hook_times["dl_end"] = time.perf_counter()
+                    if progress_callback:
+                        try:
+                            progress_callback("downloading", 100)
+                        except Exception:
+                            pass
 
             def pp_hook(d):
                 if d.get("status") == "started":
@@ -2126,6 +2193,11 @@ def _sync_download(
                         hook_times["pp_start"] = time.perf_counter()
                     in_f = d.get("info_dict", {}).get("filepath")
                     log_memory_stage("before FFmpeg", req_id=request_id, source=source, file_path=in_f)
+                    if progress_callback:
+                        try:
+                            progress_callback("processing", 100)
+                        except Exception:
+                            pass
                 elif d.get("status") == "finished":
                     hook_times["pp_end"] = time.perf_counter()
                     out_f = d.get("info_dict", {}).get("filepath")
@@ -2468,7 +2540,8 @@ async def download_track(
     is_apple_music: bool = False,
     is_text_input: bool = False,
     requested_variant: Optional[str] = None,
-    custom_album: Optional[str] = None
+    custom_album: Optional[str] = None,
+    progress_callback: Optional[Callable[[str, int], None]] = None
 ) -> DownloadedAudio:
     """
     Асинхронная функция загрузки трека в MP3.
@@ -2502,7 +2575,8 @@ async def download_track(
             is_apple_music,
             is_text_input,
             requested_variant,
-            custom_album
+            custom_album,
+            progress_callback
         )
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
