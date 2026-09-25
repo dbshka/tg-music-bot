@@ -29,7 +29,7 @@ CRYPTO_WALLETS = {
         "image_file": CRYPTO_DIR / "trc20.jpg",
     },
     "bnb": {
-        "title": "BNB",
+        "title": "BNB Smart Chain (BEP20)",
         "address": "0x118721e3E849478489b2DF0C92F01171E6b0a268",
         "image_file": CRYPTO_DIR / "bnb.jpg",
     },
@@ -51,7 +51,7 @@ def get_donate_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="USDT TRC20", callback_data="donate:trc20")],
-            [InlineKeyboardButton(text="BNB", callback_data="donate:bnb")],
+            [InlineKeyboardButton(text="BNB Smart Chain (BEP20)", callback_data="donate:bnb")],
             [InlineKeyboardButton(text="Bitcoin", callback_data="donate:btc")],
         ]
     )

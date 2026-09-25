@@ -30,7 +30,7 @@ def test_crypto_wallets_addresses():
             "filename": "trc20.jpg",
         },
         "bnb": {
-            "title": "BNB",
+            "title": "BNB Smart Chain (BEP20)",
             "address": "0x118721e3E849478489b2DF0C92F01171E6b0a268",
             "filename": "bnb.jpg",
         },
@@ -90,7 +90,8 @@ def test_donate_keyboards_structure():
     donate_kb = get_donate_inline_keyboard()
     inline_buttons = {btn.text: btn.callback_data for row in donate_kb.inline_keyboard for btn in row}
     assert inline_buttons.get("USDT TRC20") == "donate:trc20"
-    assert inline_buttons.get("BNB") == "donate:bnb"
+    assert inline_buttons.get("BNB Smart Chain (BEP20)") == "donate:bnb"
+    assert "BNB" not in inline_buttons
     assert inline_buttons.get("Bitcoin") == "donate:btc"
 
     # 3. Кнопка возврата
