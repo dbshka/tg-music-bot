@@ -22,6 +22,7 @@ from handlers.admin import router as admin_router
 from handlers.music import router as music_router
 from handlers.tag_editor import router as tag_editor_router
 from handlers.inline import router as inline_router
+from handlers.donate import router as donate_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,10 +103,11 @@ async def main():
     # Инициализация базы данных SQLite
     init_db()
 
-    # Регистрация обработчиков (admin_router, tag_editor_router, inline_router перед music_router)
+    # Регистрация обработчиков (admin_router, tag_editor_router, inline_router, donate_router перед music_router)
     dp.include_router(admin_router)
     dp.include_router(tag_editor_router)
     dp.include_router(inline_router)
+    dp.include_router(donate_router)
     dp.include_router(music_router)
 
     logger.info(f"Бот запускается (v{BOT_VERSION})...")
@@ -165,6 +167,7 @@ async def main():
             await bot.set_my_commands([
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="search", description="Поиск трека"),
+                BotCommand(command="donate", description="Поддержать проект"),
                 BotCommand(command="cancel", description="Отменить действие"),
                 BotCommand(command="help", description="Как пользоваться"),
             ])

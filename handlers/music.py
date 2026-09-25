@@ -77,10 +77,10 @@ class SearchFSM(StatesGroup):
 
 
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура с кнопкой поиска по автору и названию."""
+    """Постоянная клавиатура с кнопками поиска и поддержки проекта."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Найти песню")],
+            [KeyboardButton(text="Найти песню"), KeyboardButton(text="Поддержать проект")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -139,6 +139,7 @@ async def cmd_help(message: Message, state: FSMContext):
         "Команды:\n\n"
         "/start — Главное меню\n"
         "/search — Поиск трека\n"
+        "/donate — Поддержать проект\n"
         "/cancel — Отмена действия\n"
         "/help — Эта справка"
     )
