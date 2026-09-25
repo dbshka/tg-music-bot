@@ -222,12 +222,7 @@ def _apply_audio_modifier_if_needed(audio_path: Path, requested_modifiers: set, 
         return 0
 
     # Кандидат не содержит запрошенную модификацию -> отказ от подмены
-    missing = requested_modifiers - cand_modifiers
-    missing_desc = ', '.join(sorted(missing)) if missing else ', '.join(sorted(requested_modifiers))
-    raise ValueError(
-        f"Версия с запрошенной модификацией ({missing_desc}) не найдена. "
-        f"Оригинальный трек отклонён во избежание подмены."
-    )
+    raise ValueError("Возникла ошибка 44. Запрошенная версия трека не найдена.")
 
 
 def _restore_studio_speed_and_pitch_if_needed(
@@ -2094,13 +2089,13 @@ def _sync_download(
                     print(f"{req_tag}[DOWNLOADER] Экстренный поиск SoundCloud не удался: {sc_err}", flush=True)
                 if last_cand_error:
                     if any(k in str(last_cand_error).lower() for k in ["drm protected", "drm"]):
-                        raise ValueError("Трек защищён DRM на найденных источниках. Попробуйте другой запрос или ссылку.")
+                        raise ValueError("Возникла ошибка 45. Попробуйте другой источник.")
                     if any(k in str(last_cand_error).lower() for k in ["не был создан", "не предоставил доступного аудиопотока", "превышен max_filesize"]):
-                        raise ValueError("Ни один подходящий аудиопоток не найден для данного трека.")
+                        raise ValueError("Возникла ошибка 46. Попробуйте другой трек.")
                     raise last_cand_error
             if not entries:
-                raise ValueError("Трек не найден по данному запросу.")
-            raise ValueError("Ни один кандидат поиска не подошел для загрузки.")
+                raise ValueError("Возникла ошибка 47. Попробуйте другой запрос.")
+            raise ValueError("Возникла ошибка 48. Попробуйте изменить запрос.")
         else:
             inv_idx = len(invocations) + 1
             t_d0 = time.perf_counter()
@@ -2205,7 +2200,7 @@ def _sync_download(
 
     if "entries" in info:
         if not info["entries"]:
-            raise ValueError("Трек не найден по данному запросу.")
+            raise ValueError("Возникла ошибка 47. Попробуйте другой запрос.")
         info = info["entries"][0]
 
     audio_files = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() in [".m4a", ".mp3", ".mp4", ".aac"]]
@@ -2321,10 +2316,7 @@ def _sync_download(
             final_dl_diff = abs(duration - expected_duration)
             max_final_gate = max(4, min(7, int(expected_duration * 0.02)))
             if final_dl_diff > max_final_gate:
-                raise ValueError(
-                    f"Финальная проверка отклонена: итоговый аудиофайл имеет длительность {duration}с "
-                    f"при эталоне {expected_duration}с (разница {final_dl_diff}с > {max_final_gate}с)."
-                )
+                raise ValueError("Возникла ошибка 49. Не удалось найти подходящую версию трека.")
 
     log_memory_stage("before metadata", req_id=request_id, source=source_title or "track", file_path=audio_path)
     t_tag0 = time.perf_counter()
@@ -2515,7 +2507,7 @@ async def download_track(
 
         # Если результат подозрительно короткий (< 35s), а ожидался полноценный трек (> 60s)
         if expected_duration and expected_duration > 60 and audio.duration <= 35:
-            raise ValueError(f"Скачано превью ({audio.duration}s) вместо полного трека ({expected_duration}s)")
+            raise ValueError("Возникла ошибка 50. Не удалось получить полный трек.")
 
         if thumb_task:
             try:
@@ -2589,7 +2581,7 @@ async def download_track(
                     custom_album
                 )
                 if expected_duration and expected_duration > 60 and audio.duration <= 35:
-                    raise ValueError(f"Fallback YouTube вернул превью ({audio.duration}s)")
+                    raise ValueError("Возникла ошибка 51. Не удалось получить полный трек.")
 
                 if thumb_task:
                     try:
@@ -2640,7 +2632,7 @@ async def download_track(
                         custom_album
                     )
                     if expected_duration and expected_duration > 60 and audio.duration <= 35:
-                        raise ValueError(f"Fallback SoundCloud вернул превью ({audio.duration}s)")
+                        raise ValueError("Возникла ошибка 52. Не удалось получить полный трек.")
 
                     if thumb_task:
                         try:

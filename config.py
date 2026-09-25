@@ -67,7 +67,11 @@ if _raw_storage:
         STORAGE_CHANNEL_ID = _raw_storage
 else:
     STORAGE_CHANNEL_ID = None
-DB_PATH = BASE_DIR / "bot_database.db"
+_custom_db = os.getenv("DB_PATH")
+if _custom_db:
+    DB_PATH = Path(_custom_db)
+else:
+    DB_PATH = BASE_DIR / "bot_database.db"
 
 # Настройки постоянного хранилища и кэша Cloudflare D1
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")

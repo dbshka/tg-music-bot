@@ -7,7 +7,7 @@ from aiogram.types import Message
 from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
 
 from config import ADMIN_ID
-from services.database import get_bot_stats_async, get_all_user_ids_async
+from services.database import get_bot_stats_async, get_all_broadcast_chat_ids_async
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_router")
@@ -28,9 +28,9 @@ async def cmd_stats(message: Message):
         name = html.escape(u["full_name"] or "Пользователь")
         top_lines.append(
             f"{i}. <b>{name}</b> ({uname}, ID: <code>{u['user_id']}</code>) — "
-            f"📥 {u['downloads_count']} треков, ✏️ {u['tags_edited_count']} тегов"
+            f"скачано: {u['downloads_count']}, изменено тегов: {u['tags_edited_count']}"
         )
-    top_block = "\n".join(top_lines) if top_lines else "<i>Пока нет активных пользователей</i>"
+    top_block = "\n".join(top_lines) if top_lines else "Активных пользователей пока нет."
 
     # Последние зарегистрированные
     recent_lines = []
@@ -39,17 +39,17 @@ async def cmd_stats(message: Message):
         name = html.escape(u["full_name"] or "Пользователь")
         reg_date = str(u["first_seen"]).split(".")[0] if u.get("first_seen") else "-"
         recent_lines.append(f"• <b>{name}</b> ({uname}) — <i>{reg_date}</i>")
-    recent_block = "\n".join(recent_lines) if recent_lines else "<i>Пока нет данных</i>"
+    recent_block = "\n".join(recent_lines) if recent_lines else "Данных пока нет."
 
     text = (
-        "📊 <b>Статистика музыкального бота</b>\n\n"
-        f"👥 <b>Всего пользователей:</b> <code>{stats['total_users']}</code>\n"
-        f"🟢 <b>Активных сегодня:</b> <code>{stats['active_today']}</code>\n"
-        f"📅 <b>Активных за 7 дней:</b> <code>{stats['active_week']}</code>\n"
-        f"📥 <b>Всего скачано треков:</b> <code>{stats['total_downloads']}</code>\n"
-        f"✏️ <b>Отредактировано тегов:</b> <code>{stats['total_tags_edited']}</code>\n\n"
-        f"🏆 <b>Топ по активности:</b>\n{top_block}\n\n"
-        f"🆕 <b>Последние пользователи:</b>\n{recent_block}"
+        "<b>Статистика</b>\n\n"
+        f"Всего пользователей: <code>{stats['total_users']}</code>\n"
+        f"Активных сегодня: <code>{stats['active_today']}</code>\n"
+        f"Активных за 7 дней: <code>{stats['active_week']}</code>\n"
+        f"Скачано треков: <code>{stats['total_downloads']}</code>\n"
+        f"Изменено тегов: <code>{stats['total_tags_edited']}</code>\n\n"
+        f"Топ по активности:\n{top_block}\n\n"
+        f"Последние пользователи:\n{recent_block}"
     )
 
     await message.answer(text, parse_mode="HTML")
@@ -64,59 +64,71 @@ async def cmd_broadcast(message: Message, bot: Bot):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "📢 <b>Рассылка сообщений пользователям</b>\n\n"
+            "<b>Рассылка сообщений</b>\n\n"
             "Использование:\n"
             "<code>/broadcast Ваш текст сообщения</code>\n\n"
-            "<i>Поддерживается обычный текст и HTML-теги (&lt;b&gt;, &lt;i&gt;, &lt;code&gt;).</i>",
+            "Можно отправлять обычный текст и HTML-теги: b, i, code.",
             parse_mode="HTML"
         )
         return
 
     broadcast_text = parts[1].strip()
-    user_ids = await get_all_user_ids_async()
-    total_users = len(user_ids)
+    chat_ids = await get_all_broadcast_chat_ids_async()
+    total_users = len(chat_ids)
 
     if total_users == 0:
-        await message.answer("⚠️ В базе данных пока нет пользователей для рассылки.")
+        await message.answer("Пользователей для рассылки пока нет.")
         return
 
     progress_msg = await message.answer(
-        f"🚀 <b>Начинаю рассылку для {total_users} пользователей...</b>",
-        parse_mode="HTML"
+        f"Начинаю рассылку для {total_users} пользователей..."
     )
 
     sent_count = 0
     blocked_count = 0
     failed_count = 0
 
-    for uid in user_ids:
+    for cid in chat_ids:
         try:
-            await bot.send_message(chat_id=uid, text=broadcast_text, parse_mode="HTML")
+            await bot.send_message(chat_id=cid, text=broadcast_text, parse_mode="HTML")
             sent_count += 1
         except TelegramForbiddenError:
             # Пользователь заблокировал бота
             blocked_count += 1
         except TelegramAPIError as e:
+            err_msg_lower = str(e).lower()
+            if "blocked" in err_msg_lower or "user is deactivated" in err_msg_lower or "chat not found" in err_msg_lower:
+                blocked_count += 1
+                continue
             # Если HTML-разметка оказалась невалидной, пробуем отправить обычным текстом без parse_mode
             try:
-                await bot.send_message(chat_id=uid, text=broadcast_text, parse_mode=None)
+                await bot.send_message(chat_id=cid, text=broadcast_text, parse_mode=None)
                 sent_count += 1
+            except TelegramForbiddenError:
+                blocked_count += 1
             except Exception as inner_err:
-                logger.warning("Ошибка отправки рассылки пользователю %s: %s", uid, inner_err)
-                failed_count += 1
+                logger.warning("Ошибка отправки рассылки пользователю %s: %s", cid, inner_err)
+                if "blocked" in str(inner_err).lower() or "deactivated" in str(inner_err).lower():
+                    blocked_count += 1
+                else:
+                    failed_count += 1
         except Exception as e:
-            logger.error("Непредвиденная ошибка рассылки %s: %s", uid, e)
-            failed_count += 1
+            err_str_lower = str(e).lower()
+            if "blocked" in err_str_lower or "forbidden" in err_str_lower or "deactivated" in err_str_lower:
+                blocked_count += 1
+            else:
+                logger.error("Непредвиденная ошибка рассылки %s: %s", cid, e)
+                failed_count += 1
 
         # Небольшая пауза для соблюдения лимитов Telegram (не более 30 сообщений в секунду)
         await asyncio.sleep(0.04)
 
     await progress_msg.edit_text(
-        "✅ <b>Рассылка завершена!</b>\n\n"
-        f"👥 Всего получателей: <b>{total_users}</b>\n"
-        f"📨 Доставлено: <b>{sent_count}</b>\n"
-        f"🚫 Заблокировали бота: <b>{blocked_count}</b>\n"
-        f"⚠️ Ошибки отправки: <b>{failed_count}</b>",
+        "<b>Рассылка завершена.</b>\n\n"
+        f"Всего получателей: <b>{total_users}</b>\n"
+        f"Доставлено: <b>{sent_count}</b>\n"
+        f"Заблокировали бота: <b>{blocked_count}</b>\n"
+        f"Ошибки отправки: <b>{failed_count}</b>",
         parse_mode="HTML"
     )
 

@@ -25,7 +25,7 @@ def test_m4a_no_id3_fallthrough(tmp_path):
     bad_m4a = tmp_path / "corrupted.m4a"
     bad_m4a.write_text("not a valid mp4 container")
 
-    with pytest.raises(RuntimeError, match="Не удалось записать теги"):
+    with pytest.raises(RuntimeError, match="Возникла ошибка 63"):
         apply_mp3_tags(bad_m4a, title="Test", artist="Artist")
 
 

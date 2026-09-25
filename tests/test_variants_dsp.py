@@ -47,7 +47,7 @@ def test_dsp_fatal_error_handling(tmp_path):
     # When modifiers are requested on a candidate without them, must raise ValueError and NOT return original or use DSP
     fake_file = tmp_path / "broken.mp3"
     fake_file.write_text("corrupted content")
-    with pytest.raises(ValueError, match="Версия с запрошенной модификацией"):
+    with pytest.raises(ValueError, match="Возникла ошибка 44"):
         _apply_audio_modifier_if_needed(fake_file, requested_modifiers={"slowed"}, cand_modifiers=set())
 
 
@@ -165,7 +165,7 @@ def test_3_original_candidate_rejected_for_slowed(tmp_path):
     assert not is_candidate_matching_modifiers(req_mods, cand_orig_mods)
 
     # Проверка вызова: должна выбросить исключение, а не подменить оригинал
-    with pytest.raises(ValueError, match="Версия с запрошенной модификацией.*не найдена"):
+    with pytest.raises(ValueError, match="Возникла ошибка 44"):
         _apply_audio_modifier_if_needed(
             audio_path=fake_audio,
             requested_modifiers=req_mods,

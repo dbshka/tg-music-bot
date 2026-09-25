@@ -38,10 +38,11 @@ from services.yandex_vk import resolve_yandex_music_track, resolve_vk_music_trac
 logger = logging.getLogger(__name__)
 
 UNSUPPORTED_URL_FALLBACK_TEXT = (
-    "Не удалось распознать ссылку.\n\n"
-    "Поддерживаемые платформы: Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка (MP3).\n"
-    "Другие сервисы официально не поддерживаются.\n\n"
-    "Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
+    "Возникла ошибка 24.\n\n"
+    "Поддерживаются:\n"
+    "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка\n\n"
+    "Также можно отправить:\n"
+    "<code>Исполнитель — Название</code>"
 )
 
 
@@ -871,13 +872,13 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     # 0. Проверка безопасности URL (SSRF)
     is_safe, reason = is_safe_url(url)
     if not is_safe:
-        raise ValueError(f"Недопустимая или небезопасная ссылка ({reason})")
+        raise ValueError("Возникла ошибка 25. Проверьте ссылку и попробуйте ещё раз.")
 
     # Автоматическое безопасное раскрытие коротких ссылок
     url = await _unshorten_url(url, session)
     is_safe_after, reason_after = is_safe_url(url)
     if not is_safe_after:
-        raise ValueError(f"Недопустимая ссылка после редиректа ({reason_after})")
+        raise ValueError("Возникла ошибка 26. Проверьте ссылку и попробуйте ещё раз.")
 
     clean_url_key = f"url:{url.strip()}"
     cached = _get_cached_extracted_track(clean_url_key)
@@ -909,30 +910,18 @@ async def _resolve_track_url_inner(url: str, session: aiohttp.ClientSession) -> 
     # Явный отказ от альбомов и плейлистов (Section 14)
     if "spotify.com" in domain:
         if "/album/" in path or "/playlist/" in path or "/collection/" in path:
-            raise ValueError(
-                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
-                "Отправьте ссылку на отдельный трек."
-            )
+            raise ValueError("Возникла ошибка 27. Отправьте ссылку на отдельный трек.")
     elif "apple.com" in domain:
         qs = urllib.parse.parse_qs(parsed.query)
         if "/album/" in path and "i" not in qs and not re.search(r'/album/[^/\s?]+/\d+/\d+', path):
-            raise ValueError(
-                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
-                "Отправьте ссылку на отдельный трек."
-            )
+            raise ValueError("Возникла ошибка 28. Отправьте ссылку на отдельный трек.")
     elif "youtube.com" in domain or "youtu.be" in domain:
         qs = urllib.parse.parse_qs(parsed.query)
         if "/playlist" in path or ("list=" in url and "v" not in qs):
-            raise ValueError(
-                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
-                "Отправьте ссылку на отдельный трек."
-            )
+            raise ValueError("Возникла ошибка 29. Отправьте ссылку на отдельный трек.")
     elif "soundcloud.com" in domain:
         if "/sets/" in path:
-            raise ValueError(
-                "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
-                "Отправьте ссылку на отдельный трек."
-            )
+            raise ValueError("Возникла ошибка 30. Отправьте ссылку на отдельный трек.")
 
     # 1. Яндекс Музыка (двухэтапный resolve через российский VLESS-маршрут)
     if "music.yandex." in domain or "ya.cc" in domain or ("yandex." in domain and ("/album" in url or "/track" in url or "/artist" in url or "/playlists" in url)):

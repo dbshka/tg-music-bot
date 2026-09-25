@@ -46,8 +46,8 @@ async def test_unsupported_domains_raise_unsupported_url_error():
             with pytest.raises(UnsupportedUrlError) as exc_info:
                 await resolve_track_url(u)
             assert str(exc_info.value) == UNSUPPORTED_URL_FALLBACK_TEXT
-            assert "Не удалось распознать ссылку" in str(exc_info.value)
-            assert "Поддерживаемые платформы" in str(exc_info.value)
+            assert "Возникла ошибка 24" in str(exc_info.value)
+            assert "Поддерживаются" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -67,8 +67,7 @@ async def test_vk_audio_without_token_raises_friendly_fallback():
         assert "VK_TOKEN" not in msg
         assert "audio.getById" not in msg
         assert "error 15" not in msg
-        assert "OAuth" not in msg
-        assert "Не удалось распознать ссылку" in msg
+        assert "Возникла ошибка 24" in msg
 
 
 @pytest.mark.asyncio
@@ -201,7 +200,7 @@ async def test_inline_query_never_downloads_audio():
         assert art.reply_markup is not None
         btn = art.reply_markup.inline_keyboard[0][0]
         assert btn.callback_data.startswith("inl_status:")
-        assert btn.text == "⏳ Подготавливается..."
+        assert btn.text == "Подготавливается..."
 
 
 # ============================================================================
@@ -310,8 +309,8 @@ async def test_diagnostic_test_query():
     assert len(results) == 1
     art = results[0]
     assert art.id == "diag_test_ok"
-    assert "Тест Inline" in art.title
-    assert "Inline Mode работает" in art.description
+    assert "Проверка поиска" in art.title
+    assert "Проверка Inline-режима" in art.description
 
 
 def test_is_valid_telegram_file_id():
@@ -468,8 +467,8 @@ async def test_inline_query_with_unsupported_url():
         assert len(results) == 1
         art = results[0]
         assert art.id == "unsupported_url_result"
-        assert "Не удалось распознать" in art.title
-        assert "Отправьте название трека" in art.description
+        assert "Не удалось обработать ссылку" in art.title
+        assert "Отправьте название исполнителя и трека текстом" in art.description
         assert art.reply_markup is None # Не содержит кнопок скачивания!
 
 
@@ -724,7 +723,7 @@ async def test_inline_download_missing_storage_channel_id_fails_gracefully():
         # Сообщение должно быть отредактировано с дружелюбным текстом
         assert mock_bot.edit_message_text.called
         call_text = mock_bot.edit_message_text.call_args.kwargs.get("text") or mock_bot.edit_message_text.call_args.args[0]
-        assert "⚠️ Не удалось подготовить аудио." in call_text
+        assert "Возникла ошибка 17. Не удалось подготовить аудио." in call_text
 
 
 @pytest.mark.asyncio

@@ -80,19 +80,19 @@ def format_menu_text(data: dict) -> str:
     album = html.escape(data.get("album") or "—")
 
     if data.get("new_cover_uploaded"):
-        cover_status = "Загружена новая обложка"
+        cover_status = "Новая обложка"
     elif data.get("cover_path") or data.get("has_original_cover"):
         cover_status = "Обложка сохранена"
     else:
-        cover_status = "Без обложки"
+        cover_status = "Обложка отсутствует"
 
     return (
-        "<b>Редактор тегов аудио</b>\n\n"
-        f"<b>Исполнитель:</b> {artist}\n"
-        f"<b>Название:</b> {title}\n"
-        f"<b>Альбом:</b> {album}\n"
-        f"<b>Обложка:</b> {cover_status}\n\n"
-        "Выберите поле для изменения или нажмите «Сохранить»:"
+        "<b>Редактор тегов</b>\n\n"
+        f"Исполнитель: <b>{artist}</b>\n"
+        f"Название: <b>{title}</b>\n"
+        f"Альбом: <b>{album}</b>\n"
+        f"Обложка: <b>{cover_status}</b>\n\n"
+        "Выберите, что изменить."
     )
 
 
@@ -126,7 +126,7 @@ async def _check_owner(callback: CallbackQuery, state: FSMContext) -> bool:
     data = await state.get_data()
     owner_id = data.get("owner_user_id")
     if owner_id and callback.from_user and callback.from_user.id != owner_id:
-        await callback.answer("Вы не являетесь владельцем этой сессии редактирования.", show_alert=True)
+        await callback.answer("Этот файл редактирует другой пользователь.", show_alert=True)
         return False
     return True
 
@@ -142,9 +142,8 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
     audio_obj = message.audio or message.document
     if audio_obj.file_size and audio_obj.file_size > MAX_FILE_SIZE_BYTES:
         await message.reply(
-            "<b>Файл слишком большой.</b>\n"
-            "Telegram разрешает ботам обрабатывать файлы размером до 50 МБ.",
-            parse_mode="HTML"
+            "Файл слишком большой.\n"
+            "Максимальный размер — 50 МБ."
         )
         return
 
@@ -154,7 +153,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
         shutil.rmtree(prev_data["folder_path"], ignore_errors=True)
     await state.clear()
 
-    status_msg = await message.reply("Загрузка аудиофайла...")
+    status_msg = await message.reply("Загружаю аудиофайл...")
 
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
@@ -203,10 +202,7 @@ async def handle_incoming_audio(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         logger.exception("Ошибка при обработке аудиофайла")
         shutil.rmtree(session_dir, ignore_errors=True)
-        await status_msg.edit_text(
-            "<b>Не удалось обработать аудиофайл.</b>",
-            parse_mode="HTML"
-        )
+        await status_msg.edit_text("Возникла ошибка 19. Не удалось обработать аудиофайл.")
 
 
 # -------------------------------------------------------------
@@ -219,7 +215,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
     if len(parts) >= 3 and parts[2].isdigit():
         expected_owner = int(parts[2])
         if callback.from_user and callback.from_user.id != expected_owner:
-            await callback.answer("Редактировать теги может только владелец сообщения.", show_alert=True)
+            await callback.answer("Изменять теги может только автор сообщения.", show_alert=True)
             return
 
     audio_obj = callback.message.audio
@@ -235,7 +231,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
         shutil.rmtree(prev_data["folder_path"], ignore_errors=True)
     await state.clear()
 
-    status_msg = await callback.message.reply("Загрузка аудиофайла...")
+    status_msg = await callback.message.reply("Загружаю аудиофайл...")
 
     session_id = uuid.uuid4().hex
     session_dir = DOWNLOADS_DIR / f"edit_{session_id}"
@@ -283,10 +279,7 @@ async def cb_start_edit_from_audio(callback: CallbackQuery, state: FSMContext, b
     except Exception as e:
         logger.exception("Ошибка при обработке аудиофайла по кнопке 'Изменить'")
         shutil.rmtree(session_dir, ignore_errors=True)
-        await status_msg.edit_text(
-            "<b>Не удалось загрузить аудио.</b>",
-            parse_mode="HTML"
-        )
+        await status_msg.edit_text("Возникла ошибка 20. Не удалось загрузить аудио.")
 
 
 # -------------------------------------------------------------
@@ -299,10 +292,9 @@ async def cb_edit_artist(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_artist)
     await callback.message.edit_text(
-        "<b>Введите имя исполнителя:</b>\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
-        reply_markup=get_back_keyboard(),
-        parse_mode="HTML"
+        "Введите имя исполнителя.\n\n"
+        "Или нажмите «Назад», чтобы ничего не менять.",
+        reply_markup=get_back_keyboard()
     )
     await callback.answer()
 
@@ -313,10 +305,9 @@ async def cb_edit_title(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_title)
     await callback.message.edit_text(
-        "<b>Введите название трека:</b>\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
-        reply_markup=get_back_keyboard(),
-        parse_mode="HTML"
+        "Введите название трека.\n\n"
+        "Или нажмите «Назад», чтобы ничего не менять.",
+        reply_markup=get_back_keyboard()
     )
     await callback.answer()
 
@@ -327,10 +318,9 @@ async def cb_edit_album(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_album)
     await callback.message.edit_text(
-        "<b>Введите название альбома:</b>\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
-        reply_markup=get_back_keyboard(),
-        parse_mode="HTML"
+        "Введите название альбома.\n\n"
+        "Или нажмите «Назад», чтобы ничего не менять.",
+        reply_markup=get_back_keyboard()
     )
     await callback.answer()
 
@@ -341,11 +331,10 @@ async def cb_edit_cover(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(TagEditorStates.waiting_for_cover)
     await callback.message.edit_text(
-        "<b>Отправьте изображение для обложки трека:</b>\n\n"
-        "Изображение будет автоматически обрезано 1:1 и вшито в файл.\n\n"
-        "Либо нажмите «Назад», чтобы оставить текущее значение.",
-        reply_markup=get_back_keyboard(),
-        parse_mode="HTML"
+        "Отправьте изображение для обложки.\n\n"
+        "Оно будет обрезано до квадратного формата и добавлено в аудиофайл.\n\n"
+        "Или нажмите «Назад», чтобы ничего не менять.",
+        reply_markup=get_back_keyboard()
     )
     await callback.answer()
 
@@ -367,7 +356,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
     if folder:
         shutil.rmtree(folder, ignore_errors=True)
     await state.clear()
-    await callback.message.edit_text("Редактирование тегов отменено.")
+    await callback.message.edit_text("Редактирование отменено.")
     await callback.answer()
 
 
@@ -380,7 +369,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
     folder_path = data.get("folder_path")
 
     if not file_path or not Path(file_path).exists():
-        await callback.message.edit_text("Файл устарел или был удален. Отправьте аудио заново.")
+        await callback.message.edit_text("Возникла ошибка 21. Отправьте аудиофайл заново.")
         await state.clear()
         return
 
@@ -419,10 +408,7 @@ async def cb_save(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     except Exception as e:
         logger.exception("Ошибка при сохранении тегов")
-        await callback.message.edit_text(
-            f"<b>Ошибка при сохранении тегов:</b>\n<i>{html.escape(str(e))}</i>",
-            parse_mode="HTML"
-        )
+        await callback.message.edit_text("Возникла ошибка 22. Не удалось сохранить изменения.")
     finally:
         if folder_path:
             shutil.rmtree(folder_path, ignore_errors=True)
@@ -470,7 +456,7 @@ async def process_cover(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     folder_path = data.get("folder_path")
     if not folder_path:
-        await message.reply("Сессия устарела. Отправьте аудиофайл снова.")
+        await message.reply("Возникла ошибка 23. Отправьте аудиофайл заново.")
         await state.clear()
         return
 

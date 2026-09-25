@@ -754,7 +754,7 @@ def format_track_display(
       - дубликаты исполнителей исключаются.
     """
     if not artists and not title:
-        return "Unknown Artist — Unknown Track"
+        return "Неизвестный исполнитель — Неизвестный трек"
 
     # Если передан объект с display_name, artist, title (например ExtractedTrack, TrackIdentity, DownloadedAudio)
     if hasattr(artists, "artist") and hasattr(artists, "title") and title is None:
@@ -784,8 +784,8 @@ def format_track_display(
             seen.add(c_item.lower())
             clean_artists.append(c_item)
 
-    art_str = ", ".join(clean_artists) if clean_artists else "Unknown Artist"
-    tit_str = clean_unicode_text(str(title)).strip() if title else "Unknown Track"
+    art_str = ", ".join(clean_artists) if clean_artists else "Неизвестный исполнитель"
+    tit_str = clean_unicode_text(str(title)).strip() if title else "Неизвестный трек"
 
     return f"{art_str} — {tit_str}"
 

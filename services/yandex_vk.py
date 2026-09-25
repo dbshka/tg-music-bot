@@ -96,17 +96,11 @@ async def resolve_yandex_music_track(
 
     # Проверка на ссылки альбомов/плейлистов
     if ("/album/" in path and "/track/" not in path) or "/playlists/" in path or "/users/" in path:
-        raise ValueError(
-            "Загрузка альбомов и плейлистов пока не поддерживается.\n\n"
-            "Отправьте ссылку на отдельный трек."
-        )
+        raise ValueError("Возникла ошибка 31. Отправьте ссылку на отдельный трек.")
 
     track_id = extract_yandex_track_id(url)
     if not track_id:
-        raise ValueError(
-            "Не удалось распознать ссылку на трек Яндекс Музыки.\n\n"
-            "Отправьте прямую ссылку на трек (например: https://music.yandex.ru/album/38283718/track/143075895)."
-        )
+        raise ValueError("Возникла ошибка 32. Проверьте ссылку и попробуйте ещё раз.")
 
     album_id = extract_yandex_album_id(url)
     proxy = get_proxy_for_source("yandex", stage="resolve")
@@ -195,13 +189,11 @@ async def resolve_yandex_music_track(
                         "track_id": track_id
                     }
 
-            raise ValueError(
-                "Не удалось связаться с сервером Яндекс Музыки. Попробуйте повторить запрос позже или отправьте название треком: Исполнитель — Название"
-            )
+            raise ValueError("Возникла ошибка 33. Попробуйте ещё раз позже.")
 
         track_list = meta_json.get("result", [])
         if not track_list:
-            raise ValueError("Трек не найден в каталоге Яндекс Музыки. Попробуйте отправить название треком: Исполнитель — Название")
+            raise ValueError("Возникла ошибка 34. Попробуйте другой запрос.")
 
         track_data = track_list[0]
         title = track_data.get("title")
@@ -211,11 +203,8 @@ async def resolve_yandex_music_track(
         if not title:
             err_reason = track_data.get("error") or "метаданные недоступны"
             if "plus" in str(err_reason).lower():
-                raise ValueError(
-                    "⚠️ Этот трек доступен только по подписке Яндекс Плюс (его метаданные скрыты сервисом).\n\n"
-                    "💡 Пожалуйста, отправьте название трека текстом для поиска альтернативного источника."
-                )
-            raise ValueError(f"Трек недоступен в каталоге Яндекс Музыки ({err_reason}).")
+                raise ValueError("Возникла ошибка 35. Попробуйте найти этот трек по названию.")
+            raise ValueError("Возникла ошибка 36. Попробуйте другой источник.")
 
         artist = artist or "Unknown Artist"
         dur_ms = track_data.get("durationMs", 0)
@@ -251,10 +240,7 @@ async def resolve_yandex_music_track(
         return await asyncio.wait_for(asyncio.to_thread(_do_resolve), timeout=10.0)
     except asyncio.TimeoutError:
         logger.warning("Превышен таймаут разрешения трека Яндекс Музыки (track_id=%s, limit=10.0s)", track_id)
-        raise ValueError(
-            "Время ожидания ответа от Яндекс Музыки истекло.\n\n"
-            "Попробуйте отправить название треком: Исполнитель — Название"
-        )
+        raise ValueError("Возникла ошибка 37. Попробуйте ещё раз позже.")
 
 
 async def resolve_vk_music_track(
@@ -267,17 +253,12 @@ async def resolve_vk_music_track(
     """
     audio_ids = extract_vk_audio_id(url)
     if not audio_ids:
-        raise ValueError(
-            "Не удалось определить аудиозапись ВКонтакте.\n\n"
-            "Отправьте прямую ссылку на трек (например: https://vk.com/audio-2001429780_128429780)."
-        )
+        raise ValueError("Возникла ошибка 38. Проверьте ссылку и попробуйте ещё раз.")
 
     owner_id, audio_id = audio_ids
     vk_token = getattr(config, "VK_TOKEN", None) or os.getenv("VK_TOKEN")
     if not vk_token or not vk_token.strip():
-        raise ValueError(
-            "Для работы с аудиозаписями ВКонтакте требуется указание VK_TOKEN."
-        )
+        raise ValueError("Возникла ошибка 39. Попробуйте другой способ поиска.")
 
     proxy = get_proxy_for_source("vk", stage="resolve")
     proxy_label = "RU" if proxy else "DIRECT"
@@ -301,19 +282,19 @@ async def resolve_vk_music_track(
             data = resp.json()
         except Exception as e:
             logger.warning("Ошибка обращения к VK API (audios=%s_%s): %s", owner_id, audio_id, e)
-            raise ValueError(f"Не удалось связаться с серверами ВКонтакте: {e}")
+            raise ValueError("Возникла ошибка 40. Попробуйте ещё раз позже.")
 
         if "error" in data:
             err = data["error"]
             err_code = err.get("error_code", 0)
             err_msg = err.get("error_msg", "Неизвестная ошибка")
             if err_code == 5:
-                raise ValueError("Токен авторизации ВКонтакте (VK_TOKEN) недействителен или истёк.")
-            raise ValueError(f"Ошибка API ВКонтакте: {err_msg} (код {err_code})")
+                raise ValueError("Возникла ошибка 41. Попробуйте ещё раз позже.")
+            raise ValueError("Возникла ошибка 42. Попробуйте ещё раз.")
 
         items = data.get("response", [])
         if not items:
-            raise ValueError("Аудиозапись не найдена или была удалена из ВКонтакте.")
+            raise ValueError("Возникла ошибка 43. Попробуйте другой трек.")
 
         item = items[0]
         title = item.get("title") or "Unknown Title"

@@ -105,9 +105,9 @@ class TestTrackDisplayFormatting:
         assert disp == "Eminem — Without Me"
 
     def test_missing_fields_fallbacks(self):
-        assert format_track_display("", "Song Title") == "Unknown Artist — Song Title"
-        assert format_track_display("Artist Name", "") == "Artist Name — Unknown Track"
-        assert format_track_display("", "") == "Unknown Artist — Unknown Track"
+        assert format_track_display("", "Song Title") == "Неизвестный исполнитель — Song Title"
+        assert format_track_display("Artist Name", "") == "Artist Name — Неизвестный трек"
+        assert format_track_display("", "") == "Неизвестный исполнитель — Неизвестный трек"
 
 
 class TestArtistMatchingAndRanking:
@@ -164,7 +164,7 @@ class TestUXCopywritingAndIntegrity:
         assert "YouTube" in text
         assert "SoundCloud" in text
         assert "Яндекс Музыка" in text
-        assert "MP3" in text
+        assert "Возникла ошибка 24" in text
         assert "Исполнитель — Название" in text
         assert "—" in text  # em-dash
 

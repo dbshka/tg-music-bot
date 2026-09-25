@@ -7,6 +7,7 @@ import urllib.parse
 import asyncio
 import logging
 from collections import OrderedDict
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from config import DB_PATH
 from services.identity import clean_unicode_text
@@ -84,11 +85,16 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_db():
     """Инициализирует таблицы базы данных SQLite, индексы, миграции и прогревает L1 RAM кэш."""
+    try:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
+                chat_id INTEGER,
                 username TEXT,
                 full_name TEXT,
                 first_seen TIMESTAMP,
@@ -97,6 +103,16 @@ def init_db():
                 tags_edited_count INTEGER DEFAULT 0
             )
         """)
+        # Миграция: проверяем наличие колонки chat_id в users
+        try:
+            cursor.execute("PRAGMA table_info(users)")
+            user_columns = [col[1] for col in cursor.fetchall()]
+            if "chat_id" not in user_columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN chat_id INTEGER")
+                cursor.execute("UPDATE users SET chat_id = user_id WHERE chat_id IS NULL")
+        except Exception:
+            pass
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tracks_cache (
                 query_key TEXT PRIMARY KEY,
@@ -131,6 +147,8 @@ def init_db():
         """)
 
         # Создаем индексы для ускорения
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_chat_id ON users(chat_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_downloads ON users(downloads_count DESC, tags_edited_count DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_file_id ON tracks_cache(file_id)")
@@ -399,9 +417,22 @@ async def search_cached_tracks_async(query: str, limit: int = 5) -> List[Dict[st
     return await asyncio.to_thread(search_cached_tracks, query, limit)
 
 
-def log_user_activity(user_id: int, username: Optional[str] = None, full_name: Optional[str] = None):
-    """Регистрирует нового пользователя или обновляет время последней активности."""
+def register_user(
+    user_id: int,
+    chat_id: Optional[int] = None,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None
+) -> bool:
+    """
+    Регистрирует нового пользователя или обновляет chat_id/метаданные существующего.
+    Вызывается ТОЛЬКО при команде /start.
+    Гарантирует немедленную атомарную запись в SQLite до ответа пользователю.
+    Возвращает True, если зарегистрирован новый пользователь, False если пользователь уже был в базе.
+    """
+    if chat_id is None:
+        chat_id = user_id
     now = datetime.datetime.now()
+    is_new = False
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -409,18 +440,81 @@ def log_user_activity(user_id: int, username: Optional[str] = None, full_name: O
             row = cursor.fetchone()
             if row:
                 cursor.execute("""
-                    UPDATE users 
-                    SET last_seen = ?, username = COALESCE(?, username), full_name = COALESCE(?, full_name)
+                    UPDATE users
+                    SET chat_id = COALESCE(?, chat_id),
+                        last_seen = ?,
+                        username = COALESCE(?, username),
+                        full_name = COALESCE(?, full_name)
                     WHERE user_id = ?
-                """, (now, username, full_name, user_id))
+                """, (chat_id, now, username, full_name, user_id))
             else:
-                cursor.execute("""
-                    INSERT INTO users (user_id, username, full_name, first_seen, last_seen, downloads_count, tags_edited_count)
-                    VALUES (?, ?, ?, ?, ?, 0, 0)
-                """, (user_id, username, full_name, now, now))
+                try:
+                    cursor.execute("""
+                        INSERT INTO users (user_id, chat_id, username, full_name, first_seen, last_seen, downloads_count, tags_edited_count)
+                        VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+                    """, (user_id, chat_id, username, full_name, now, now))
+                    is_new = True
+                except sqlite3.IntegrityError:
+                    cursor.execute("""
+                        UPDATE users
+                        SET chat_id = COALESCE(?, chat_id),
+                            last_seen = ?,
+                            username = COALESCE(?, username),
+                            full_name = COALESCE(?, full_name)
+                        WHERE user_id = ?
+                    """, (chat_id, now, username, full_name, user_id))
+                    is_new = False
             conn.commit()
+    except Exception as e:
+        logger.error("Ошибка при регистрации пользователя %s: %s", user_id, e)
+    return is_new
+
+
+async def register_user_async(
+    user_id: int,
+    chat_id: Optional[int] = None,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None
+) -> bool:
+    """Асинхронная обёртка для немедленной регистрации пользователя."""
+    return await asyncio.to_thread(register_user, user_id, chat_id, username, full_name)
+
+
+def is_user_registered(user_id: int) -> bool:
+    """Проверяет, зарегистрирован ли пользователь в таблице users."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+            return cursor.fetchone() is not None
     except Exception:
-        pass
+        return False
+
+
+async def is_user_registered_async(user_id: int) -> bool:
+    """Асинхронная проверка регистрации пользователя."""
+    return await asyncio.to_thread(is_user_registered, user_id)
+
+
+def log_user_activity(user_id: int, username: Optional[str] = None, full_name: Optional[str] = None):
+    """
+    Обновляет время последней активности (last_seen) существующего зарегистрированного пользователя.
+    НЕ создаёт новую запись в users, если пользователь не был зарегистрирован через /start.
+    """
+    now = datetime.datetime.now()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET last_seen = ?,
+                    username = COALESCE(?, username),
+                    full_name = COALESCE(?, full_name)
+                WHERE user_id = ?
+            """, (now, username, full_name, user_id))
+            conn.commit()
+    except Exception as e:
+        logger.warning("Ошибка обновления активности пользователя %s: %s", user_id, e)
 
 
 async def log_user_activity_async(user_id: int, username: Optional[str] = None, full_name: Optional[str] = None):
@@ -469,7 +563,7 @@ def get_bot_stats() -> Dict[str, Any]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # 1. Общее количество пользователей
+        # 1. Общее количество зарегистрированных пользователей
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
 
@@ -487,18 +581,19 @@ def get_bot_stats() -> Dict[str, Any]:
         total_downloads = row[0] or 0
         total_tags_edited = row[1] or 0
 
-        # 5. Топ 5 активных по скачиваниям (использует индекс idx_users_downloads)
+        # 5. Топ 5 активных по скачиваниям (не фильтруется по времени активности, сохраняет историю)
         cursor.execute("""
-            SELECT user_id, username, full_name, downloads_count, tags_edited_count, last_seen
+            SELECT user_id, chat_id, username, full_name, downloads_count, tags_edited_count, last_seen
             FROM users
+            WHERE downloads_count > 0 OR tags_edited_count > 0
             ORDER BY downloads_count DESC, tags_edited_count DESC
             LIMIT 5
         """)
         top_users = [dict(r) for r in cursor.fetchall()]
 
-        # 6. Последние 5 зарегистрированных
+        # 6. Последние 5 зарегистрированных (строго по дате регистрации first_seen DESC)
         cursor.execute("""
-            SELECT user_id, username, full_name, first_seen, downloads_count
+            SELECT user_id, chat_id, username, full_name, first_seen, downloads_count
             FROM users
             ORDER BY first_seen DESC
             LIMIT 5
@@ -521,16 +616,29 @@ async def get_bot_stats_async() -> Dict[str, Any]:
     return await asyncio.to_thread(get_bot_stats)
 
 
-def get_all_user_ids() -> List[int]:
-    """Возвращает список всех ID пользователей из базы данных для рассылки."""
+def get_all_broadcast_chat_ids() -> List[int]:
+    """
+    Возвращает список chat_id всех зарегистрированных пользователей из таблицы users для рассылки.
+    Если chat_id не заполнен (старые записи), используется user_id.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users")
-        return [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT COALESCE(chat_id, user_id) FROM users")
+        return [row[0] for row in cursor.fetchall() if row[0] is not None]
+
+
+async def get_all_broadcast_chat_ids_async() -> List[int]:
+    """Асинхронное получение списка chat_id для рассылки."""
+    return await asyncio.to_thread(get_all_broadcast_chat_ids)
+
+
+def get_all_user_ids() -> List[int]:
+    """Возвращает список ID всех зарегистрированных пользователей (chat_id для рассылки)."""
+    return get_all_broadcast_chat_ids()
 
 
 async def get_all_user_ids_async() -> List[int]:
-    """Асинхронное получение ID пользователей."""
+    """Асинхронное получение ID всех зарегистрированных пользователей."""
     return await asyncio.to_thread(get_all_user_ids)
 
 

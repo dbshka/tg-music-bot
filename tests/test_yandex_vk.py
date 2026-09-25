@@ -278,14 +278,14 @@ async def test_resolve_yandex_music_rejects_unavailable_without_metadata():
         return mock_resp
 
     with patch("services.yandex_vk._sync_http_request", side_effect=fake_sync_http):
-        with pytest.raises(ValueError, match="только по подписке Яндекс Плюс"):
+        with pytest.raises(ValueError, match="Возникла ошибка 35"):
             await resolve_yandex_music_track("https://music.yandex.ru/track/60292250")
 
 
 @pytest.mark.asyncio
 async def test_resolve_vk_music_requires_token():
     with patch.object(config, "VK_TOKEN", None):
-        with pytest.raises(ValueError, match="VK_TOKEN"):
+        with pytest.raises(ValueError, match="Возникла ошибка 39"):
             await resolve_vk_music_track("https://vk.com/audio-2001429780_128429780")
 
 
@@ -344,7 +344,7 @@ async def test_resolve_vk_music_token_expired():
 
     with patch.object(config, "VK_TOKEN", "expired_token"), \
          patch("services.yandex_vk._sync_http_request", side_effect=fake_sync_http):
-        with pytest.raises(ValueError, match="VK_TOKEN.*недействителен или истёк"):
+        with pytest.raises(ValueError, match="Возникла ошибка 41"):
             await resolve_vk_music_track("https://vk.com/audio-2001429780_128429780")
 
 
@@ -516,7 +516,7 @@ async def test_yandex_full_pipeline_rejects_on_duration_mismatch():
          patch("mutagen.File", return_value=MagicMock(info=MagicMock(length=300, sample_rate=44100))), \
          patch("services.downloader.get_current_youtube_proxy", return_value="socks5://127.0.0.1:10808"):
 
-        with pytest.raises(ValueError, match="(Ни один кандидат поиска не подошел|не совпадает по длительности)"):
+        with pytest.raises(ValueError, match="(Возникла ошибка 48|Возникла ошибка 49)"):
             await download_track(
                 query_or_url="ytsearch5:The Weeknd - Blinding Lights",
                 custom_title="Blinding Lights",
@@ -743,7 +743,7 @@ async def test_yandex_draxxxy_clubb_regression(tmp_path):
             return {"entries": []}
 
     with patch("yt_dlp.YoutubeDL", side_effect=EmptyYDL):
-        with pytest.raises(ValueError, match="Трек не найден"):
+        with pytest.raises(ValueError, match="Возникла ошибка 47"):
             _sync_download(
                 query_or_url="ytsearch5:Draxxxy - Clubb",
                 output_dir=tmp_path,
@@ -768,7 +768,7 @@ async def test_vk_music_ru_domain_and_token_regression():
 
     # 1. No token -> clear error message about metadata requirement
     with patch.object(config, "VK_TOKEN", None):
-        with pytest.raises(ValueError, match="требуется указание VK_TOKEN"):
+        with pytest.raises(ValueError, match="Возникла ошибка 39"):
             await resolve_vk_music_track(url)
 
     # 2. With token -> metadata resolved, routes to ytsearch5, ignores VK url
@@ -979,7 +979,7 @@ async def test_yandex_music_regression_test_e_timeout_bounding():
 
     with patch("services.yandex_vk._sync_http_request", side_effect=hanging_sync_http), \
          patch("asyncio.wait_for", side_effect=fake_wait_for):
-        with pytest.raises(ValueError, match="Время ожидания ответа от Яндекс Музыки истекло"):
+        with pytest.raises(ValueError, match="Возникла ошибка 37"):
             await resolve_yandex_music_track(url)
 
 
@@ -1016,5 +1016,5 @@ async def test_yandex_music_regression_test_f_metadata_failure_and_fallback():
         raise requests.exceptions.HTTPError("404 Not Found")
 
     with patch("services.yandex_vk._sync_http_request", side_effect=fake_complete_fail):
-        with pytest.raises(ValueError, match="Не удалось связаться с сервером Яндекс Музыки"):
+        with pytest.raises(ValueError, match="Возникла ошибка 33"):
             await resolve_yandex_music_track(url)

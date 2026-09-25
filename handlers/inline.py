@@ -143,15 +143,15 @@ async def handle_inline_query(inline_query: InlineQuery):
     if not query_text:
         prompt_article = InlineQueryResultArticle(
             id="empty_query_prompt",
-            title="Введите исполнителя и название трека",
+            title="Введите исполнителя и название",
             description="Например: Исполнитель — Название",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    "<b>Поиск музыки</b>\n\n"
-                    "Введите запрос после имени бота в формате:\n"
-                    "<code>@musicAutoSaver_bot Исполнитель — Название</code>\n\n"
-                    "Для совместных треков:\n"
-                    "<code>@musicAutoSaver_bot Исполнитель 1, Исполнитель 2 -- Название</code>"
+                    "Поиск музыки\n\n"
+                    "Введите:\n"
+                    "<code>Исполнитель — Название</code>\n\n"
+                    "Если исполнителей несколько:\n"
+                    "<code>Исполнитель 1, Исполнитель 2 — Название</code>"
                 ),
                 parse_mode="HTML"
             )
@@ -168,10 +168,10 @@ async def handle_inline_query(inline_query: InlineQuery):
     if query_text.lower() in ("test", "тест", "ping"):
         test_article = InlineQueryResultArticle(
             id="diag_test_ok",
-            title="Тест Inline",
-            description="Inline Mode работает корректно",
+            title="Проверка поиска",
+            description="Проверка Inline-режима",
             input_message_content=InputTextMessageContent(
-                message_text="<b>Тест поиска</b>\nПоиск работает корректно.",
+                message_text="Поиск работает.",
                 parse_mode="HTML"
             )
         )
@@ -216,15 +216,15 @@ async def handle_inline_query(inline_query: InlineQuery):
                 input_message_content=InputTextMessageContent(
                     message_text=(
                         f"<b>{html.escape(disp)}</b>\n"
-                        f"⏱ <b>Длительность:</b> {dur_str or '—'}\n\n"
-                        f"<i>Загрузка аудио...</i>"
+                        f"Длительность: {dur_str or '—'}\n\n"
+                        f"Загрузка аудио..."
                     ),
                     parse_mode="HTML"
                 ),
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[
                         InlineKeyboardButton(
-                            text="⏳ Подготавливается...",
+                            text="Подготавливается...",
                             callback_data=f"inl_status:{cand_id}"
                         )
                     ]]
@@ -235,8 +235,8 @@ async def handle_inline_query(inline_query: InlineQuery):
             logger.info("Unsupported or unresolvable URL in inline query: %s (%s)", url_found, url_err)
             fallback_article = InlineQueryResultArticle(
                 id="unsupported_url_result",
-                title="Не удалось распознать ссылку",
-                description="Отправьте название трека или исполнителя текстом",
+                title="Не удалось обработать ссылку",
+                description="Отправьте название исполнителя и трека текстом",
                 input_message_content=InputTextMessageContent(
                     message_text=UNSUPPORTED_URL_FALLBACK_TEXT,
                     parse_mode="HTML"
@@ -359,15 +359,15 @@ async def handle_inline_query(inline_query: InlineQuery):
                     input_message_content=InputTextMessageContent(
                         message_text=(
                             f"<b>{html.escape(disp)}</b>\n"
-                            f"⏱ <b>Длительность:</b> {dur_str or '—'}\n\n"
-                            f"<i>Загрузка трека...</i>"
+                            f"Длительность: {dur_str or '—'}\n\n"
+                            f"Загрузка трека..."
                         ),
                         parse_mode="HTML"
                     ),
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[[
                             InlineKeyboardButton(
-                                text="⏳ Подготавливается...",
+                                text="Подготавливается...",
                                 callback_data=f"inl_status:{cand_id}"
                             )
                         ]]
@@ -383,11 +383,12 @@ async def handle_inline_query(inline_query: InlineQuery):
             InlineQueryResultArticle(
                 id="no_results_found",
                 title="Ничего не найдено",
-                description=f"По запросу «{query_text[:40]}» треки не найдены",
+                description=f"По запросу «{query_text[:40]}» ничего не найдено",
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        f"По запросу <b>«{html.escape(query_text)}»</b> ничего не найдено.\n\n"
-                        f"Попробуйте указать исполнителя и название: <code>Исполнитель — Название</code>"
+                        f"По запросу «{html.escape(query_text)}» ничего не найдено.\n\n"
+                        f"Попробуйте указать исполнителя и название:\n"
+                        f"<code>Исполнитель — Название</code>"
                     ),
                     parse_mode="HTML"
                 )
@@ -469,7 +470,7 @@ async def process_inline_download(
             try:
                 await bot.edit_message_text(
                     inline_message_id=inline_message_id,
-                    text="Срок действия ссылки истёк. Пожалуйста, повторите поиск."
+                    text="Возникла ошибка 16. Повторите поиск."
                 )
             except Exception:
                 pass
@@ -491,8 +492,8 @@ async def process_inline_download(
             await bot.edit_message_text(
                 inline_message_id=inline_message_id,
                 text=(
-                    f"🎵 <b>{html.escape(disp)}</b>\n\n"
-                    f"⏳ Загрузка..."
+                    f"<b>{html.escape(disp)}</b>\n\n"
+                    f"Загрузка..."
                 ),
                 parse_mode="HTML",
                 reply_markup=None
@@ -776,12 +777,9 @@ async def process_inline_download(
         if inline_message_id:
             try:
                 if "STORAGE_CHANNEL_ID" in str(err):
-                    err_text = "⚠️ Не удалось подготовить аудио."
+                    err_text = "Возникла ошибка 17. Не удалось подготовить аудио."
                 else:
-                    err_text = (
-                        "Не удалось скачать этот трек.\n\n"
-                        "Попробуйте выбрать другой вариант."
-                    )
+                    err_text = "Возникла ошибка 18. Попробуйте выбрать другой трек."
                 await bot.edit_message_text(
                     inline_message_id=inline_message_id,
                     text=err_text,
@@ -808,7 +806,7 @@ async def handle_inline_status_callback(callback: CallbackQuery, bot: Bot):
     Если feedback задержался, запускает скачивание.
     """
     cand_id = callback.data.split(":", 1)[1]
-    await callback.answer("Загрузка уже идёт...", show_alert=False)
+    await callback.answer("Загрузка уже идёт.", show_alert=False)
     if callback.inline_message_id:
         _start_inline_download(
             cand_id=cand_id,

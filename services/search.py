@@ -813,9 +813,9 @@ def render_search_page(session_id: str, query: str, items: List[SearchItem], pag
 
     nav_row: List[InlineKeyboardButton] = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"mspg:{session_id}:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text="Назад", callback_data=f"mspg:{session_id}:{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"mspg:{session_id}:{page + 1}"))
+        nav_row.append(InlineKeyboardButton(text="Далее", callback_data=f"mspg:{session_id}:{page + 1}"))
 
     if nav_row:
         keyboard_rows.append(nav_row)

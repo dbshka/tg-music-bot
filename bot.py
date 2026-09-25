@@ -51,7 +51,7 @@ async def start_healthcheck_server(port: int = 7860):
     import os
 
     async def handle_ping(request):
-        return web.Response(text="Music Bot is running OK!", content_type="text/plain")
+        return web.Response(text="Сервис работает.", content_type="text/plain")
 
 
     app = web.Application()
@@ -163,26 +163,29 @@ async def main():
 
         try:
             await bot.set_my_commands([
-                BotCommand(command="start", description="Запустить бота"),
-                BotCommand(command="search", description="Поиск по исполнителю и названию"),
-                BotCommand(command="cancel", description="Отмена действия"),
-                BotCommand(command="help", description="Справка и возможности"),
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="search", description="Поиск трека"),
+                BotCommand(command="cancel", description="Отменить действие"),
+                BotCommand(command="help", description="Как пользоваться"),
             ])
             # Окно «Что умеет этот бот?», отображаемое по центру чата до нажатия «Старт»
             bot_description = (
-                "музыка скачать не фейк — быстрый поиск и загрузка музыки в MP3.\n\n"
-                "Отправьте ссылку на трек или текстовый запрос: Исполнитель — Название.\n\n"
+                "Поиск и загрузка музыки в MP3.\n\n"
+                "Отправьте ссылку на трек или напишите:\n"
+                "Исполнитель — Название\n\n"
+                "Если исполнителей несколько, укажите их через запятую:\n"
+                "Исполнитель 1, Исполнитель 2 — Название\n\n"
                 "Поддерживаемые платформы:\n"
                 "• Spotify\n"
                 "• Apple Music\n"
                 "• YouTube\n"
                 "• SoundCloud\n"
                 "• Яндекс Музыка\n\n"
-                "Формат аудио: MP3. Другие сервисы официально не поддерживаются."
+                "Формат аудио: MP3."
             )
             await bot.set_my_description(description=bot_description)
             await bot.set_my_short_description(
-                short_description="музыка скачать не фейк. Поиск и загрузка треков из Spotify, Apple Music, YouTube, SoundCloud, Яндекс Музыки в MP3."
+                short_description="Поиск и загрузка треков из Spotify, Apple Music, YouTube, SoundCloud и Яндекс Музыки в MP3."
             )
         except Exception as e:
             logger.debug("Не удалось обновить меню команд и описание: %s", e)

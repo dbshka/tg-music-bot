@@ -152,7 +152,7 @@ def apply_mp3_tags(
             return file_path, final_cover_jpg
         except Exception as e:
             logger.error("Ошибка при сохранении тегов MP4/M4A %s: %s", file_path.name, e)
-            raise RuntimeError(f"Не удалось записать теги в {file_path.name}: {e}")
+            raise RuntimeError("Возникла ошибка 63. Не удалось сохранить изменения.")
 
     # MP3 ID3 теги (только для non-MP4 файлов)
     try:

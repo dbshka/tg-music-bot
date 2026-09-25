@@ -126,7 +126,7 @@ def test_reverb_rejection_on_unmodded_candidate(tmp_path):
     fake_audio.write_bytes(b"\xff\xfb\x90\x44" + b"\x00" * 1000)
 
     # Requested modifier is reverb, candidate has NO modifiers
-    with pytest.raises(ValueError, match="Версия с запрошенной модификацией"):
+    with pytest.raises(ValueError, match="Возникла ошибка 44"):
         _apply_audio_modifier_if_needed(
             audio_path=fake_audio,
             requested_modifiers={"reverb"},
@@ -505,7 +505,7 @@ def test_all_drm_candidates_rejected_and_no_remix_substitution(tmp_path):
 
     with patch("yt_dlp.YoutubeDL", side_effect=FakeYDL), \
          patch("services.downloader._apply_custom_metadata", return_value=None):
-        with pytest.raises(ValueError, match="(DRM|Ни один кандидат)"):
+        with pytest.raises(ValueError, match="(Возникла ошибка 45|Возникла ошибка 48)"):
             _sync_download(
                 query_or_url="ytsearch5:The Weeknd Blinding Lights",
                 output_dir=tmp_path,

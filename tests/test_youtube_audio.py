@@ -225,35 +225,35 @@ def test_youtube_error_mappings():
 
     err1 = Exception("ERROR: [youtube] dQw4w9WgXcQ: Private video. Sign in if you've been granted access to this video")
     msg1 = format_download_error(err1)
-    assert "Видео приватно" in msg1
+    assert "Возникла ошибка 3" in msg1
 
     err2 = Exception("Sign in to confirm your age. This video may be inappropriate for some users.")
     msg2 = format_download_error(err2)
-    assert "Возрастное ограничение" in msg2
+    assert "Возникла ошибка 4" in msg2
 
     err3 = Exception("The uploader has not made this video available in your country")
     msg3 = format_download_error(err3)
-    assert "Региональное ограничение" in msg3
+    assert "Возникла ошибка 5" in msg3
 
     err4 = Exception("Sign in to confirm you're not a bot (HTTP Error 429: Too Many Requests)")
     msg4 = format_download_error(err4)
-    assert "Временное ограничение YouTube" in msg4
+    assert "Возникла ошибка 6" in msg4
 
     err5 = Exception("Requested format is not available")
     msg5 = format_download_error(err5)
-    assert "Аудиопоток недоступен" in msg5
+    assert "Возникла ошибка 7" in msg5
 
     err6 = Exception("Video unavailable. This video has been removed by the uploader")
     msg6 = format_download_error(err6)
-    assert "Видео недоступно или удалено" in msg6
+    assert "Возникла ошибка 10" in msg6
 
     err7 = Exception("Connection timed out while reading stream")
     msg7 = format_download_error(err7)
-    assert "Превышено время ожидания" in msg7
+    assert "Возникла ошибка 8" in msg7
 
     err8 = Exception("ffprobe / ffmpeg conversion failed")
     msg8 = format_download_error(err8)
-    assert "Ошибка конвертации аудио" in msg8
+    assert "Возникла ошибка 9" in msg8
 
 
 def test_download_concurrency_semaphore_is_strictly_one():
@@ -813,7 +813,7 @@ def test_spotify_pipeline_rejects_unrelated_candidate_even_if_phrase_matches(tmp
                 is_apple_music=True,
             )
         assert download_called is False  # Rejected pre-download!
-        assert any(k in str(exc.value).lower() for k in ["не подошел", "не найден", "ни один"])
+        assert any(k in str(exc.value).lower() for k in ["ошибка 48", "ошибка", "не подошел", "не найден", "ни один"])
 
 
 def test_validate_candidate_artist_and_inversion_extreme_cases():

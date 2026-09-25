@@ -47,24 +47,24 @@ def is_safe_url(url: str) -> Tuple[bool, str]:
     try:
         parsed = urllib.parse.urlparse(url.strip())
     except Exception:
-        return False, "Некорректный формат URL"
+        return False, "Возникла ошибка 53. Проверьте ссылку."
 
     if parsed.scheme.lower() not in ("http", "https"):
-        return False, f"Недопустимая схема URL: {parsed.scheme}"
+        return False, "Возникла ошибка 54. Проверьте ссылку."
 
     hostname = parsed.hostname
     if not hostname:
-        return False, "Отсутствует имя хоста"
+        return False, "Возникла ошибка 55. Проверьте ссылку."
 
     # Защита от прямого указания localhost
     if hostname.lower() in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-        return False, "Обращение к локальному хосту запрещено"
+        return False, "Возникла ошибка 56. Проверьте ссылку."
 
     # Проверка, является ли hostname уже IP-адресом
     try:
         ip_obj = ipaddress.ip_address(hostname)
         if is_ip_blocked(str(ip_obj)):
-            return False, f"Обращение к приватным IP запрещено ({hostname})"
+            return False, "Возникла ошибка 57. Проверьте ссылку."
         return True, ""
     except ValueError:
         pass
@@ -73,14 +73,16 @@ def is_safe_url(url: str) -> Tuple[bool, str]:
     port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     try:
         addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+        if not addr_info:
+            return False, "Возникла ошибка 59. Проверьте ссылку и попробуйте ещё раз."
         for family, socktype, proto, canonname, sockaddr in addr_info:
             ip_str = sockaddr[0]
             if is_ip_blocked(ip_str):
-                return False, f"Хост {hostname} разрешается в приватный IP {ip_str}"
+                return False, "Возникла ошибка 58. Проверьте ссылку."
     except socket.gaierror as e:
-        return False, f"Ошибка DNS разрешения хоста {hostname}: {e}"
+        return False, "Возникла ошибка 60. Проверьте ссылку и попробуйте ещё раз."
     except Exception as e:
-        return False, f"Ошибка проверки хоста {hostname}: {e}"
+        return False, "Возникла ошибка 61. Проверьте ссылку и попробуйте ещё раз."
 
     return True, ""
 
@@ -99,7 +101,7 @@ async def safe_unshorten_url(url: str, session: aiohttp.ClientSession, max_redir
         is_safe, reason = is_safe_url(current_url)
         if not is_safe:
             logger.warning("SSRF заблокирован при редиректе: %s (%s)", current_url, reason)
-            raise ValueError(f"Небезопасный URL ({reason})")
+            raise ValueError("Возникла ошибка 62. Проверьте ссылку и попробуйте ещё раз.")
 
         parsed = urllib.parse.urlparse(current_url)
         short_domains = ("ya.cc", "clck.ru", "vk.cc", "t.co", "goo.gl", "bit.ly", "spotify.link", "band.link", "tinyurl.com")

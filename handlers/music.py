@@ -43,6 +43,7 @@ from services.downloader import (
     log_memory_stage,
 )
 from services.database import (
+    register_user_async,
     log_user_activity_async,
     increment_user_download_async,
     get_cached_track_async,
@@ -99,16 +100,21 @@ def get_cancel_reply_keyboard() -> ReplyKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    if message.from_user:
-        await log_user_activity_async(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    chat_id = message.chat.id
+    username = message.from_user.username if message.from_user else None
+    full_name = message.from_user.full_name if message.from_user else None
+    await register_user_async(user_id=user_id, chat_id=chat_id, username=username, full_name=full_name)
     start_text = (
-        "<b>музыка скачать не фейк</b> — быстрый поиск и загрузка музыки в MP3.\n\n"
-        "Отправьте ссылку на трек или напишите: <code>Исполнитель — Название</code>\n"
-        "Для совместных треков: <code>Исполнитель 1, Исполнитель 2 -- Название</code>\n\n"
+        "Поиск и загрузка музыки в MP3.\n\n"
+        "Отправьте ссылку на трек или напишите:\n"
+        "<code>Исполнитель — Название</code>\n\n"
+        "Если исполнителей два или больше, укажите их через запятую:\n"
+        "<code>Исполнитель 1, Исполнитель 2 — Название</code>\n\n"
         "Поддерживаемые платформы:\n"
-        "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка (MP3).\n"
-        "Остальные сервисы официально не поддерживаются.\n\n"
-        "Вы также можете отправить аудиофайл для редактирования тегов."
+        "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка\n\n"
+        "Формат аудио: MP3.\n\n"
+        "Также можно отправить аудиофайл и изменить его теги."
     )
     await message.answer(start_text, reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
 
@@ -117,22 +123,24 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     help_text = (
-        "<b>Справка и возможности:</b>\n\n"
-        "<b>1. Загрузка по ссылке</b>\n"
-        "Отправьте ссылку на трек из поддерживаемых сервисов:\n"
-        "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка.\n"
-        "Формат аудио: MP3. Другие сервисы официально не поддерживаются.\n\n"
-        "<b>2. Поиск по названию</b>\n"
-        "Отправьте сообщение в формате: <code>Исполнитель — Название</code>\n"
-        "Если исполнителей несколько: <code>Исполнитель 1, Исполнитель 2 -- Название</code>\n"
-        "Либо используйте команду /search.\n\n"
-        "<b>3. Редактор тегов</b>\n"
-        "Пришлите аудиофайл или нажмите «Изменить теги» под отправленным треком.\n\n"
-        "<b>Команды:</b>\n"
+        "Как пользоваться\n\n"
+        "1. Загрузка по ссылке\n\n"
+        "Отправьте ссылку на отдельный трек из одной из поддерживаемых платформ:\n"
+        "Spotify · Apple Music · YouTube · SoundCloud · Яндекс Музыка\n\n"
+        "Формат аудио: MP3.\n\n"
+        "2. Поиск по названию\n\n"
+        "Напишите:\n"
+        "<code>Исполнитель — Название</code>\n\n"
+        "Если исполнителей несколько:\n"
+        "<code>Исполнитель 1, Исполнитель 2 — Название</code>\n\n"
+        "Также можно использовать /search.\n\n"
+        "3. Редактирование тегов\n\n"
+        "Отправьте аудиофайл или нажмите «Изменить теги» под отправленным треком.\n\n"
+        "Команды:\n\n"
         "/start — Главное меню\n"
-        "/search — Поиск по исполнителю и названию\n"
+        "/search — Поиск трека\n"
         "/cancel — Отмена действия\n"
-        "/help — Справка"
+        "/help — Эта справка"
     )
     await message.answer(help_text, reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
 
@@ -140,7 +148,7 @@ async def cmd_help(message: Message, state: FSMContext):
 @router.message(Command("version"))
 async def cmd_version(message: Message):
     from config import BOT_VERSION
-    await message.answer(f"Версия бота: <b>v{BOT_VERSION}</b>", parse_mode="HTML")
+    await message.answer(f"Версия: v{BOT_VERSION}")
 
 
 @router.message(Command("cancel"))
@@ -151,13 +159,13 @@ async def cancel_handler(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Поиск отменён.", reply_markup=get_main_reply_keyboard())
     else:
-        await message.answer("Нет активного поиска.", reply_markup=get_main_reply_keyboard())
+        await message.answer("Сейчас нечего отменять.", reply_markup=get_main_reply_keyboard())
 
 
 @router.callback_query(F.data == "search:cancel")
 async def cb_search_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.answer("Поиск отменён")
+    await callback.answer("Поиск отменён.")
     try:
         await callback.message.edit_text("Поиск отменён.")
     except Exception:
@@ -170,11 +178,11 @@ async def cmd_search_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(SearchFSM.waiting_for_artist)
     await message.answer(
-        "Шаг 1 из 2: введите имя исполнителя.\n"
-        "Если исполнителей несколько, перечислите через запятую:\n"
+        "Шаг 1 из 2: введите имя исполнителя.\n\n"
+        "Если исполнителей два или больше, укажите их через запятую:\n"
         "<code>Исполнитель 1, Исполнитель 2</code>\n\n"
-        "Или отправьте трек целиком:\n"
-        "<code>Исполнитель 1, Исполнитель 2 -- Название</code>",
+        "Можно сразу отправить исполнителя и название:\n"
+        "<code>Исполнитель — Название</code>",
         reply_markup=get_cancel_reply_keyboard(),
         parse_mode="HTML"
     )
@@ -185,14 +193,14 @@ async def cb_use_quick_artist(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     artist = data.get("quick_artist")
     if not artist:
-        await callback.answer("Исполнитель не указан", show_alert=True)
+        await callback.answer("Исполнитель не указан.", show_alert=True)
         return
     await state.update_data(artist=artist)
     await state.set_state(SearchFSM.waiting_for_title)
     await callback.answer()
     prompt_text = (
         f"Исполнитель: <b>{html.escape(artist)}</b>\n\n"
-        "Шаг 2 из 2: введите название трека:"
+        "Шаг 2 из 2: введите название трека."
     )
     try:
         await callback.message.edit_text(prompt_text, parse_mode="HTML")
@@ -226,7 +234,7 @@ async def process_search_artist(message: Message, state: FSMContext):
         variant = ", ".join(mods) if mods else "original"
         display_name = format_track_display(artists_list, clean_title)
         await message.answer(
-            f"Поиск: <b>{html.escape(display_name)}</b>...",
+            f"Ищу: <b>{html.escape(display_name)}</b>",
             parse_mode="HTML",
             reply_markup=get_main_reply_keyboard()
         )
@@ -243,7 +251,7 @@ async def process_search_artist(message: Message, state: FSMContext):
     await state.set_state(SearchFSM.waiting_for_title)
     await message.answer(
         f"Исполнитель: <b>{html.escape(artist_text)}</b>\n\n"
-        "Шаг 2 из 2: введите название трека:",
+        "Шаг 2 из 2: введите название трека.",
         parse_mode="HTML",
         reply_markup=get_cancel_reply_keyboard()
     )
@@ -277,7 +285,7 @@ async def process_search_title(message: Message, state: FSMContext):
 
     display_name = format_track_display(artist, clean_title)
     await message.answer(
-        f"Поиск: <b>{html.escape(display_name)}</b>...",
+        f"Ищу: <b>{html.escape(display_name)}</b>",
         parse_mode="HTML",
         reply_markup=get_main_reply_keyboard()
     )
@@ -337,11 +345,11 @@ async def handle_music_request(message: Message, state: FSMContext):
         )
 
     await message.answer(
-        "Шаг 1 из 2: введите имя исполнителя.\n"
-        "Если исполнителей несколько, перечислите через запятую:\n"
+        "Шаг 1 из 2: введите имя исполнителя.\n\n"
+        "Если исполнителей два или больше, укажите их через запятую:\n"
         "<code>Исполнитель 1, Исполнитель 2</code>\n\n"
-        "Или отправьте трек целиком:\n"
-        "<code>Исполнитель 1, Исполнитель 2 -- Название</code>",
+        "Можно сразу отправить:\n"
+        "<code>Исполнитель — Название</code>",
         parse_mode="HTML",
         reply_markup=quick_markup or get_cancel_reply_keyboard()
     )
@@ -353,67 +361,36 @@ def format_download_error(e: Exception, track_info: Optional[ExtractedTrack] = N
     лаконичные сообщения для пользователя без технических деталей и дампов.
     """
     err_str = str(e)
+    if err_str.startswith("⚠️"):
+        err_str = err_str.replace("⚠️ ", "").strip()
+    if err_str.startswith("Возникла ошибка"):
+        return err_str
+
     err_lower = err_str.lower()
     if "drm protected" in err_lower or "is drm protected" in err_lower:
-        return (
-            "<b>Трек защищён DRM (SoundCloud Go+).</b>\n\n"
-            "Попробуйте отправить ссылку из Spotify, Apple Music или YouTube."
-        )
-    if err_str.startswith("⚠️"):
-        return err_str.replace("⚠️ ", "").strip()
+        return "Возникла ошибка 1. Попробуйте другой источник или отправьте название трека текстом."
     if track_info and track_info.platform in ("Yandex Music", "VK Music") and (
         "не найден" in err_lower or "не подошел" in err_lower or "кандидат" in err_lower or "not found" in err_lower
     ):
-        disp = format_track_display(track_info.artist, track_info.title)
-        return (
-            f"Не удалось найти подходящий трек для «{html.escape(disp)}».\n\n"
-            f"Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
-        )
+        return "Возникла ошибка 2. Попробуйте ещё раз или отправьте название трека текстом."
     if any(k in err_lower for k in ("private video", "this video is private", "video is private")):
-        return (
-            "<b>Видео приватно</b>\n\n"
-            "Это видео доступно только по приглашению или закрыто автором. Скачивание невозможно."
-        )
+        return "Возникла ошибка 3. Попробуйте другой трек."
     if any(k in err_lower for k in ("confirm your age", "age-restricted", "age restricted", "content warning", "requires authentication")):
-        return (
-            "<b>Возрастное ограничение</b>\n\n"
-            "YouTube требует авторизацию для доступа к этому видео. Скачивание невозможно без входа в аккаунт."
-        )
+        return "Возникла ошибка 4. Попробуйте другой трек."
     if any(k in err_lower for k in ("not available in your country", "uploader has not made this video available", "geo-restricted", "georestricted", "blocked in your country")):
-        return (
-            "<b>Региональное ограничение</b>\n\n"
-            "Автор видео или правообладатель ограничил доступ в регионе сервера."
-        )
+        return "Возникла ошибка 5. Попробуйте другой источник."
     if any(k in err_lower for k in ("confirm you're not a bot", "automated queries", "too many requests", "http error 429", "bot-check", "bot check")):
-        return (
-            "<b>Временное ограничение YouTube</b>\n\n"
-            "YouTube временно ограничил запросы. Пожалуйста, повторите попытку через пару минут."
-        )
+        return "Возникла ошибка 6. Попробуйте ещё раз через некоторое время."
     if any(k in err_lower for k in ("format is not available", "requested format", "no audio stream", "format not available")):
-        return (
-            "<b>Аудиопоток недоступен</b>\n\n"
-            "Не удалось извлечь аудиопоток для этой записи. Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
-        )
+        return "Возникла ошибка 7. Попробуйте другой трек или отправьте название текстом."
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)) or any(k in err_lower for k in ("timed out", "timeout", "timedout", "connection reset", "network is unreachable", "temporary failure in name resolution")):
-        return (
-            "<b>Превышено время ожидания</b>\n\n"
-            "Время ожидания ответа истекло. Пожалуйста, повторите попытку через минуту."
-        )
+        return "Возникла ошибка 8. Попробуйте ещё раз."
     if any(k in err_lower for k in ("ffmpeg", "ffprobe", "conversion failed", "postprocessing")):
-        return (
-            "<b>Ошибка конвертации аудио</b>\n\n"
-            "Не удалось сконвертировать аудиофайл. Попробуйте повторить запрос позже."
-        )
+        return "Возникла ошибка 9. Попробуйте ещё раз."
     if any(k in err_lower for k in ("video unavailable", "this video is unavailable", "has been removed", "deleted", "does not exist")):
-        return (
-            "<b>Видео недоступно или удалено</b>\n\n"
-            "Запись по указанной ссылке не найдена или была удалена с сервиса."
-        )
+        return "Возникла ошибка 10. Попробуйте другой трек."
 
-    return (
-        "<b>Не удалось скачать трек.</b>\n\n"
-        "Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
-    )
+    return "Возникла ошибка 11. Попробуйте ещё раз."
 
 
 async def _execute_download_and_send(
@@ -449,7 +426,7 @@ async def _execute_download_and_send(
     try:
         t_m0 = time.perf_counter()
         if url:
-            status_msg = await message.reply("Анализ ссылки...")
+            status_msg = await message.reply("Проверяю ссылку...")
             print(f"[MUSIC][request_id={req_id}] resolve_track_url START url='{url}'", flush=True)
             track_info = await asyncio.wait_for(resolve_track_url(url), timeout=10.0)
             # Определение варианта для URL-входов:
@@ -472,7 +449,7 @@ async def _execute_download_and_send(
         elif custom_artist and custom_title:
             disp_name = format_track_display(custom_artist, custom_title)
             status_msg = await message.reply(
-                f"Поиск: <b>{html.escape(disp_name)}</b>...",
+                f"Ищу: <b>{html.escape(disp_name)}</b>",
                 parse_mode="HTML"
             )
             combined_q = f"{custom_artist} {custom_title}"
@@ -509,14 +486,14 @@ async def _execute_download_and_send(
                 )
         else:
             status_msg = await message.reply(
-                f"Поиск: <b>{html.escape(raw_query)}</b>...",
+                f"Ищу: <b>{html.escape(raw_query)}</b>",
                 parse_mode="HTML"
             )
             print(f"[MUSIC][request_id={req_id}] resolve_text_to_track_info START query='{raw_query}'", flush=True)
             track_info = await asyncio.wait_for(resolve_text_to_track_info(raw_query), timeout=10.0)
 
         if not track_info:
-            raise ValueError("Не удалось распознать трек. Попробуйте текстовый поиск.")
+            raise ValueError("Возникла ошибка 12. Проверьте название трека и попробуйте ещё раз.")
 
         t_metadata = time.perf_counter() - t_m0
         print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}' duration={track_info.duration}s", flush=True)
@@ -640,7 +617,7 @@ async def _execute_download_and_send(
         if status_msg:
             display_title = format_track_display(track_info.artist, track_info.title)
             await status_msg.edit_text(
-                f"Загрузка: <b>{html.escape(display_title)}</b>{platform_label}...",
+                f"Загрузка: <b>{html.escape(display_title)}</b>{platform_label}",
                 parse_mode="HTML"
             )
 
@@ -707,11 +684,7 @@ async def _execute_download_and_send(
         print(f"[MUSIC][request_id={req_id}] download_track SUCCESS title='{downloaded_audio.title}' duration={downloaded_audio.duration}s size={downloaded_audio.filesize} bytes", flush=True)
 
         if downloaded_audio.filesize > MAX_FILE_SIZE_BYTES:
-            size_mb = downloaded_audio.filesize / (1024 * 1024)
-            await status_msg.edit_text(
-                f"Файл слишком большой ({size_mb:.1f} МБ).\n"
-                f"Telegram разрешает ботам отправлять файлы до 50 МБ."
-            )
+            await status_msg.edit_text("Возникла ошибка 13. Получившийся файл слишком большой для отправки.")
             return
 
         # Финальный барьер перед отправкой в Telegram: аутентичность и хронометраж студийного оригинала или канонической версии
@@ -722,12 +695,7 @@ async def _execute_download_and_send(
                 max_final_diff = max(4, min(7, int(track_info.duration * 0.02)))
                 if final_diff > max_final_diff:
                     print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: final_diff={final_diff}s > {max_final_diff}s (got {actual_final_dur}s vs canonical {track_info.duration}s for студийного оригинала). Refusing to send to Telegram.", flush=True)
-                    disp = format_track_display(track_info.artist, track_info.title)
-                    msg_text = (
-                        f"Не удалось найти точную версию трека «{html.escape(disp)}».\n\n"
-                        f"Попробуйте отправить название треком: <code>Исполнитель — Название</code>"
-                    )
-                    await status_msg.edit_text(msg_text, parse_mode="HTML")
+                    await status_msg.edit_text("Возникла ошибка 14. Точная версия трека не найдена.")
                     downloaded_audio.cleanup()
                     return
             elif variant != "original":
@@ -746,13 +714,11 @@ async def _execute_download_and_send(
 
                 if not is_candidate_matching_modifiers(target_mods, cand_mods):
                     print(f"[MUSIC][request_id={req_id}] FINAL VALIDATION FAILED: downloaded audio '{downloaded_audio.title}' (source: '{downloaded_audio.source_title}') lacks requested variant '{variant}' (got mods: {cand_mods}, target: {target_mods}). Refusing to send to Telegram.", flush=True)
-                    await status_msg.edit_text(
-                        f"Версия «{html.escape(variant)}» для этого трека не найдена."
-                    )
+                    await status_msg.edit_text("Возникла ошибка 15. Запрошенная версия трека не найдена.")
                     downloaded_audio.cleanup()
                     return
 
-        await status_msg.edit_text("Отправка трека...")
+        await status_msg.edit_text("Отправляю трек...")
 
         audio_file = FSInputFile(downloaded_audio.file_path)
         thumb_path = downloaded_audio.thumbnail_path

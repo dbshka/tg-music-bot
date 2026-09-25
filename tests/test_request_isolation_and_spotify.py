@@ -105,11 +105,11 @@ def test_format_download_error_handles_timeout():
     """Проверяет преобразование таймаутов в понятный UX-текст."""
     async_to = asyncio.TimeoutError()
     msg = format_download_error(async_to)
-    assert "Превышено время ожидания" in msg
+    assert "Возникла ошибка 8" in msg
 
     to_err = TimeoutError("Candidate exceeded candidate deadline")
     msg2 = format_download_error(to_err)
-    assert "Превышено время ожидания" in msg2
+    assert "Возникла ошибка 8" in msg2
 
 
 @pytest.mark.asyncio
