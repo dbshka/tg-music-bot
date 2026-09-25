@@ -80,11 +80,11 @@ def test_donate_keyboards_structure():
     2. get_donate_inline_keyboard содержит 3 валюты с правильными callback_data;
     3. get_crypto_back_keyboard содержит кнопку '← Назад' с callback_data 'donate:menu'.
     """
-    # 1. Reply-клавиатура
+    # 1. Reply-клавиатура (кнопка 'Поддержать проект' убрана с главного экрана)
     main_kb = get_main_reply_keyboard()
     button_texts = [btn.text for row in main_kb.keyboard for btn in row]
     assert "Найти песню" in button_texts
-    assert "Поддержать проект" in button_texts
+    assert "Поддержать проект" not in button_texts
 
     # 2. Главная inline-клавиатура донатов
     donate_kb = get_donate_inline_keyboard()
@@ -190,7 +190,7 @@ async def test_main_menu_and_help_commands():
     assert reply_kb is not None
     button_texts = [btn.text for row in reply_kb.keyboard for btn in row]
     assert "Найти песню" in button_texts
-    assert "Поддержать проект" in button_texts
+    assert "Поддержать проект" not in button_texts
 
     # 2. /help
     msg_help = MagicMock()

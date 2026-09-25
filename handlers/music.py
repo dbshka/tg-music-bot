@@ -77,10 +77,10 @@ class SearchFSM(StatesGroup):
 
 
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура с кнопками поиска и поддержки проекта."""
+    """Постоянная клавиатура с кнопкой поиска по автору и названию."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Найти песню"), KeyboardButton(text="Поддержать проект")],
+            [KeyboardButton(text="Найти песню")],
         ],
         resize_keyboard=True,
         is_persistent=True,
