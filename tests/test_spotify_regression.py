@@ -218,3 +218,155 @@ async def test_can_try_sc_activated_for_catalog_tracks():
         assert sc_called is True
         assert audio is not None
         assert audio.title == "револьвер"
+
+
+def test_sync_download_preserves_explicit_caller_query():
+    """
+    Проверяет, что _sync_download не перезаписывает явно переданный поисковый запрос
+    (например из fallback 'ytsearch5:револьвер - Trap Remix') обратно в 'artist - title'.
+    """
+    from services.downloader import _sync_download
+    from pathlib import Path
+
+    searched_queries = []
+
+    mock_ydl = MagicMock()
+    mock_ydl.__enter__.return_value = mock_ydl
+
+    def mock_extract(query, download=False):
+        searched_queries.append(query)
+        if "револьвер" in query:
+            return {
+                "entries": [
+                    {
+                        "id": "u-Mi2Be_DJ0",
+                        "title": "револьвер (Trap Remix)",
+                        "uploader": "Release - Topic",
+                        "artist": "DJ ZUP RAIii",
+                        "duration": 81,
+                        "url": "https://www.youtube.com/watch?v=u-Mi2Be_DJ0",
+                        "webpage_url": "https://www.youtube.com/watch?v=u-Mi2Be_DJ0",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+        return {"entries": []}
+
+    mock_ydl.extract_info.side_effect = mock_extract
+
+    def mock_dl(ydl_opts, url, timeout_sec=None, cand_cancel_event=None, parent_cancel_event=None):
+        out_tmpl = ydl_opts.get("outtmpl", {})
+        default_tmpl = out_tmpl.get("default", "") if isinstance(out_tmpl, dict) else str(out_tmpl)
+        parent_dir = Path(default_tmpl).parent
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        audio_f = parent_dir / "candidate_0.m4a"
+        audio_f.write_bytes(b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 4096)
+        return {
+            "id": "u-Mi2Be_DJ0",
+            "title": "револьвер (Trap Remix)",
+            "uploader": "Release - Topic",
+            "artist": "DJ ZUP RAIii",
+            "duration": 81,
+            "ext": "m4a",
+            "filepath": str(audio_f)
+        }
+
+    with patch("yt_dlp.YoutubeDL", return_value=mock_ydl), \
+         patch("services.downloader._extract_info_with_timeout", side_effect=mock_dl), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        audio = _sync_download(
+            query_or_url="ytsearch5:револьвер - Trap Remix",
+            output_dir=Path("C:/tmp/test_sync_preserve"),
+            custom_title="револьвер - Trap Remix",
+            custom_artist="DJ ZUP RAlii",
+            requested_variant="remix",
+            is_apple_music=True
+        )
+        assert audio is not None
+        assert audio.title == "револьвер - Trap Remix"
+        assert audio.artist == "DJ ZUP RAlii"
+        # Проверяем, что поиск выполнялся по названию, а не был принудительно заменён на имя исполнителя
+        assert any("револьвер - Trap Remix" in q for q in searched_queries)
+
+
+@pytest.mark.asyncio
+async def test_spotify_track_2dI9FmLvKLUvnVV4fSZGA2_regression():
+    """
+    Регрессионный тест для Spotify трека 2dI9FmLvKLUvnVV4fSZGA2 (DJ ZUP RAlii - револьвер - Trap Remix):
+    моделирует успешный проход:
+    поиск -> нахождение Topic-релиза (u-Mi2Be_DJ0) -> скачивание -> обработка -> корректное завершение без Error 48.
+    """
+    from services.downloader import download_track
+
+    # Имитируем, что поиск по артисту даёт 0 результатов (из-за различий омоглифов на YouTube),
+    # но параллельный/fallback поиск по названию находит релиз
+    def mock_extract(query, download=False):
+        if "DJ ZUP RAlii" in query:
+            # Поиск по ошибочному имени возвращает сторонние треки
+            return {
+                "entries": [
+                    {
+                        "id": "pSUopA25o3U",
+                        "title": "исповедь",
+                        "uploader": "_DJ ZUP RAIii_",
+                        "artist": "DJ ZUP RAIii",
+                        "duration": 90,
+                        "url": "https://www.youtube.com/watch?v=pSUopA25o3U",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+        elif "револьвер" in query:
+            # Поиск по названию находит официальный релиз на Topic-канале
+            return {
+                "entries": [
+                    {
+                        "id": "u-Mi2Be_DJ0",
+                        "title": "револьвер (Trap Remix)",
+                        "uploader": "Release - Topic",
+                        "artist": "DJ ZUP RAIii",
+                        "duration": 81,
+                        "url": "https://www.youtube.com/watch?v=u-Mi2Be_DJ0",
+                        "webpage_url": "https://www.youtube.com/watch?v=u-Mi2Be_DJ0",
+                        "_source": "youtube"
+                    }
+                ]
+            }
+        return {"entries": []}
+
+    mock_ydl = MagicMock()
+    mock_ydl.__enter__.return_value = mock_ydl
+    mock_ydl.extract_info.side_effect = mock_extract
+
+    def mock_dl(ydl_opts, url, timeout_sec=None, cand_cancel_event=None, parent_cancel_event=None):
+        from pathlib import Path
+        out_tmpl = ydl_opts.get("outtmpl", {})
+        default_tmpl = out_tmpl.get("default", "") if isinstance(out_tmpl, dict) else str(out_tmpl)
+        parent_dir = Path(default_tmpl).parent
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        audio_f = parent_dir / "candidate_0.m4a"
+        audio_f.write_bytes(b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 4096)
+        return {
+            "id": "u-Mi2Be_DJ0",
+            "title": "револьвер (Trap Remix)",
+            "uploader": "Release - Topic",
+            "artist": "DJ ZUP RAIii",
+            "duration": 81,
+            "ext": "m4a",
+            "filepath": str(audio_f)
+        }
+
+    with patch("yt_dlp.YoutubeDL", return_value=mock_ydl), \
+         patch("services.downloader._extract_info_with_timeout", side_effect=mock_dl), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        audio = await download_track(
+            query_or_url="ytsearch5:DJ ZUP RAlii - револьвер - Trap Remix",
+            custom_title="револьвер - Trap Remix",
+            custom_artist="DJ ZUP RAlii",
+            requested_variant="remix",
+            is_apple_music=True
+        )
+        assert audio is not None
+        assert audio.title == "револьвер - Trap Remix"
+        assert audio.artist == "DJ ZUP RAlii"
+        assert audio.duration == 81

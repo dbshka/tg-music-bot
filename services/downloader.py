@@ -1248,10 +1248,13 @@ def _sync_download(
             inv_idx1 = len(invocations) + 1
             t_s0 = time.perf_counter()
 
-            if custom_artist and custom_title:
+            raw_target_q = query_or_url.split(":", 1)[1].strip() if ":" in query_or_url else query_or_url.strip()
+            if raw_target_q and not raw_target_q.startswith("http") and (not custom_artist or not custom_title or raw_target_q.lower() != f"{custom_artist} - {custom_title}".lower()):
+                clean_search = raw_target_q
+            elif custom_artist and custom_title:
                 clean_search = f"{custom_artist} - {custom_title}"
             else:
-                clean_search = query_or_url.split(":", 1)[1] if ":" in query_or_url else query_or_url
+                clean_search = raw_target_q
 
             search_query_lower = clean_search.lower()
             entries = []
@@ -1311,7 +1314,10 @@ def _sync_download(
             if not core_title_words and custom_title:
                 core_title_words = set(re.findall(r'[\w]+', custom_title.lower()))
 
-            clean_q_simple = f"{clean_artist_str} {clean_title_str}".strip() if (clean_artist_str and clean_title_str) else clean_search
+            if clean_artist_str and clean_title_str and (not raw_target_q or clean_artist_str.lower() in raw_target_q.lower()):
+                clean_q_simple = f"{clean_artist_str} {clean_title_str}".strip()
+            else:
+                clean_q_simple = clean_search
             ignore_cand_words = core_title_words | (set(re.findall(r'[\w]+', custom_artist.lower())) if custom_artist else set())
 
 
@@ -1334,6 +1340,8 @@ def _sync_download(
                         ("youtube", f"ytsearch4:{clean_artist_str} - {clean_title_str} ({mod_term})".strip()),
                         ("soundcloud", f"scsearch5:{variant_query}")
                     ]
+                    if clean_title_str and len(clean_title_str) >= 3:
+                        search_tasks.append(("youtube", f"ytsearch4:{clean_title_str}"))
                 else:
                     search_tasks = [
                         ("youtube", f"ytmsearch5:{clean_q_simple}"),
@@ -1342,6 +1350,8 @@ def _sync_download(
                     ]
                     if clean_search and clean_search != clean_q_simple:
                         search_tasks.append(("youtube", f"ytsearch3:{clean_search}"))
+                    elif clean_title_str and len(clean_title_str) >= 3 and clean_title_str.lower() != clean_q_simple.lower():
+                        search_tasks.append(("youtube", f"ytsearch3:{clean_title_str}"))
             else:
                 if requested_modifiers:
                     mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
@@ -1352,6 +1362,8 @@ def _sync_download(
                         ("youtube", f"ytsearch6:{variant_query}"),
                         ("soundcloud", f"scsearch5:{variant_query}")
                     ]
+                    if clean_title_str and len(clean_title_str) >= 3:
+                        search_tasks.append(("youtube", f"ytsearch4:{clean_title_str}"))
                 else:
                     search_tasks = [
                         ("youtube", f"ytmsearch5:{clean_q_simple}"),
@@ -2707,47 +2719,48 @@ async def download_track(
             if q.strip().lower() != clean_init_q.lower()
         ]
         if available_yt_fallbacks and not is_bot_blocked:
-            yt_query = available_yt_fallbacks[0]
-            try:
-                print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch5:{yt_query}", flush=True)
-                audio = await asyncio.to_thread(
-                    _sync_download,
-                    f"ytsearch5:{yt_query}",
-                    output_dir,
-                    custom_title,
-                    custom_artist,
-                    bitrate,
-                    bool(thumbnail_url),
-                    expected_duration,
-                    request_id,
-                    cancel_event,
-                    is_apple_music,
-                    is_text_input,
-                    None,
-                    custom_album
-                )
-                if expected_duration and expected_duration > 60 and audio.duration <= 35:
-                    raise ValueError("Возникла ошибка 51. Не удалось получить полный трек.")
+            for yt_query in available_yt_fallbacks[:2]:
+                try:
+                    print(f"{req_tag}[DOWNLOADER] Попытка Fallback через YouTube Search: ytsearch5:{yt_query}", flush=True)
+                    audio = await asyncio.to_thread(
+                        _sync_download,
+                        f"ytsearch5:{yt_query}",
+                        output_dir,
+                        custom_title,
+                        custom_artist,
+                        bitrate,
+                        bool(thumbnail_url),
+                        expected_duration,
+                        request_id,
+                        cancel_event,
+                        is_apple_music,
+                        is_text_input,
+                        requested_variant,
+                        custom_album,
+                        progress_callback
+                    )
+                    if expected_duration and expected_duration > 60 and audio.duration <= 35:
+                        raise ValueError("Возникла ошибка 51. Не удалось получить полный трек.")
 
-                if thumb_task:
-                    try:
-                        downloaded_thumb, highres_cover = await thumb_task
-                        if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
-                            audio.thumbnail_path = downloaded_thumb
-                        cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
-                        if cover_to_embed and cover_to_embed.exists():
-                            audio.cover_path = cover_to_embed
-                            _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album or audio.album)
-                    except Exception:
-                        pass
-                if audio.thumbnail_path and not audio.thumbnail_path.exists():
-                    audio.thumbnail_path = None
-                elapsed_fb = time.time() - t_start
-                print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
-                return audio
-            except Exception as yt_err:
-                safe_yt_err = str(yt_err).encode("ascii", errors="replace").decode("ascii")
-                print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search не удался: {safe_yt_err}", flush=True)
+                    if thumb_task:
+                        try:
+                            downloaded_thumb, highres_cover = await thumb_task
+                            if downloaded_thumb and downloaded_thumb.exists() and not audio.thumbnail_path:
+                                audio.thumbnail_path = downloaded_thumb
+                            cover_to_embed = highres_cover if (highres_cover and highres_cover.exists()) else audio.thumbnail_path
+                            if cover_to_embed and cover_to_embed.exists():
+                                audio.cover_path = cover_to_embed
+                                _apply_custom_metadata(audio.file_path, audio.title, audio.artist, cover_to_embed, album=custom_album or audio.album)
+                        except Exception:
+                            pass
+                    if audio.thumbnail_path and not audio.thumbnail_path.exists():
+                        audio.thumbnail_path = None
+                    elapsed_fb = time.time() - t_start
+                    print(f"{req_tag}[DOWNLOADER] [OK] Трек получен через YouTube Search Fallback за {elapsed_fb:.2f} сек: {audio.title}", flush=True)
+                    return audio
+                except Exception as yt_err:
+                    safe_yt_err = str(yt_err).encode("ascii", errors="replace").decode("ascii")
+                    print(f"{req_tag}[DOWNLOADER] Fallback YouTube Search '{yt_query}' не удался: {safe_yt_err}", flush=True)
         is_direct_yt = bool(("youtube.com" in query_or_url or "youtu.be" in query_or_url) and not query_or_url.startswith("ytsearch"))
         if is_direct_yt:
             print(f"{req_tag}[DOWNLOADER] Прямая ссылка YouTube завершилась ошибкой ({primary_error}). Fallback в SoundCloud запрещён.", flush=True)
