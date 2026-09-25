@@ -109,3 +109,112 @@ async def test_spotify_track_regression_no_error_8():
     for call in reply_msg.edit_text.call_args_list:
         text = call.args[0] if call.args else ""
         assert "Возникла ошибка 8" not in text
+        assert "Возникла ошибка 48" not in text
+
+
+def test_candidate_retry_403_sabr_fallback_success(tmp_path):
+    """
+    Проверяет, что при блокировке 403 на основном потоке (140/251)
+    кандидат переключается на альтернативный аудиопоток и успешно скачивается
+    без ошибки 48.
+    """
+    from services.downloader import _sync_download
+    from pathlib import Path
+
+    extract_calls = []
+
+    def mock_extract(ydl_opts, url, timeout_sec=None, cand_cancel_event=None, parent_cancel_event=None):
+        fmt = ydl_opts.get("format", "")
+        extract_calls.append(fmt)
+        if "[format_id!*=140]" in fmt:
+            out_tmpl = ydl_opts.get("outtmpl", {})
+            default_tmpl = out_tmpl.get("default", "") if isinstance(out_tmpl, dict) else str(out_tmpl)
+            parent_dir = Path(default_tmpl).parent
+            parent_dir.mkdir(parents=True, exist_ok=True)
+            audio_f = parent_dir / "candidate_0.m4a"
+            audio_f.write_bytes(b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 4096)
+            return {
+                "id": "RkYikO_-ztw",
+                "title": "револьвер",
+                "uploader": "_DJ ZUP RAIii_",
+                "artist": "DJ ZUP RAlii",
+                "duration": 73,
+                "ext": "m4a",
+                "filepath": str(audio_f)
+            }
+        else:
+            raise RuntimeError("HTTP Error 403: Forbidden")
+
+    mock_ydl = MagicMock()
+    mock_ydl.__enter__.return_value = mock_ydl
+    mock_ydl.extract_info.return_value = {
+        "entries": [
+            {
+                "id": "RkYikO_-ztw",
+                "title": "револьвер",
+                "uploader": "_DJ ZUP RAIii_",
+                "artist": "DJ ZUP RAlii",
+                "duration": 73,
+                "url": "https://www.youtube.com/watch?v=RkYikO_-ztw",
+                "webpage_url": "https://www.youtube.com/watch?v=RkYikO_-ztw",
+                "_source": "youtube"
+            }
+        ]
+    }
+
+    with patch("yt_dlp.YoutubeDL", return_value=mock_ydl), \
+         patch("services.downloader._extract_info_with_timeout", side_effect=mock_extract), \
+         patch("services.downloader._apply_custom_metadata", return_value=None):
+        audio = _sync_download(
+            query_or_url="ytsearch5:DJ ZUP RAlii - револьвер",
+            output_dir=tmp_path,
+            custom_title="револьвер",
+            custom_artist="DJ ZUP RAlii",
+            expected_duration=72,
+            is_text_input=False
+        )
+        assert audio is not None
+        assert audio.title == "револьвер"
+        assert audio.artist == "DJ ZUP RAlii"
+        assert any("[format_id!*=140][format_id!*=251]" in str(f) for f in extract_calls)
+
+
+@pytest.mark.asyncio
+async def test_can_try_sc_activated_for_catalog_tracks():
+    """
+    Проверяет, что для каталожных треков (например Spotify, query_or_url='ytsearch5:...', но заданы custom_artist/custom_title)
+    SoundCloud fallback разрешён, если поиск на YouTube не дал результата.
+    """
+    from services.downloader import download_track
+
+    sc_called = False
+
+    def mock_sync(query_or_url, *args, **kwargs):
+        nonlocal sc_called
+        if "ytsearch" in query_or_url:
+            raise ValueError("Возникла ошибка 48. Попробуйте изменить запрос.")
+        if "scsearch" in query_or_url:
+            sc_called = True
+            mock_audio = MagicMock()
+            mock_audio.title = "револьвер"
+            mock_audio.artist = "DJ ZUP RAlii"
+            mock_audio.duration = 72
+            mock_audio.file_path = MagicMock()
+            mock_audio.thumbnail_path = None
+            mock_audio.album = None
+            mock_audio.perf_timings = {}
+            mock_audio.cleanup = MagicMock()
+            return mock_audio
+        raise RuntimeError(f"Unknown query: {query_or_url}")
+
+    with patch("services.downloader._sync_download", side_effect=mock_sync), \
+         patch("services.downloader._build_fallback_queries", return_value=["DJ ZUP RAlii револьвер"]):
+        audio = await download_track(
+            query_or_url="ytsearch5:DJ ZUP RAlii - револьвер",
+            custom_title="револьвер",
+            custom_artist="DJ ZUP RAlii",
+            expected_duration=72
+        )
+        assert sc_called is True
+        assert audio is not None
+        assert audio.title == "револьвер"

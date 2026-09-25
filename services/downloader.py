@@ -1870,14 +1870,77 @@ def _sync_download(
                             retry_cand_opts = dict(cand_dl_opts)
                             retry_cand_opts.pop("cookiefile", None)
                             retry_cand_opts.pop("extractor_args", None)
+
+                            retry_cancel_event = threading.Event()
+                            retry_deadline = time.perf_counter() + t_retry_remain
+
+                            def retry_p_hook(d):
+                                if cancel_event and cancel_event.is_set():
+                                    raise RuntimeError("Download cancelled by user")
+                                if retry_cancel_event.is_set() or time.perf_counter() > retry_deadline:
+                                    retry_cancel_event.set()
+                                    raise TimeoutError(f"Candidate #{cand_idx+1} retry exceeded candidate deadline")
+                                if d.get("status") == "downloading":
+                                    if progress_callback:
+                                        tot = d.get("total_bytes") or d.get("total_bytes_estimate")
+                                        dl = d.get("downloaded_bytes") or 0
+                                        if tot and tot > 0:
+                                            pct = max(0, min(100, int(dl / tot * 100)))
+                                            try:
+                                                progress_callback("downloading", pct)
+                                            except Exception:
+                                                pass
+                                elif d.get("status") == "finished":
+                                    if progress_callback:
+                                        try:
+                                            progress_callback("downloading", 100)
+                                        except Exception:
+                                            pass
+
+                            def retry_pp_hook(d):
+                                if cancel_event and cancel_event.is_set():
+                                    raise RuntimeError("Download cancelled by user")
+                                if retry_cancel_event.is_set() or time.perf_counter() > retry_deadline:
+                                    retry_cancel_event.set()
+                                    raise TimeoutError(f"Candidate #{cand_idx+1} retry exceeded candidate deadline")
+                                if d.get("status") == "started":
+                                    if progress_callback:
+                                        try:
+                                            progress_callback("processing", 100)
+                                        except Exception:
+                                            pass
+
+                            retry_cand_opts["progress_hooks"] = [retry_p_hook]
+                            retry_cand_opts["postprocessor_hooks"] = [retry_pp_hook]
+
                             try:
-                                res_info = _extract_info_with_timeout(
-                                    ydl_opts=retry_cand_opts,
-                                    url=target_url,
-                                    timeout_sec=t_retry_remain,
-                                    cand_cancel_event=cand_cancel_event,
-                                    parent_cancel_event=cancel_event
-                                )
+                                try:
+                                    res_info = _extract_info_with_timeout(
+                                        ydl_opts=retry_cand_opts,
+                                        url=target_url,
+                                        timeout_sec=t_retry_remain,
+                                        cand_cancel_event=retry_cancel_event,
+                                        parent_cancel_event=cancel_event
+                                    )
+                                except Exception as first_retry_err:
+                                    err_first_str = str(first_retry_err).lower()
+                                    rem_after_first = t_global_deadline - time.perf_counter() - GLOBAL_SC_FALLBACK_RESERVE
+                                    if any(k in err_first_str for k in ["403", "forbidden", "format", "unavailable"]) and rem_after_first >= MIN_RETRY_TIME_REMAINING:
+                                        print(f"{req_tag}[DOWNLOADER] Ошибка 403 при основном формате (140/251). Пробуем альтернативный аудиопоток без SABR-блокировки...", flush=True)
+                                        alt_cand_opts = dict(retry_cand_opts)
+                                        alt_cand_opts["format"] = "ba[format_id!*=140][format_id!*=251]/ba[ext=m4a]/ba"
+                                        retry_cancel_event.clear()
+                                        alt_deadline = time.perf_counter() + min(CANDIDATE_DOWNLOAD_TIMEOUT, rem_after_first)
+                                        retry_deadline = alt_deadline
+                                        res_info = _extract_info_with_timeout(
+                                            ydl_opts=alt_cand_opts,
+                                            url=target_url,
+                                            timeout_sec=min(CANDIDATE_DOWNLOAD_TIMEOUT, rem_after_first),
+                                            cand_cancel_event=retry_cancel_event,
+                                            parent_cancel_event=cancel_event
+                                        )
+                                    else:
+                                        raise first_retry_err
                                 audio_files = _find_or_convert_candidate_audio(cand_dir, cand_idx, cand_title, req_tag=req_tag)
                                 if not audio_files and output_dir.exists():
                                     direct_audio = _find_or_convert_candidate_audio(output_dir, cand_idx, cand_title, req_tag=req_tag)
@@ -2265,7 +2328,16 @@ def _sync_download(
             try:
                 info = _execute_extraction(ydl_opts_retry)
             except Exception as retry_err:
-                return _fallback_direct_search(retry_err)
+                if any(k in str(retry_err).lower() for k in ["403", "forbidden", "format", "unavailable"]):
+                    print(f"[DOWNLOADER] Ошибка 403 при чистом запуске прямой ссылки. Пробуем альтернативный аудиопоток...", flush=True)
+                    ydl_opts_alt = dict(ydl_opts_retry)
+                    ydl_opts_alt["format"] = "ba[format_id!*=140][format_id!*=251]/ba[ext=m4a]/ba"
+                    try:
+                        info = _execute_extraction(ydl_opts_alt)
+                    except Exception as alt_err:
+                        return _fallback_direct_search(alt_err)
+                else:
+                    return _fallback_direct_search(retry_err)
         else:
             return _fallback_direct_search(extract_err)
     log_memory_stage("after yt-dlp", req_id=request_id, source="youtube" if is_youtube else "soundcloud")
@@ -2684,7 +2756,7 @@ async def download_track(
 
         # 2. Fallback в SoundCloud (выбирает полный трек среди лучших вариантов запроса)
         # Применяется для сторонних каталогов (Spotify, Apple Music и др.) либо если исходный запрос не был прямым YouTube
-        can_try_sc = not is_direct_yt and (is_apple_music or not query_or_url.startswith(("ytsearch", "scsearch")))
+        can_try_sc = not is_direct_yt and (is_apple_music or bool(custom_artist and custom_title) or not query_or_url.startswith(("ytsearch", "scsearch")))
         if can_try_sc:
             for fb_q in fallback_queries[:2]:
                 try:
