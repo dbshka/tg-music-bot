@@ -170,7 +170,7 @@ def test_build_singbox_config():
 
 def test_start_vless_proxy_noop_when_no_env():
     with patch("services.vless_proxy.config.VLESS_URL", None), \
-         patch.dict("os.environ", {}, clear=False):
+         patch.dict("os.environ", {"VLESS_URL": "", "YOUTUBE_VLESS_URL": ""}):
         proc = start_vless_proxy()
         assert proc is None
 

@@ -29,6 +29,18 @@ RUSSIAN_SOCKS_PORT = 10809
 DEFAULT_SOCKS_PORT = FOREIGN_SOCKS_PORT
 
 
+def _safe_log_print(msg: str) -> None:
+    """Выводит лог в stdout, устойчиво к кодировкам терминала (Windows cp1251 и др.)."""
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        try:
+            print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
+
+
+
 def is_valid_remote_server(server: str, port: int) -> bool:
     """
     Проверяет, что сервер не является локальной заглушкой (0.0.0.0, 127.0.0.1, localhost, ::1)
@@ -425,7 +437,7 @@ def _start_singbox_instance(
 
     bin_path = ensure_singbox_binary()
     if not bin_path:
-        print(f"[VLESS-{name}] ❌ Бинарник sing-box не найден в системе. Прокси не запущен.", flush=True)
+        _safe_log_print(f"[VLESS-{name}] ❌ Бинарник sing-box не найден в системе. Прокси не запущен.")
         return None
 
     try:
@@ -465,7 +477,7 @@ def _start_singbox_instance(
         while time.time() - start_t < timeout_secs:
             if proc.poll() is not None:
                 err = proc.stderr.read() if proc.stderr else "unknown error"
-                print(f"[VLESS-{name}] ❌ Ошибка: процесс sing-box завершился преждевременно: {err}", flush=True)
+                _safe_log_print(f"[VLESS-{name}] ❌ Ошибка: процесс sing-box завершился преждевременно: {err}")
                 return None
             if is_port_open(socks_host, socks_port):
                 listener_ready = True
@@ -473,7 +485,7 @@ def _start_singbox_instance(
             time.sleep(0.2)
 
         if not listener_ready:
-            print(f"[VLESS-{name}] ⚠️ sing-box не открыл порт SOCKS5 за {timeout_secs}с на {socks_host}:{socks_port}", flush=True)
+            _safe_log_print(f"[VLESS-{name}] ⚠️ sing-box не открыл порт SOCKS5 за {timeout_secs}с на {socks_host}:{socks_port}")
             _stop_process_internal(proc, config_filename)
             return None
 
@@ -482,16 +494,16 @@ def _start_singbox_instance(
         # 2. Проверка реального outbound-соединения в интернет через VLESS
         outbound_ok, ext_info = verify_outbound_connectivity(socks_host, socks_port, timeout=5.0)
         if outbound_ok:
-            print(f"[VLESS-{name}] ✅ VLESS outbound connection established! Внешний выходной IP: {ext_info} (сервер: {server_info})", flush=True)
+            _safe_log_print(f"[VLESS-{name}] ✅ VLESS outbound connection established! Внешний выходной IP: {ext_info} (сервер: {server_info})")
             return proc
         else:
-            print(f"[VLESS-{name}] ⚠️ VLESS outbound connection NOT established ({ext_info}). Удалённый сервер {server_info} не отвечает.", flush=True)
-            print(f"[VLESS-{name}] Отключение неработающего прокси во избежание сбоев.", flush=True)
+            _safe_log_print(f"[VLESS-{name}] ⚠️ VLESS outbound connection NOT established ({ext_info}). Удалённый сервер {server_info} не отвечает.")
+            _safe_log_print(f"[VLESS-{name}] Отключение неработающего прокси во избежание сбоев.")
             _stop_process_internal(proc, config_filename)
             return None
 
     except Exception as e:
-        print(f"[VLESS-{name}] ❌ Ошибка инициализации: {e}", flush=True)
+        _safe_log_print(f"[VLESS-{name}] ❌ Ошибка инициализации: {e}")
         return None
 
 
@@ -600,7 +612,7 @@ def start_vless_proxy(
             try:
                 start_russian_vless_proxy(socks_host=socks_host, socks_port=RUSSIAN_SOCKS_PORT, timeout_secs=timeout_secs)
             except Exception as e:
-                print(f"[VLESS-Russian] ⚠️ Ошибка автозапуска российского VLESS: {e}", flush=True)
+                _safe_log_print(f"[VLESS-Russian] ⚠️ Ошибка автозапуска российского VLESS: {e}")
 
     return foreign_proc
 
