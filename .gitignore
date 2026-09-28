@@ -1,27 +1,56 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 venv/
-.env
-# cookies.txt included for deployment
-*.db
-bot_database.db
+.venv/
+env/
 
-# Загрузки и временные файлы
+# Environment and secrets
+.env
+.env.*
+!.env.example
+cookies.txt
+*cookies*.txt
+*.session
+*.session-journal
+
+# Database & Runtime Cache (never delete or commit)
+*.db
+*.sqlite
+*.sqlite3
+bot_database.db
+bot_cache.db
+music_bot.db
+
+# Downloads & Temporary media files
 downloads/
 *.mp3
 *.webm
 *.m4a
 *.webp
+*.ogg
+*.wav
+*.flac
 
-# Разрешаем логотипы проекта
-!logo*.png
-!logo*.jpg
+# Logs & Diagnostics
+*.log
+.pytest_cache/
+*_AUDIT.md
+*audit*.md
 
-# IDE
+# IDE & Editor files
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local VPN binaries & configurations (sensitive)
 .bin/
-# Local VPN configs (sensitive)
 xray*.json
 vless_nodes*.txt
