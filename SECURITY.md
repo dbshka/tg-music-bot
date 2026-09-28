@@ -4,7 +4,7 @@
 
 Если вы обнаружили потенциальную уязвимость безопасности в проекте **Telegram Music Bot**, пожалуйста, не создавайте публичный Issue на GitHub.
 
-Вместо этого свяжитесь с владельцем репозитория через приватные каналы связи или откройте приватный [GitHub Security Advisory](https://github.com/dbshka/tg-music-bot/security/advisories/new).
+Вместо этого свяжитесь с автором проекта (maintainer: [dbshka](https://github.com/dbshka)) через приватные каналы связи или откройте приватный [GitHub Security Advisory](https://github.com/dbshka/tg-music-bot/security/advisories/new).
 
 ---
 
