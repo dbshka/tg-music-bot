@@ -12,7 +12,7 @@
 
 1. **Telegram Bot Token**:
    - Никогда не коммитьте и не передавайте третьим лицам ваш `BOT_TOKEN`.
-   - Храните токен исключительно в файле `.env` или в переменных окружения хостинга (например, Environment Variables в Render / Hugging Face).
+   - Храните токен исключительно в файле `.env` или в переменных окружения хостинга (например, Environment Variables в Render).
    - В случае компрометации немедленно отзовите токен в [@BotFather](https://t.me/BotFather) командой `/revoke`.
 
 2. **Файлы Cookies (`cookies.txt`)**:
