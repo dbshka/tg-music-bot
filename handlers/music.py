@@ -365,6 +365,13 @@ def format_download_error(e: Exception, track_info: Optional[ExtractedTrack] = N
     err_str = str(e)
     if err_str.startswith("⚠️"):
         err_str = err_str.replace("⚠️ ", "").strip()
+    if track_info and track_info.platform == "Spotify":
+        for code in (47, 48):
+            if err_str.startswith(f"Возникла ошибка {code}."):
+                return (
+                    f"Возникла ошибка {code}. Трек распознан в Spotify, но подходящий источник аудио не найден. "
+                    "Если у вас есть прямая ссылка на ту же запись в YouTube или SoundCloud, пришлите её."
+                )
     if err_str.startswith("Возникла ошибка"):
         return err_str
 

@@ -10,6 +10,99 @@ from handlers.music import _execute_download_and_send, format_download_error
 HORSE_STEPPIN_URL = "https://open.spotify.com/track/2rYZETHlA6JTDbbkAWj9jD?si=e77c46346ffe40e1"
 
 
+def test_late_fragment_is_safe_after_request_directory_is_removed(monkeypatch, tmp_path):
+    import shutil
+    import threading
+    import time
+    from pathlib import Path
+    from services import downloader
+
+    request_dir = tmp_path / "request"
+    candidate = request_dir / "sc_cand_2"
+    candidate.mkdir(parents=True)
+    release_writer = threading.Event()
+    worker_finished = threading.Event()
+    timed_out = threading.Event()
+    written = []
+
+    def fake_ydl(options):
+        directory = Path(options["outtmpl"]).parent
+
+        def extract_info(_url, download):
+            assert download
+            try:
+                assert release_writer.wait(2)
+                (directory / "audio.m4a.part-Frag8.part").write_bytes(b"fragment")
+                with pytest.raises(TimeoutError, match="cancelled"):
+                    options["progress_hooks"][0]({"status": "downloading"})
+                written.append(directory)
+                return {}
+            finally:
+                worker_finished.set()
+
+        fake = MagicMock()
+        fake.__enter__.return_value = fake
+        fake.extract_info.side_effect = extract_info
+        return fake
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", fake_ydl)
+    try:
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            downloader._extract_info_with_timeout(
+                {"outtmpl": str(candidate / "%(title)s.%(ext)s")}, "track", 0.1, timed_out
+            )
+        assert timed_out.is_set()
+        shutil.rmtree(request_dir)
+    finally:
+        release_writer.set()
+    assert worker_finished.wait(2)
+    assert written and written[0].parent == tmp_path
+    deadline = time.monotonic() + 2
+    while written[0].exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not written[0].exists()
+
+
+def test_soundcloud_fallback_ranks_empty_search_and_skips_similar_title(monkeypatch, tmp_path):
+    from pathlib import Path
+    from services import downloader
+
+    artist = "神保 伸太郎"
+    title = "Kokuu no Shisya"
+    wrong = {
+        "title": "Kokuu no Meikyuu ~type gamma~", "duration": 221,
+        "uploader": "Unknown channel", "url": "https://soundcloud.com/example/wrong",
+    }
+    exact = {
+        "title": title, "duration": 221, "artist": artist,
+        "url": "https://soundcloud.com/example/exact",
+    }
+    attempted = []
+
+    def fake_extract(options, target, download):
+        if download:
+            attempted.append(target)
+            (Path(options["outtmpl"]).parent / "audio.m4a").write_bytes(b"test audio")
+            return exact
+        return {"entries": [wrong, exact] if target.startswith("scsearch4:") else []}
+
+    def fake_ydl(options):
+        ydl = MagicMock()
+        ydl.__enter__.return_value = ydl
+        ydl.extract_info.side_effect = lambda target, download: fake_extract(options, target, download)
+        return ydl
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", fake_ydl)
+    request_dir = tmp_path / "downloads" / "request"
+    request_dir.mkdir(parents=True)
+    result = downloader._sync_download(
+        "ytsearch5:神保 伸太郎 - Kokuu no Shisya", request_dir,
+        custom_title=title, custom_artist=artist, expected_duration=221, is_apple_music=True,
+    )
+    assert result.title == title
+    assert attempted == [exact["url"]]
+
+
 @pytest.mark.asyncio
 async def test_spotify_keeps_title_and_artist_if_optional_enrichment_times_out(monkeypatch):
     from services import extractor

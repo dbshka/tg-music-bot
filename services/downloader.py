@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import unicodedata
@@ -529,29 +530,55 @@ def _extract_info_with_timeout(
     cand_cancel_event: threading.Event,
     parent_cancel_event: Optional[threading.Event] = None
 ) -> dict:
-    """
-    Выполняет вызов yt_dlp.YoutubeDL.extract_info(url, download=True) с жестким ограничением по времени.
-    В случае превышения лимита времени или отмены пользователем, немедленно прерывает ожидание,
-    устанавливает cand_cancel_event и завершает фоновый поток без блокировки вызывающего воркера.
-    """
+    """Bound the wait and keep in-flight files outside the request's cleanup directory."""
     if parent_cancel_event and parent_cancel_event.is_set():
         raise RuntimeError("Download cancelled by user")
     if timeout_sec <= 0:
         cand_cancel_event.set()
         raise TimeoutError("Candidate timeout budget exhausted before start")
 
+    output_template = Path(ydl_opts["outtmpl"])
+    destination = output_template.parent
+    # destination is <downloads>/<request>/<candidate>. Request cleanup must not
+    # remove files while yt-dlp or a postprocessor still has them open.
+    workspace = Path(tempfile.mkdtemp(prefix=".active-candidate-", dir=destination.parent.parent))
+    options = dict(ydl_opts, outtmpl=str(workspace / output_template.name))
+
+    def check_cancelled(_status=None):
+        if parent_cancel_event and parent_cancel_event.is_set():
+            raise RuntimeError("Download cancelled by user")
+        if cand_cancel_event.is_set():
+            raise TimeoutError("Candidate download cancelled after timeout")
+
+    for hook_name in ("progress_hooks", "postprocessor_hooks"):
+        options[hook_name] = [check_cancelled, *(options.get(hook_name) or [])]
+
     def _worker():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        check_cancelled()
+        with yt_dlp.YoutubeDL(options) as ydl:
             return ydl.extract_info(url, download=True)
 
+    def cleanup(_future=None):
+        shutil.rmtree(workspace, ignore_errors=True)
+
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
     try:
         future = executor.submit(_worker)
-        return future.result(timeout=timeout_sec)
+        result = future.result(timeout=timeout_sec)
     except concurrent.futures.TimeoutError:
         cand_cancel_event.set()
         raise TimeoutError(f"Candidate download exceeded timeout ({timeout_sec:.1f}s)")
+    else:
+        check_cancelled()
+        for item in workspace.iterdir():
+            shutil.move(str(item), destination / item.name)
+        return result
     finally:
+        if future is None:
+            cleanup()
+        else:
+            future.add_done_callback(cleanup)
         executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -1484,27 +1511,22 @@ def _sync_download(
             youtube_blocked = False
             best_fallback_info = None
 
-            if not entries:
-                ranked_candidates = []
-            else:
-                t_c0 = time.perf_counter()
+            def _candidate_penalty(e):
+                return compute_candidate_penalty(
+                    candidate=e,
+                    custom_artist=custom_artist,
+                    custom_title=custom_title,
+                    expected_duration=expected_duration,
+                    requested_modifiers=requested_modifiers,
+                    is_text_input=is_text_input,
+                    is_apple_music=is_apple_music,
+                    source=source,
+                    clean_search=clean_search
+                )
 
-                def _candidate_penalty(e):
-                    return compute_candidate_penalty(
-                        candidate=e,
-                        custom_artist=custom_artist,
-                        custom_title=custom_title,
-                        expected_duration=expected_duration,
-                        requested_modifiers=requested_modifiers,
-                        is_text_input=is_text_input,
-                        is_apple_music=is_apple_music,
-                        source=source,
-                        clean_search=clean_search
-                    )
-
-                ranked_candidates = sorted(entries, key=_candidate_penalty)
-                t_c1 = time.perf_counter()
-                perf_timings["candidate_selection"] += (t_c1 - t_c0)
+            t_c0 = time.perf_counter()
+            ranked_candidates = sorted(entries, key=_candidate_penalty)
+            perf_timings["candidate_selection"] += time.perf_counter() - t_c0
 
             # 3. Цикл скачивания лучших кандидатов с принципом гарантированной доставки (Zero False Negatives)
             t_global_deadline = t_start_all + GLOBAL_EXTRACTION_TIMEOUT
@@ -2049,7 +2071,7 @@ def _sync_download(
 
             # Экстренный поиск в SoundCloud (запрещён для прямых ссылок YouTube!)
             is_direct_yt = bool(("youtube.com" in query_or_url or "youtu.be" in query_or_url) and not query_or_url.startswith("ytsearch"))
-            if not has_usable_candidate and not is_direct_yt:
+            if not has_usable_candidate and not is_direct_yt and time.perf_counter() < t_global_deadline:
                 print(f"{req_tag}[DOWNLOADER] Экстренный Fallback: поиск трека '{clean_search}' в SoundCloud...", flush=True)
                 try:
                     sc_opts = dict(options)
@@ -2092,7 +2114,26 @@ def _sync_download(
                                     print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{s_title}' отклонён до загрузки: {sc_r_reason}", flush=True)
                                     continue
 
+                                # Catalog fallback should not spend a download on a
+                                # partial title match from an unconfirmed artist.
+                                if is_apple_music and custom_artist and core_title_words:
+                                    title_match = compute_title_match_ratio(s_title, core_title_words)
+                                    artist_match = validate_candidate_artist(
+                                        expected_artist=custom_artist,
+                                        candidate_title=s_title,
+                                        candidate_uploader=s_cand.get("uploader"),
+                                        candidate_channel=s_cand.get("channel"),
+                                        expected_title=custom_title,
+                                        candidate_artist=s_cand.get("artist") or s_cand.get("creator"),
+                                    )
+                                    if title_match < (0.5 if artist_match else 0.75):
+                                        print(f"{req_tag}[AUTHENTICITY] SoundCloud кандидат '{s_title}' отклонён: слабое совпадение названия ({title_match:.2f})", flush=True)
+                                        continue
+
                                 if s_url:
+                                    sc_remain = t_global_deadline - time.perf_counter()
+                                    if sc_remain <= 0:
+                                        break
                                     sc_token = uuid.uuid4().hex[:6]
                                     sc_cand_dir = output_dir / f"sc_cand_{s_idx}_{sc_token}"
                                     sc_cand_dir.mkdir(parents=True, exist_ok=True)
@@ -2131,8 +2172,7 @@ def _sync_download(
                                         sc_opts_dl["progress_hooks"] = [sc_p_hook]
                                         sc_opts_dl["postprocessor_hooks"] = [sc_pp_hook]
                                     try:
-                                        sc_remain = max(2.0, t_global_deadline - time.perf_counter())
-                                        sc_timeout = min(10.0, sc_remain)
+                                        sc_timeout = min(CANDIDATE_DOWNLOAD_TIMEOUT, sc_remain)
                                         sc_cand_cancel = threading.Event()
                                         res_cand = _extract_info_with_timeout(
                                             ydl_opts=sc_opts_dl,
