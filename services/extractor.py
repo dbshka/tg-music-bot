@@ -37,6 +37,10 @@ from services.yandex_vk import resolve_yandex_music_track, resolve_vk_music_trac
 
 logger = logging.getLogger(__name__)
 
+# Chat handlers allow 10 seconds for URL resolution, including URL checks.
+SPOTIFY_METADATA_BUDGET = 9.0
+SPOTIFY_ENRICHMENT_TIMEOUT = 2.0
+
 UNSUPPORTED_URL_FALLBACK_TEXT = (
     "Возникла ошибка 24.\n\n"
     "Поддерживаются:\n"
@@ -374,13 +378,18 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
     if not clean_q or len(clean_q) < 2:
         return None
 
+    cache_key = f"canonical:{' '.join(clean_q.split()).casefold()}"
+    cached = _get_cached_extracted_track(cache_key)
+    if cached is not None:
+        return cached
+
     session = get_shared_session()
 
     # 1. Приоритетный поиск в Deezer API (< 200 мс) - чистейший студийный каталог без каверов
     try:
         d_artist, d_title, d_cover, d_dur = await _search_deezer(session, clean_q)
         if d_artist and d_title and d_dur:
-            return ExtractedTrack(
+            track = ExtractedTrack(
                 platform="Canonical/Deezer",
                 target=f"ytsearch5:{d_artist} - {d_title}",
                 is_search=True,
@@ -389,6 +398,8 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
                 thumbnail_url=d_cover,
                 duration=d_dur
             )
+            _set_cached_extracted_track(cache_key, track)
+            return track
     except Exception as ex:
         logger.debug("Ошибка канонического поиска Deezer: %s", ex)
 
@@ -396,7 +407,7 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
     try:
         it_artist, it_title, it_cover, it_dur = await _search_itunes_track(session, clean_q)
         if it_artist and it_title and it_dur:
-            return ExtractedTrack(
+            track = ExtractedTrack(
                 platform="Canonical/iTunes",
                 target=f"ytsearch5:{it_artist} - {it_title}",
                 is_search=True,
@@ -405,6 +416,8 @@ async def resolve_canonical_track_info_async(query: str) -> Optional[ExtractedTr
                 thumbnail_url=it_cover,
                 duration=it_dur
             )
+            _set_cached_extracted_track(cache_key, track)
+            return track
     except Exception as ex:
         logger.debug("Ошибка канонического поиска iTunes: %s", ex)
 
@@ -550,11 +563,8 @@ async def _extract_spotify_embed_metadata(track_id: str, session: aiohttp.Client
     try:
         spotify_track_url = f"https://open.spotify.com/track/{track_id}"
         m_artist, m_title, m_cover = await _extract_microlink_metadata(spotify_track_url, session)
-        if m_title and m_artist:
-            m_duration = None
-            if not has_track_modifiers(m_title):
-                _, _, _, m_duration = await _search_itunes_track(session, f"{m_artist} {m_title}")
-            return m_artist, m_title, m_cover, m_duration
+        if m_title:
+            return m_artist, m_title, m_cover, None
     except Exception as ex:
         logger.debug("Ошибка Microlink fallback для Spotify: %s", ex)
 
@@ -576,6 +586,7 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
     artist = None
     thumbnail_url = None
     duration = None
+    deadline = time.monotonic() + SPOTIFY_METADATA_BUDGET
 
     # 1. Приоритетное извлечение через Embed API (с поддержкой Microlink)
     if track_id:
@@ -589,11 +600,14 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
         thumbnail_url = thumbnail_url or m_cover
 
     # 3. Резервный опрос oEmbed
-    if not (title and artist):
+    remaining = deadline - time.monotonic()
+    if not (title and (artist or thumbnail_url)) and remaining > 0:
         try:
             oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(clean_url)}"
             headers = {"User-Agent": "Mozilla/5.0"}
-            async with session.get(oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
+            async with session.get(
+                oembed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=min(2.5, remaining))
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     oe_raw = data.get("title")
@@ -605,9 +619,17 @@ async def extract_spotify_info(url: str, session: aiohttp.ClientSession) -> Opti
 
     # 4. Резервный поиск канонического эталона через Deezer / iTunes
     # ВНИМАНИЕ: только если трек НЕ является модификацией (slowed, sped up, remix и т.д.)
-    if title and (not artist or not duration) and not has_track_modifiers(title):
+    remaining = deadline - time.monotonic()
+    if title and (not artist or not duration) and not has_track_modifiers(title) and remaining > 0:
         search_q = f"{artist} {title}" if artist else title
-        canonical = await resolve_canonical_track_info_async(search_q)
+        try:
+            canonical = await asyncio.wait_for(
+                resolve_canonical_track_info_async(search_q),
+                timeout=min(SPOTIFY_ENRICHMENT_TIMEOUT, remaining),
+            )
+        except asyncio.TimeoutError:
+            canonical = None
+            logger.info("Spotify metadata enrichment timed out for track %s", track_id)
         if canonical:
             artist = artist or canonical.artist
             title = title or canonical.title
@@ -866,19 +888,30 @@ async def resolve_track_url(url: str, session: Optional[aiohttp.ClientSession] =
     - SoundCloud -> oEmbed метаданные + прямая загрузка (с автоматическим Fallback)
     - VK, Bandcamp и др. -> прямая загрузка через yt-dlp
     """
-    if session is None:
-        session = get_shared_session()
+    url = url.strip()
+    spotify_track = re.fullmatch(
+        r"https?://open\.spotify\.com/(?:intl-[a-z-]+/)?track/([a-z0-9]+)/?(?:[?#]\S*)?",
+        url, flags=re.IGNORECASE,
+    )
+    if spotify_track:
+        url = f"https://open.spotify.com/track/{spotify_track.group(1)}"
+        cached = _get_cached_extracted_track(f"url:{url}")
+        if cached is not None:
+            return cached
 
-    # 0. Проверка безопасности URL (SSRF)
-    is_safe, reason = is_safe_url(url)
+    is_safe, _ = await asyncio.to_thread(is_safe_url, url)
     if not is_safe:
         raise ValueError("Возникла ошибка 25. Проверьте ссылку и попробуйте ещё раз.")
 
-    # Автоматическое безопасное раскрытие коротких ссылок
-    url = await _unshorten_url(url, session)
-    is_safe_after, reason_after = is_safe_url(url)
-    if not is_safe_after:
-        raise ValueError("Возникла ошибка 26. Проверьте ссылку и попробуйте ещё раз.")
+    if session is None:
+        session = get_shared_session()
+    if not spotify_track:
+        resolved_url = await _unshorten_url(url, session)
+        if resolved_url != url:
+            is_safe_after, _ = await asyncio.to_thread(is_safe_url, resolved_url)
+            if not is_safe_after:
+                raise ValueError("Возникла ошибка 26. Проверьте ссылку и попробуйте ещё раз.")
+        url = resolved_url
 
     clean_url_key = f"url:{url.strip()}"
     cached = _get_cached_extracted_track(clean_url_key)

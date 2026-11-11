@@ -39,8 +39,8 @@ async def test_resolve_track_url_ttl_cache_prevents_duplicate_network_calls():
         duration=200
     ))
 
-    with patch("services.extractor.is_safe_url", return_value=(True, "OK")), \
-         patch("services.extractor._unshorten_url", new=AsyncMock(side_effect=lambda u, s: u)), \
+    with patch("services.extractor.is_safe_url", return_value=(True, "OK")) as verify_url, \
+         patch("services.extractor._unshorten_url", new=AsyncMock(side_effect=lambda u, s: u)) as unshorten, \
          patch("services.extractor._resolve_track_url_inner", new=mock_inner):
 
         url = "https://open.spotify.com/track/test12345"
@@ -50,9 +50,74 @@ async def test_resolve_track_url_ttl_cache_prevents_duplicate_network_calls():
         assert mock_inner.call_count == 1
 
         # Second call: must be served from in-memory TTL cache without calling inner resolver
-        res2 = await resolve_track_url(url)
+        res2 = await resolve_track_url("https://open.spotify.com/intl-en/track/test12345?si=share")
         assert res2.title == "Test Title"
         assert mock_inner.call_count == 1  # Still 1! No second network lookup!
+        verify_url.assert_called_once_with(url)
+        unshorten.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repeated_canonical_search_reuses_catalog_result(monkeypatch):
+    from services import extractor
+
+    clear_extracted_cache()
+    catalog = AsyncMock(return_value=("Sun Araw", "Horse Steppin’", None, 628))
+    monkeypatch.setattr(extractor, "_search_deezer", catalog)
+    monkeypatch.setattr(extractor, "get_shared_session", MagicMock())
+    first = await extractor.resolve_canonical_track_info_async("Sun Araw Horse Steppin’")
+    second = await extractor.resolve_canonical_track_info_async("sun araw  horse steppin’")
+
+    assert first.duration == second.duration == 628
+    catalog.assert_awaited_once()
+    clear_extracted_cache()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_failure", [None, "flood_control", "invalid_id"])
+async def test_youtube_local_hit_skips_cloud_and_only_bad_file_ids_redownload(monkeypatch, send_failure):
+    from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+    from aiogram.methods import SendAudio
+    from handlers import music
+
+    url = "https://www.youtube.com/watch?v=testVideo01"
+    status = MagicMock(edit_text=AsyncMock(), delete=AsyncMock())
+    message = MagicMock(from_user=None, reply=AsyncMock(return_value=status), answer_audio=AsyncMock())
+    track = ExtractedTrack("YouTube / YouTube Music", url, False, title="Track", artist="Artist", duration=180)
+    local_cache = AsyncMock(return_value=dict(file_id="stored-file-id", title="Track", artist="Artist", duration=180))
+    cloud_cache = AsyncMock()
+    invalidate = AsyncMock()
+    download = AsyncMock(side_effect=ValueError("simulated download attempt"))
+    monkeypatch.setattr(music, "resolve_track_url", AsyncMock(return_value=track))
+    monkeypatch.setattr(music, "get_cached_track_async", local_cache)
+    monkeypatch.setattr(music, "get_persistent_track_async", cloud_cache)
+    monkeypatch.setattr(music, "invalidate_cached_file_id_async", invalidate)
+    monkeypatch.setattr(music, "invalidate_persistent_track_async", AsyncMock())
+    monkeypatch.setattr(music, "download_track", download)
+    monkeypatch.setattr(music.ChatActionSender, "upload_voice", MagicMock())
+
+    method = SendAudio(chat_id=1, audio="stored-file-id")
+    if send_failure == "flood_control":
+        message.answer_audio.side_effect = TelegramRetryAfter(method, "Flood control exceeded", 2)
+    elif send_failure == "invalid_id":
+        message.answer_audio.side_effect = TelegramBadRequest(method, "wrong file identifier")
+
+    await music._execute_download_and_send(message, url, url=url)
+
+    local_cache.assert_awaited_once_with(url, variant="original")
+    cloud_cache.assert_not_awaited()
+    message.answer_audio.assert_awaited_once()
+    if send_failure == "invalid_id":
+        invalidate.assert_awaited_once_with("stored-file-id")
+        download.assert_awaited_once()
+        status.delete.assert_not_awaited()
+    else:
+        invalidate.assert_not_awaited()
+        download.assert_not_awaited()
+        if send_failure:
+            assert "Возникла ошибка 6." in status.edit_text.await_args.args[0]
+        else:
+            status.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio

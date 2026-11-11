@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import time
-import traceback
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -23,7 +22,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.utils.chat_action import ChatActionSender
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from config import MAX_FILE_SIZE_BYTES
 from services.extractor import (
@@ -47,6 +46,8 @@ from services.database import (
     log_user_activity_async,
     increment_user_download_async,
     get_cached_track_async,
+    delete_cached_track_async,
+    normalize_cache_key,
     save_cached_track_async,
     invalidate_cached_file_id_async
 )
@@ -63,7 +64,7 @@ from services.persistent_cache import (
     invalidate_persistent_track_async,
     check_metadata_match,
 )
-from handlers.inline import is_valid_telegram_file_id
+from handlers.inline import is_unusable_file_id_error, is_valid_telegram_file_id
 from handlers.tag_editor import get_audio_edit_keyboard
 
 logger = logging.getLogger(__name__)
@@ -380,7 +381,7 @@ def format_download_error(e: Exception, track_info: Optional[ExtractedTrack] = N
         return "Возникла ошибка 4. Попробуйте другой трек."
     if any(k in err_lower for k in ("not available in your country", "uploader has not made this video available", "geo-restricted", "georestricted", "blocked in your country")):
         return "Возникла ошибка 5. Попробуйте другой источник."
-    if any(k in err_lower for k in ("confirm you're not a bot", "automated queries", "too many requests", "http error 429", "bot-check", "bot check")):
+    if isinstance(e, TelegramRetryAfter) or any(k in err_lower for k in ("confirm you're not a bot", "automated queries", "too many requests", "http error 429", "bot-check", "bot check")):
         return "Возникла ошибка 6. Попробуйте ещё раз через некоторое время."
     if any(k in err_lower for k in ("format is not available", "requested format", "no audio stream", "format not available")):
         return "Возникла ошибка 7. Попробуйте другой трек или отправьте название текстом."
@@ -478,6 +479,21 @@ class DownloadProgressUpdater:
         self._closed = True
 
 
+def _cached_audio_mismatch(cached, variant, expected_duration):
+    cached_duration = cached.get("duration") or 0
+    cached_modifiers = extract_modifiers(f"{cached.get('title') or ''} {cached.get('artist') or ''}")
+    if variant == "original":
+        if expected_duration and cached_duration > 0 and abs(cached_duration - expected_duration) > 4:
+            return "duration mismatch"
+        if cached_modifiers:
+            return "unexpected version"
+    elif not is_candidate_matching_modifiers(
+        extract_modifiers(variant), cached_modifiers | extract_modifiers(cached.get("variant"))
+    ):
+        return "version mismatch"
+    return None
+
+
 async def _execute_download_and_send(
     message: Message,
     raw_query: str,
@@ -506,6 +522,8 @@ async def _execute_download_and_send(
         cache_key = raw_query.lower()
 
     downloaded_audio = None
+    track_info = None
+    stage = "metadata"
     t_cleanup = 0.0
     status_msg = None
     progress_updater = None
@@ -585,15 +603,35 @@ async def _execute_download_and_send(
         print(f"[MUSIC][request_id={req_id}] metadata SUCCESS in {t_metadata*1000:.1f}ms platform='{track_info.platform}' target='{track_info.target}' duration={track_info.duration}s", flush=True)
 
         source_key, source_type, source_id = build_source_key(url or track_info.target)
+        is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "tiktok.com")))
+        has_canonical_dur = bool(track_info.duration and track_info.duration > 35)
+        is_apple_music = track_info.platform in ("Apple Music", "Spotify", "Canonical/Deezer", "Canonical/iTunes", "Yandex Music", "VK Music")
+        is_text_input = not url
+        expected_cache_duration = track_info.duration if has_canonical_dur and not is_direct_media else None
 
         # ⚡ Шаг 0: Проверка в двух-уровневом кэше L1 (RAM) / L2 (SQLite) с проверкой точности хронометража и изоляцией вариантов
+        stage = "cache"
         t_c0 = time.perf_counter()
-        cached = await get_cached_track_async(cache_key, variant=variant)
-        if not cached and track_info.artist and track_info.title:
-            cached = await get_cached_track_async(f"{track_info.artist} - {track_info.title}".lower(), variant=variant)
+        local_keys = [cache_key]
+        if source_type != "youtube" and track_info.artist and track_info.title:
+            alias = f"{track_info.artist} - {track_info.title}".lower()
+            if normalize_cache_key(alias) != normalize_cache_key(cache_key):
+                local_keys.append(alias)
+        cached = None
+        for key in local_keys:
+            candidate = await get_cached_track_async(key, variant=variant)
+            if not candidate:
+                continue
+            mismatch = _cached_audio_mismatch(candidate, variant, expected_cache_duration)
+            if mismatch:
+                logger.info("[MUSIC][request_id=%s] Local cache invalid: %s", req_id, mismatch)
+                await delete_cached_track_async(key, variant=variant)
+                continue
+            cached = candidate
+            break
 
-        # Persistent Cache (Cloudflare D1 + L1 RAM) для YouTube-источников
-        if source_type == "youtube" and variant == "original":
+        # A valid local hit needs no Cloudflare D1 round trip.
+        if not cached and source_type == "youtube" and variant == "original":
             cached_persistent = await get_persistent_track_async(source_key)
             if cached_persistent and is_valid_telegram_file_id(cached_persistent.telegram_file_id):
                 is_match, cached_hash, current_hash = check_metadata_match(
@@ -604,100 +642,60 @@ async def _execute_download_and_send(
                     duration=track_info.duration
                 )
                 if is_match:
-                    cached = {
+                    candidate = {
                         "file_id": cached_persistent.telegram_file_id,
                         "title": cached_persistent.title,
                         "artist": cached_persistent.artist,
                         "duration": cached_persistent.duration,
                         "variant": "original"
                     }
-                    print(f"[MUSIC][request_id={req_id}] Persistent cache HIT: {source_key}", flush=True)
+                    if not _cached_audio_mismatch(candidate, variant, expected_cache_duration):
+                        cached = candidate
+                        print(f"[MUSIC][request_id={req_id}] Persistent cache HIT: {source_key}", flush=True)
                 else:
                     print(
                         f"[MUSIC][request_id={req_id}] Persistent cache metadata mismatch for {source_key}: "
                         f"cached_hash={cached_hash} current_hash={current_hash}. Cache MISS.",
                         flush=True
                     )
-                    cached = None
         t_cache = time.perf_counter() - t_c0
-
-        is_direct_media = bool(url and any(d in url.lower() for d in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com", "tiktok.com")))
-        has_canonical_dur = bool(track_info.duration and track_info.duration > 35)
-        is_apple_music = bool(track_info and track_info.platform in ("Apple Music", "Spotify", "Canonical/Deezer", "Canonical/iTunes", "Yandex Music", "VK Music"))
-        is_text_input = bool(not url)
 
         if cached:
             cached_dur = cached.get("duration") or 0
-            cached_title = cached.get("title") or ""
-            cached_artist = cached.get("artist") or ""
-            _, user_mods = extract_track_modifiers(raw_query)
-            _, cached_mods = extract_track_modifiers(f"{cached_title} {cached_artist}")
-
-            should_invalidate = False
-            # 1. Для каталогов (Apple Music / Spotify / Deezer / Text): несовпадение хронометража более чем на 4 сек (только для оригинала!)
-            if variant == "original" and not is_direct_media and has_canonical_dur and cached_dur > 0 and abs(cached_dur - track_info.duration) > 4:
-                print(f"[MUSIC][request_id={req_id}] Catalog cache INVALIDATED: cached_duration={cached_dur}s != expected={track_info.duration}s. Purging.", flush=True)
-                should_invalidate = True
-            # 2. Если в кэше лежит ремикс/микс/драмка/slowed, а пользователь искал оригинал
-            elif variant == "original" and cached_mods:
-                print(f"[MUSIC][request_id={req_id}] Text search cache INVALIDATED: cached track '{cached_title}' has unwanted modifiers {cached_mods}. Purging.", flush=True)
-                should_invalidate = True
-            # 3. Если пользователь искал вариант, а в кэше трек без требуемого варианта
-            elif variant != "original":
-                target_mods = extract_modifiers(variant)
-                cached_var = cached.get("variant")
-                cached_var_mods = extract_modifiers(cached_var) if cached_var else set()
-                combined_cached_mods = set(cached_mods) | cached_var_mods
-                if not is_candidate_matching_modifiers(target_mods, combined_cached_mods):
-                    print(f"[MUSIC][request_id={req_id}] Variant cache INVALIDATED: cached track '{cached_title}' does not match variant '{variant}'. Purging.", flush=True)
-                    should_invalidate = True
-
-            if should_invalidate:
+            print(f"[MUSIC][request_id={req_id}] cache lookup HIT in {t_cache*1000:.2f}ms (duration={cached_dur}s)", flush=True)
+            stage = "telegram_upload"
+            t_u0 = time.perf_counter()
+            owner_id = message.from_user.id if message.from_user else None
+            try:
+                await message.answer_audio(
+                    audio=cached["file_id"],
+                    title=cached.get("title") or (track_info.title or custom_title or "Unknown Track"),
+                    performer=cached.get("artist") or (track_info.artist or custom_artist or "Unknown Artist"),
+                    duration=cached_dur,
+                    reply_markup=get_audio_edit_keyboard(owner_id)
+                )
+            except TelegramAPIError as cache_err:
+                if not is_unusable_file_id_error(cache_err):
+                    raise
+                logger.info("[MUSIC][request_id=%s] Cached Telegram file_id is no longer usable", req_id)
+                await invalidate_cached_file_id_async(cached["file_id"])
+                if source_type == "youtube":
+                    await invalidate_persistent_track_async(source_key, cached["file_id"])
+            else:
+                t_telegram = time.perf_counter() - t_u0
+                if status_msg:
+                    try:
+                        await status_msg.delete()
+                    except TelegramAPIError:
+                        pass
+                if message.from_user:
+                    await increment_user_download_async(message.from_user.id)
+                t_total_cache = time.perf_counter() - t_req_start
                 print(
-                    f"[MUSIC][request_id={req_id}] Cache INVALIDATED. Purging stale cache entry.",
+                    f"[PERF][request_id={req_id}] cache_lookup={t_cache:.3f}s telegram_upload={t_telegram:.3f}s TOTAL={t_total_cache:.3f}s (CACHE_HIT)",
                     flush=True
                 )
-                await delete_cached_track_async(cache_key, variant=variant)
-                if track_info.artist and track_info.title:
-                    await delete_cached_track_async(f"{track_info.artist} - {track_info.title}".lower(), variant=variant)
-                cached = None
-            else:
-                print(f"[MUSIC][request_id={req_id}] cache lookup HIT in {t_cache*1000:.2f}ms (duration={cached_dur}s)", flush=True)
-                try:
-                    if status_msg:
-                        try:
-                            await status_msg.delete()
-                        except Exception:
-                            pass
-                    t_u0 = time.perf_counter()
-                    owner_id = message.from_user.id if message.from_user else None
-                    await message.answer_audio(
-                        audio=cached["file_id"],
-                        title=cached.get("title") or (track_info.title or custom_title or "Unknown Track"),
-                        performer=cached.get("artist") or (track_info.artist or custom_artist or "Unknown Artist"),
-                        duration=cached_dur,
-                        reply_markup=get_audio_edit_keyboard(owner_id)
-                    )
-                    t_telegram = time.perf_counter() - t_u0
-                    if message.from_user:
-                        await increment_user_download_async(message.from_user.id)
-                    t_total_cache = time.perf_counter() - t_req_start
-                    print(
-                        f"[PERF][request_id={req_id}] cache_lookup={t_cache:.3f}s telegram_upload={t_telegram:.3f}s TOTAL={t_total_cache:.3f}s (CACHE_HIT)",
-                        flush=True
-                    )
-                    return
-                except TelegramAPIError as cache_err:
-                    print(f"[MUSIC][request_id={req_id}] cache send failed with TelegramAPIError ({cache_err}). Purging invalid file_id and re-downloading.", flush=True)
-                    logger.warning("Кэшированный file_id устарел или недоступен: %s", cache_err)
-                    if cached.get("file_id"):
-                        await invalidate_cached_file_id_async(cached["file_id"])
-                        if source_type == "youtube":
-                            await invalidate_persistent_track_async(source_key, cached["file_id"])
-                    cached = None
-                except Exception as cache_err:
-                    print(f"[MUSIC][request_id={req_id}] cache send failed: {cache_err}. Falling back to live download.", flush=True)
-                    cached = None
+                return
 
         display_title = format_track_display(track_info.artist, track_info.title)
         platform_label = f"\nПлатформа: <b>{track_info.platform}</b>" if track_info.platform and "Search" not in track_info.platform else ""
@@ -708,6 +706,7 @@ async def _execute_download_and_send(
             )
 
         progress_updater = DownloadProgressUpdater(status_msg, display_title, platform_label)
+        stage = "download"
 
         print(f"[MUSIC][request_id={req_id}] download_track START target='{track_info.target}' is_apple_music={is_apple_music} is_text_input={is_text_input}", flush=True)
         try:
@@ -822,6 +821,7 @@ async def _execute_download_and_send(
         )
 
         owner_id = message.from_user.id if message.from_user else None
+        stage = "telegram_upload"
         t_u0 = time.perf_counter()
         print(f"[MUSIC][request_id={req_id}] send_audio START", flush=True)
         log_memory_stage("before Telegram upload", req_id=req_id, source=source_type, file_path=downloaded_audio.file_path)
@@ -926,9 +926,16 @@ async def _execute_download_and_send(
                 pass
 
     except Exception as e:
-        print(f"[MUSIC][request_id={req_id}] ERROR at processing: {e}\n{traceback.format_exc()}", flush=True)
-        logger.exception("Ошибка при обработке запроса %s", url or raw_query)
+        logger.exception("[MUSIC][request_id=%s] Ошибка обработки stage=%s", req_id, stage)
         user_friendly = format_download_error(e, track_info)
+        if user_friendly.startswith("Возникла ошибка 8."):
+            timeout_hint = {
+                "metadata": "Не удалось вовремя получить сведения о треке.",
+                "cache": "Не удалось вовремя проверить кэш трека.",
+                "download": "Загрузка аудио не завершилась вовремя.",
+                "telegram_upload": "Telegram не подтвердил отправку вовремя.",
+            }[stage]
+            user_friendly = f"Возникла ошибка 8. {timeout_hint} Попробуйте ещё раз. Код запроса: {req_id}."
 
         try:
             if status_msg:

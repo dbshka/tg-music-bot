@@ -1,9 +1,77 @@
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.extractor import resolve_track_url, ExtractedTrack
 from services.identity import validate_artist_match, validate_candidate_artist
 from handlers.music import _execute_download_and_send, format_download_error
+
+
+HORSE_STEPPIN_URL = "https://open.spotify.com/track/2rYZETHlA6JTDbbkAWj9jD?si=e77c46346ffe40e1"
+
+
+@pytest.mark.asyncio
+async def test_spotify_keeps_title_and_artist_if_optional_enrichment_times_out(monkeypatch):
+    from services import extractor
+
+    async def slow_enrichment(_query):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(extractor, "SPOTIFY_ENRICHMENT_TIMEOUT", 0.01)
+    monkeypatch.setattr(extractor, "resolve_canonical_track_info_async", slow_enrichment)
+    monkeypatch.setattr(extractor, "_extract_spotify_embed_metadata", AsyncMock(
+        return_value=("Sun Araw", "Horse Steppin’", "https://example.com/cover.jpg", None)
+    ))
+    result = await extractor.extract_spotify_info(HORSE_STEPPIN_URL, MagicMock())
+    assert result.target == "ytsearch5:Sun Araw - Horse Steppin’"
+    assert result.duration is None
+
+
+@pytest.mark.asyncio
+async def test_link_resolution_timeout_is_reported_with_stage(monkeypatch):
+    from handlers import music
+
+    message = MagicMock(from_user=None)
+    status = MagicMock(edit_text=AsyncMock())
+    message.reply = AsyncMock(return_value=status)
+    message.answer_audio = AsyncMock()
+    monkeypatch.setattr(music, "resolve_track_url", AsyncMock(side_effect=asyncio.TimeoutError))
+
+    await music._execute_download_and_send(message, HORSE_STEPPIN_URL, url=HORSE_STEPPIN_URL)
+
+    response = status.edit_text.await_args.args[0]
+    assert "Возникла ошибка 8." in response
+    assert "сведения о треке" in response
+    assert "Код запроса:" in response
+    message.answer_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_text_super_slowed_search_preserves_version_in_soundcloud_fallback(monkeypatch, tmp_path):
+    from services import downloader
+
+    exact_audio = MagicMock(duration=110, thumbnail_path=None, source_modifiers={"super slowed"})
+    normal_audio = MagicMock(duration=79, thumbnail_path=None, source_modifiers=set())
+
+    def fake_download(target, *args):
+        if target.startswith("ytsearch"):
+            raise TimeoutError("simulated YouTube timeout")
+        assert target.startswith("scsearch")
+        return exact_audio if target.endswith("super slowed") and args[10] == "super slowed" else normal_audio
+
+    monkeypatch.setattr(downloader, "DOWNLOADS_DIR", tmp_path)
+    mock_download = MagicMock(side_effect=fake_download)
+    monkeypatch.setattr(downloader, "_sync_download", mock_download)
+    audio = await downloader.download_track(
+        "ytsearch6:DJ zup ralii губам super slowed",
+        custom_artist="DJ zup ralii",
+        custom_title="губам",
+        is_text_input=True,
+        requested_variant="super slowed",
+    )
+
+    assert audio is exact_audio
+    assert all(call.args[0].endswith("super slowed") for call in mock_download.call_args_list)
 
 
 def test_spotify_artist_homoglyph_matching():

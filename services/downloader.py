@@ -1328,20 +1328,24 @@ def _sync_download(
                 pass
 
             import concurrent.futures
+            if requested_modifiers:
+                mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
+                variant_query = clean_q_simple
+                if mod_term.lower() not in clean_q_simple.lower():
+                    variant_query = f"{clean_q_simple} {mod_term}".strip()
+                title_variant_query = clean_title_str
+                if mod_term.lower() not in clean_title_str.lower():
+                    title_variant_query = f"{clean_title_str} {mod_term}".strip()
+
             if is_apple_music or is_text_input:
                 if requested_modifiers:
-                    mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
-                    variant_query = clean_q_simple
-                    if mod_term.lower() not in clean_q_simple.lower():
-                        variant_query = f"{clean_q_simple} {mod_term}".strip()
-
                     search_tasks = [
                         ("youtube", f"ytsearch6:{variant_query}"),
                         ("youtube", f"ytsearch4:{clean_artist_str} - {clean_title_str} ({mod_term})".strip()),
                         ("soundcloud", f"scsearch5:{variant_query}")
                     ]
                     if clean_title_str and len(clean_title_str) >= 3:
-                        search_tasks.append(("youtube", f"ytsearch4:{clean_title_str}"))
+                        search_tasks.append(("youtube", f"ytsearch4:{title_variant_query}"))
                 else:
                     search_tasks = [
                         ("youtube", f"ytmsearch5:{clean_q_simple}"),
@@ -1354,16 +1358,12 @@ def _sync_download(
                         search_tasks.append(("youtube", f"ytsearch3:{clean_title_str}"))
             else:
                 if requested_modifiers:
-                    mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
-                    variant_query = clean_q_simple
-                    if mod_term.lower() not in clean_q_simple.lower():
-                        variant_query = f"{clean_q_simple} {mod_term}".strip()
                     search_tasks = [
                         ("youtube", f"ytsearch6:{variant_query}"),
                         ("soundcloud", f"scsearch5:{variant_query}")
                     ]
                     if clean_title_str and len(clean_title_str) >= 3:
-                        search_tasks.append(("youtube", f"ytsearch4:{clean_title_str}"))
+                        search_tasks.append(("youtube", f"ytsearch4:{title_variant_query}"))
                 else:
                     search_tasks = [
                         ("youtube", f"ytmsearch5:{clean_q_simple}"),
@@ -1373,7 +1373,6 @@ def _sync_download(
 
             clean_core_title = " ".join(core_title_words) if core_title_words else ""
             if clean_core_title and custom_artist and requested_modifiers:
-                mod_term = requested_variant if (requested_variant and requested_variant != "original") else " ".join(sorted(requested_modifiers))
                 search_tasks.append(("soundcloud", f"scsearch3:{custom_artist} {clean_core_title} {mod_term}"))
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(search_tasks))
@@ -2551,7 +2550,8 @@ def is_generic_artist_name(name: Optional[str]) -> bool:
 def _build_fallback_queries(
     custom_artist: Optional[str],
     custom_title: Optional[str],
-    query_or_url: str
+    query_or_url: str,
+    requested_variant: Optional[str] = None,
 ) -> list[str]:
     """
     Генерирует ранжированный список очищенных поисковых запросов для fallback (SoundCloud / YouTube).
@@ -2605,8 +2605,11 @@ def _build_fallback_queries(
 
     seen = set()
     deduped = []
+    requested_mods = extract_modifiers(requested_variant)
     for q in queries:
         norm = " ".join(q.split()).strip()
+        if norm and requested_mods and not is_candidate_matching_modifiers(requested_mods, extract_modifiers(norm)):
+            norm = f"{norm} {requested_variant}"
         if norm and norm.lower() not in seen:
             seen.add(norm.lower())
             deduped.append(norm)
@@ -2704,7 +2707,7 @@ async def download_track(
         else:
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        fallback_queries = _build_fallback_queries(custom_artist, custom_title, query_or_url)
+        fallback_queries = _build_fallback_queries(custom_artist, custom_title, query_or_url, requested_variant)
         err_msg = str(primary_error).lower()
         is_bot_blocked = any(
             marker in err_msg
@@ -2787,8 +2790,9 @@ async def download_track(
                         cancel_event,
                         is_apple_music,
                         is_text_input,
-                        None,
-                        custom_album
+                        requested_variant,
+                        custom_album,
+                        progress_callback
                     )
                     if expected_duration and expected_duration > 60 and audio.duration <= 35:
                         raise ValueError("Возникла ошибка 52. Не удалось получить полный трек.")
